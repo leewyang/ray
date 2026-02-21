@@ -47,6 +47,7 @@ except ImportError:
 
 
 if TYPE_CHECKING:
+    import cudf
     import pandas
 
     from ray.data._internal.planner.exchange.sort_task_spec import SortKey
@@ -320,6 +321,16 @@ class ArrowBlockAccessor(TableBlockAccessor):
 
     def to_arrow(self) -> "pyarrow.Table":
         return self._table
+
+    def to_cudf(self) -> "cudf.DataFrame":
+        try:
+            import cudf
+        except ImportError:
+            raise ImportError(
+                "cuDF is required to use batch_format='cudf'. "
+                "Install it with: pip install cudf-cu12"
+            )
+        return cudf.DataFrame.from_arrow(self._table)
 
     def num_rows(self) -> int:
         # Arrow may represent an empty table via an N > 0 row, 0-column table, e.g. when

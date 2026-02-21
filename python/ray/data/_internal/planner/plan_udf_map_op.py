@@ -480,17 +480,22 @@ def _try_wrap_udf_exception(e: Exception, item: Any = None):
 
 
 def _validate_batch_output(batch: Block) -> None:
-    if not isinstance(
-        batch,
-        (
-            list,
-            pa.Table,
-            np.ndarray,
-            collections.abc.Mapping,
-            pd.core.frame.DataFrame,
-            dict,
-        ),
-    ):
+    valid_types = (
+        list,
+        pa.Table,
+        np.ndarray,
+        collections.abc.Mapping,
+        pd.core.frame.DataFrame,
+        dict,
+    )
+    try:
+        import cudf
+
+        valid_types = valid_types + (cudf.DataFrame,)
+    except ImportError:
+        pass
+
+    if not isinstance(batch, valid_types):
         raise ValueError(
             "The `fn` you passed to `map_batches` returned a value of type "
             f"{type(batch)}. This isn't allowed -- `map_batches` expects "

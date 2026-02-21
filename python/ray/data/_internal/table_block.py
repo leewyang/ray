@@ -576,6 +576,8 @@ class TableBlockAccessor(BlockAccessor):
             return BlockAccessor.for_block(block).to_arrow()
         elif block_type == BlockType.PANDAS:
             return BlockAccessor.for_block(block).to_pandas()
+        elif block_type == BlockType.CUDF:
+            return BlockAccessor.for_block(block).to_cudf()
         else:
             return BlockAccessor.for_block(block).to_default()
 
