@@ -28,6 +28,7 @@ from ray.util import log_once
 from ray.util.annotations import DeveloperAPI
 
 if TYPE_CHECKING:
+    import cudf
     import pandas
     import pyarrow
 
@@ -70,6 +71,7 @@ logger = logging.getLogger(__name__)
 class BlockType(Enum):
     ARROW = "arrow"
     PANDAS = "pandas"
+    CUDF = "cudf"
 
 
 @DeveloperAPI
@@ -78,11 +80,14 @@ class BatchFormat(str, Enum):
     ARROW = "pyarrow"
     PANDAS = "pandas"
     NUMPY = "numpy"
+    CUDF = "cudf"
 
 
 # User-facing data batch type. This is the data type for data that is supplied to and
 # returned from batch UDFs.
-DataBatch = Union["pyarrow.Table", "pandas.DataFrame", Dict[str, np.ndarray]]
+DataBatch = Union[
+    "pyarrow.Table", "pandas.DataFrame", Dict[str, np.ndarray], "cudf.DataFrame"
+]
 
 # User-facing data column type. This is the data type for data that is supplied to and
 # returned from column UDFs.
@@ -113,7 +118,7 @@ BlockPartition = List[Tuple[ObjectRef[Block], "BlockMetadata"]]
 # same type as the metadata that describes each block in the partition.
 BlockPartitionMetadata = List["BlockMetadata"]
 
-VALID_BATCH_FORMATS = ["pandas", "pyarrow", "numpy", None]
+VALID_BATCH_FORMATS = ["pandas", "pyarrow", "numpy", "cudf", None]
 DEFAULT_BATCH_FORMAT = "numpy"
 
 
@@ -392,6 +397,10 @@ class BlockAccessor:
         """Convert this block into an Arrow table."""
         raise NotImplementedError
 
+    def to_cudf(self) -> "cudf.DataFrame":
+        """Convert this block into a cuDF DataFrame."""
+        raise NotImplementedError
+
     def to_block(self) -> Block:
         """Return the base block that this accessor wraps."""
         raise NotImplementedError
@@ -419,6 +428,8 @@ class BlockAccessor:
             return self.to_arrow()
         elif batch_format == "numpy":
             return self.to_numpy()
+        elif batch_format == "cudf":
+            return self.to_cudf()
         else:
             raise ValueError(
                 f"The batch format must be one of {VALID_BATCH_FORMATS}, got: "
@@ -537,6 +548,15 @@ class BlockAccessor:
                 "return `{'item': batch}` instead of just `batch`."
             )
         else:
+            try:
+                import cudf
+
+                if isinstance(block, cudf.DataFrame):
+                    from ray.data._internal.cudf_block import CudfBlockAccessor
+
+                    return CudfBlockAccessor(block)
+            except ImportError:
+                pass
             raise TypeError("Not a block type: {} ({})".format(block, type(block)))
 
     def sample(self, n_samples: int, sort_key: "SortKey") -> "Block":

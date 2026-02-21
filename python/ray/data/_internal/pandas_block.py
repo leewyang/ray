@@ -36,6 +36,7 @@ from ray.data.context import DataContext
 from ray.data.expressions import Expr
 
 if TYPE_CHECKING:
+    import cudf
     import pandas
     import pyarrow
 
@@ -464,6 +465,16 @@ class PandasBlockAccessor(TableBlockAccessor):
         else:
             arrays = dict(zip(columns, arrays))
         return arrays
+
+    def to_cudf(self) -> "cudf.DataFrame":
+        try:
+            import cudf
+        except ImportError:
+            raise ImportError(
+                "cuDF is required to use batch_format='cudf'. "
+                "Install it with: pip install cudf-cu12"
+            )
+        return cudf.DataFrame.from_pandas(self.to_pandas())
 
     def to_arrow(self) -> "pyarrow.Table":
         import pyarrow as pa

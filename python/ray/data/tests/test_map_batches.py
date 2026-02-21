@@ -24,6 +24,13 @@ from ray.data.tests.test_util import ConcurrencyCounter  # noqa
 from ray.data.tests.util import column_udf, extract_values
 from ray.tests.conftest import *  # noqa
 
+try:
+    import cudf  # noqa: F401
+
+    CUDF_AVAILABLE = True
+except ImportError:
+    CUDF_AVAILABLE = False
+
 
 # Helper function to process timestamp data in nanoseconds
 def process_timestamp_data(row):
@@ -836,6 +843,84 @@ def test_map_batches_struct_field_type_divergence(shutdown_only):
     # Rows with a=1.5 should have float a, with b=None
     assert rows[2]["data"] == {"a": 1.5, "b": None, "c": 100}
     assert rows[3]["data"] == {"a": 1.5, "b": None, "c": 100}
+
+
+@pytest.mark.skipif(not CUDF_AVAILABLE, reason="cuDF not available")
+def test_map_batches_cudf_identity(ray_start_2_cpus_1_gpu_shared):
+    """Test that batch_format='cudf' passes cudf.DataFrames through identity UDF."""
+    ds = ray.data.range(100)
+
+    def identity(df):
+        assert isinstance(df, cudf.DataFrame)
+        return df
+
+    result = ds.map_batches(
+        identity,
+        batch_format="cudf",
+        batch_size=10,
+        num_gpus=1,
+    ).materialize()  # materialize to CPU
+
+    assert result.count() == 100
+    rows = result.take_all()
+    assert [r["id"] for r in rows] == list(range(100))
+
+
+@pytest.mark.skipif(not CUDF_AVAILABLE, reason="cuDF not available")
+def test_map_batches_cudf_transform(ray_start_2_cpus_1_gpu_shared):
+    """Test that a cuDF transform UDF produces correct output."""
+    ds = ray.data.from_pandas(pd.DataFrame({"x": [1, 2, 3]}))
+    result = ds.map_batches(
+        lambda df: df.assign(y=df["x"] * 2),
+        batch_format="cudf",
+        batch_size=10,
+        num_gpus=1,
+    )
+    out = result.to_pandas()
+    assert list(out["x"]) == [1, 2, 3]
+    assert list(out["y"]) == [2, 4, 6]
+
+
+@pytest.mark.skipif(not CUDF_AVAILABLE, reason="cuDF not available")
+def test_map_batches_cudf_chained_transforms(ray_start_2_cpus_1_gpu_shared):
+    """Test that chained cuDF transform UDFs produce correct output."""
+
+    def transform1(df):
+        assert isinstance(df, cudf.DataFrame)
+        return df.assign(y=df["x"] * 2)
+
+    def transform2(df):
+        assert isinstance(df, cudf.DataFrame)
+        return df.assign(z=df["y"] * 3)
+
+    ds = ray.data.from_pandas(pd.DataFrame({"x": [1, 2, 3]}))
+    result = (
+        ds.map_batches(
+            transform1,
+            batch_format="cudf",
+            batch_size=10,
+            num_gpus=1,
+        )
+        .map_batches(
+            transform2,
+            batch_format="cudf",
+            batch_size=10,
+            num_gpus=1,
+        )
+        .materialize()
+    )
+    out = result.to_pandas()
+    assert list(out["x"]) == [1, 2, 3]
+    assert list(out["y"]) == [2, 4, 6]
+    assert list(out["z"]) == [6, 12, 18]
+
+
+@pytest.mark.skipif(CUDF_AVAILABLE, reason="Requires cuDF to be absent")
+def test_map_batches_cudf_import_error(ray_start_regular_shared):
+    """Test that using batch_format='cudf' without cuDF installed raises ImportError."""
+    ds = ray.data.range(10)
+    with pytest.raises(Exception):
+        ds.map_batches(lambda df: df, batch_size=10, batch_format="cudf").materialize()
 
 
 if __name__ == "__main__":

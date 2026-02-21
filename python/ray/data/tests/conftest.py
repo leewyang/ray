@@ -79,6 +79,13 @@ def ray_start_10_cpus_shared(request):
         yield res
 
 
+@pytest.fixture(scope="module")
+def ray_start_2_cpus_1_gpu_shared(request):
+    param = getattr(request, "param", {})
+    with _ray_start(num_cpus=2, num_gpus=1, **param) as res:
+        yield res
+
+
 @pytest.fixture(scope="function")
 def aws_credentials():
     import os
