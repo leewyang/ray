@@ -160,6 +160,11 @@ class SerializationContext:
         # (e.g. gloo, nccl, etc.) for tensor communication between actors,
         # instead of the normal serialize -> object store -> deserialize codepath.
         self._torch_custom_serializer_registered = False
+        # This flag is to mark whether the custom serializer for cudf.DataFrame has
+        # been registered. cuDF DataFrames are transported by extracting GPU column
+        # buffers as ByteTensors that travel via the existing RDT transports (NIXL,
+        # CUDA IPC). If cuDF is not installed, registration is silently skipped.
+        self._cudf_custom_serializer_registered = False
 
         # Enable zero-copy serialization of tensors if the environment variable is set.
         self._zero_copy_tensors_enabled = (
@@ -699,6 +704,21 @@ class SerializationContext:
 
             TorchTensorType().register_custom_serializer()
             self._torch_custom_serializer_registered = True
+
+        if not self._cudf_custom_serializer_registered:
+            # Register a custom serializer for cudf.DataFrame so that GPU
+            # column buffers are extracted as ByteTensors and transported via
+            # the existing RDT path (NIXL, CUDA IPC) without a CPU round-trip.
+            # Silently skip when cuDF is not installed.
+            try:
+                from ray.experimental.gpu_object_manager.cudf_transport_utils import (
+                    register_cudf_serializer,
+                )
+
+                register_cudf_serializer()
+                self._cudf_custom_serializer_registered = True
+            except ImportError:
+                pass
 
         serialized_val, tensors = self._serialize_and_retrieve_tensors(value)
 
