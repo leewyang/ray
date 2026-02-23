@@ -40,6 +40,10 @@ from ray.data._internal.arrow_ops.transform_pyarrow import (
     _create_empty_table,
     hash_partition,
 )
+from ray.data._internal.cudf_ops.transform_cudf import (
+    _create_empty_cudf_table,
+    hash_partition_cudf,
+)
 from ray.data._internal.execution.interfaces import (
     ExecutionOptions,
     ExecutionResources,
@@ -197,9 +201,9 @@ class ConcatAggregation(ShuffleAggregation):
     def finalize(self, partition_shards_map: Dict[int, List[Block]]) -> Iterator[Block]:
         """Concatenates blocks and optionally sorts by key columns."""
 
-        assert (
-            len(partition_shards_map) == 1
-        ), f"Single input-sequence is expected (got {len(partition_shards_map)})"
+        assert len(partition_shards_map) == 1, (
+            f"Single input-sequence is expected (got {len(partition_shards_map)})"
+        )
 
         blocks = partition_shards_map[0]
         if not blocks:
@@ -207,13 +211,30 @@ class ConcatAggregation(ShuffleAggregation):
 
         result = _combine(blocks)
 
-        if self._should_sort and result.num_rows > 0:
-            result = result.sort_by([(k, "ascending") for k in self._key_columns])
+        if self._should_sort and BlockAccessor.for_block(result).num_rows() > 0:
+            if BlockAccessor.for_block(result).block_type() == BlockType.CUDF:
+                result = result.sort_values(by=list(self._key_columns), ascending=True)
+            else:
+                result = result.sort_by([(k, "ascending") for k in self._key_columns])
 
         yield result
 
 
 def _combine(partition_shards: List[Block]) -> Block:
+    """Concatenate a list of same-type blocks into a single block.
+
+    Dispatches to a cuDF-native path when the shards are ``cudf.DataFrame``
+    objects so that the concatenation stays on the GPU without an
+    Arrow round-trip.
+    """
+    if not partition_shards:
+        return ArrowBlockBuilder().build()
+
+    if BlockAccessor.for_block(partition_shards[0]).block_type() == BlockType.CUDF:
+        import cudf
+
+        return cudf.concat(partition_shards, ignore_index=True)
+
     builder = ArrowBlockBuilder()
     for block in partition_shards:
         builder.add_block(block)
@@ -239,7 +260,10 @@ def _shuffle_block(
        aggregators
 
     Args:
-        block: Incoming block (in the form of Pyarrow's `Table`) to be shuffled
+        block: Incoming block to be shuffled.  Accepts Arrow (``pyarrow.Table``),
+            Pandas (``pandas.DataFrame``), and cuDF (``cudf.DataFrame``) blocks.
+            cuDF blocks are partitioned on-device via
+            ``cudf.DataFrame.partition_by_hash`` without an Arrow round-trip.
         input_index: Id of the input sequence block belongs to
         key_columns: Columns to be used by hash-partitioning algorithm
         pool: Hash-shuffling operator's pool of aggregators that are due to receive
@@ -268,12 +292,18 @@ def _shuffle_block(
     if block_transformer is not None:
         block = block_transformer(block)
 
-    # Make sure we're handling Arrow blocks
-    block: Block = TableBlockAccessor.try_convert_block_type(
-        block, block_type=BlockType.ARROW
-    )
+    # Detect the block type once so we can choose the right hash-partition
+    # implementation without unnecessary CPU-GPU transitions.
+    block_type = BlockAccessor.for_block(block).block_type()
 
-    if block.num_rows == 0:
+    if block_type != BlockType.CUDF:
+        # Non-GPU path: normalise to Arrow so the existing hash_partition
+        # helper (which only accepts pyarrow.Table) can be used.
+        block = TableBlockAccessor.try_convert_block_type(
+            block, block_type=BlockType.ARROW
+        )
+
+    if BlockAccessor.for_block(block).num_rows() == 0:
         empty = BlockAccessor.for_block(block).get_metadata(
             exec_stats=stats.build(block_ser_time_s=0)
         )
@@ -281,18 +311,24 @@ def _shuffle_block(
 
     num_partitions = pool.num_partitions
 
-    assert isinstance(block, pa.Table), f"Expected Pyarrow's `Table`, got {type(block)}"
-
     # In case when no target key columns have been provided shuffling is
     # reduced to just forwarding whole block to the target aggregator
     if key_columns:
-        block_partitions = hash_partition(
-            block, hash_cols=key_columns, num_partitions=num_partitions
-        )
+        if block_type == BlockType.CUDF:
+            block_partitions = hash_partition_cudf(
+                block, hash_cols=key_columns, num_partitions=num_partitions
+            )
+        else:
+            assert isinstance(block, pa.Table), (
+                f"Expected Pyarrow's `Table`, got {type(block)}"
+            )
+            block_partitions = hash_partition(
+                block, hash_cols=key_columns, num_partitions=num_partitions
+            )
     else:
-        assert (
-            0 <= override_partition_id < num_partitions
-        ), f"Expected override partition id < {num_partitions} (got {override_partition_id})"
+        assert 0 <= override_partition_id < num_partitions, (
+            f"Expected override partition id < {num_partitions} (got {override_partition_id})"
+        )
 
         block_partitions = {override_partition_id: block}
 
@@ -310,13 +346,16 @@ def _shuffle_block(
             if not send_empty_blocks:
                 continue
 
-            partition_shard = _create_empty_table(block.schema)
+            if block_type == BlockType.CUDF:
+                partition_shard = _create_empty_cudf_table(block)
+            else:
+                partition_shard = _create_empty_table(block.schema)
 
         # Capture partition shard metadata
         #
         # NOTE: We're skipping over empty shards as these are used for schema
         #       broadcasting and aren't relevant to keep track of
-        if partition_shard.num_rows > 0:
+        if BlockAccessor.for_block(partition_shard).num_rows() > 0:
             partition_shards_stats[partition_id] = _PartitionStats.for_table(
                 partition_shard
             )
@@ -363,7 +402,7 @@ def _shuffle_block(
 
         logger.debug(
             f"Shuffled block (rows={original_block_metadata.num_rows}, "
-            f"bytes={original_block_metadata.size_bytes/MiB:.1f}MB) "
+            f"bytes={original_block_metadata.size_bytes / MiB:.1f}MB) "
             f"into {len(partition_shards_stats)} partitions ("
             f"quantiles={'/'.join(map(str, quantiles))}, "
             f"rows={'/'.join(map(str, num_rows_quantiles))}, "
@@ -424,10 +463,11 @@ class _PartitionStats:
         )
 
     @staticmethod
-    def for_table(table: pa.Table) -> "_PartitionStats":
+    def for_table(table: Block) -> "_PartitionStats":
+        accessor = BlockAccessor.for_block(table)
         return _PartitionStats(
-            num_rows=table.num_rows,
-            byte_size=table.nbytes,
+            num_rows=accessor.num_rows(),
+            byte_size=accessor.size_bytes(),
         )
 
     @staticmethod
@@ -604,9 +644,9 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         #   - Input sequence id -> Task id -> Task
         #
         # NOTE: Input sequences correspond to the outputs of the input operators
-        self._shuffling_tasks: DefaultDict[
-            int, Dict[int, MetadataOpTask]
-        ] = defaultdict(dict)
+        self._shuffling_tasks: DefaultDict[int, Dict[int, MetadataOpTask]] = (
+            defaultdict(dict)
+        )
 
         self._next_aggregate_task_idx: int = 0
         # Aggregating tasks are mapped like following
@@ -635,9 +675,9 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         #
         #   input_sequence_id -> partition_id -> _PartitionStats
         #
-        self._partitions_stats: DefaultDict[
-            int, Dict[int, _PartitionStats]
-        ] = defaultdict(dict)
+        self._partitions_stats: DefaultDict[int, Dict[int, _PartitionStats]] = (
+            defaultdict(dict)
+        )
 
         self._health_monitoring_started: bool = False
         self._health_monitoring_start_time: float = 0.0
@@ -764,17 +804,17 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
                 self._shuffle_bar.update(increment=input_block_metadata.num_rows or 0)
 
             # TODO update metrics
-            task = self._shuffling_tasks[input_index][
-                cur_shuffle_task_idx
-            ] = MetadataOpTask(
-                task_index=cur_shuffle_task_idx,
-                object_ref=input_block_partition_shards_metadata_tuple_ref,
-                task_done_callback=functools.partial(
-                    _on_partitioning_done, cur_shuffle_task_idx
-                ),
-                task_resource_bundle=ExecutionResources.from_resource_dict(
-                    shuffle_task_resource_bundle
-                ),
+            task = self._shuffling_tasks[input_index][cur_shuffle_task_idx] = (
+                MetadataOpTask(
+                    task_index=cur_shuffle_task_idx,
+                    object_ref=input_block_partition_shards_metadata_tuple_ref,
+                    task_done_callback=functools.partial(
+                        _on_partitioning_done, cur_shuffle_task_idx
+                    ),
+                    task_resource_bundle=ExecutionResources.from_resource_dict(
+                        shuffle_task_resource_bundle
+                    ),
+                )
             )
             if task.get_requested_resource_bundle() is not None:
                 self._shuffling_resource_usage = self._shuffling_resource_usage.add(
@@ -1266,7 +1306,9 @@ class HashShuffleOperator(HashShufflingOperatorBase):
 
         super().__init__(
             name_factory=(
-                lambda num_partitions: f"Shuffle(key_columns={key_columns}, num_partitions={num_partitions})"
+                lambda num_partitions: (
+                    f"Shuffle(key_columns={key_columns}, num_partitions={num_partitions})"
+                )
             ),
             input_ops=[input_op],
             data_context=data_context,
@@ -1358,18 +1400,18 @@ class AggregatorPool:
         target_max_block_size: Optional[int],
         min_max_shards_compaction_thresholds: Optional[Tuple[int, int]] = None,
     ):
-        assert (
-            num_partitions >= 1
-        ), f"Number of partitions has to be >= 1 (got {num_partitions})"
+        assert num_partitions >= 1, (
+            f"Number of partitions has to be >= 1 (got {num_partitions})"
+        )
 
         self._target_max_block_size = target_max_block_size
         self._num_input_seqs = num_input_seqs
         self._num_partitions = num_partitions
         self._num_aggregators: int = num_aggregators
-        self._aggregator_partition_map: Dict[
-            int, List[int]
-        ] = self._allocate_partitions(
-            num_partitions=num_partitions,
+        self._aggregator_partition_map: Dict[int, List[int]] = (
+            self._allocate_partitions(
+                num_partitions=num_partitions,
+            )
         )
 
         self._aggregators: List[ray.actor.ActorHandle] = []
@@ -1378,11 +1420,11 @@ class AggregatorPool:
             aggregation_factory
         )
 
-        self._aggregator_ray_remote_args: Dict[
-            str, Any
-        ] = self._derive_final_shuffle_aggregator_ray_remote_args(
-            aggregator_ray_remote_args,
-            self._aggregator_partition_map,
+        self._aggregator_ray_remote_args: Dict[str, Any] = (
+            self._derive_final_shuffle_aggregator_ray_remote_args(
+                aggregator_ray_remote_args,
+                self._aggregator_partition_map,
+            )
         )
 
         self._min_max_shards_compaction_thresholds = (
@@ -1528,9 +1570,9 @@ class AggregatorPool:
             DEFAULT_HASH_SHUFFLE_AGGREGATOR_MAX_CONCURRENCY,
         )
 
-        assert (
-            max_concurrency >= 1
-        ), f"{max_partitions_per_aggregator=}, {DEFAULT_MAX_HASH_SHUFFLE_AGGREGATORS}"
+        assert max_concurrency >= 1, (
+            f"{max_partitions_per_aggregator=}, {DEFAULT_MAX_HASH_SHUFFLE_AGGREGATORS}"
+        )
 
         # NOTE: ShuffleAggregator is configured as threaded actor to allow for
         #       multiple requests to be handled "concurrently" (par GIL) --
@@ -1660,12 +1702,12 @@ class HashShuffleAggregator:
 
         # Per-sequence mapping of partition-id to `PartitionState` with individual
         # locks for thread-safe block accumulation
-        self._input_seq_partition_buckets: Dict[
-            int, Dict[int, PartitionBucket]
-        ] = self._allocate_partition_buckets(
-            num_input_seqs,
-            target_partition_ids,
-            min_num_blocks_compaction_threshold,
+        self._input_seq_partition_buckets: Dict[int, Dict[int, PartitionBucket]] = (
+            self._allocate_partition_buckets(
+                num_input_seqs,
+                target_partition_ids,
+                min_num_blocks_compaction_threshold,
+            )
         )
 
         self._bg_thread = threading.Thread(
@@ -1779,7 +1821,7 @@ class HashShuffleAggregator:
                     }
 
             logger.debug(
-                f"Hash shuffle aggregator id={self._aggregator_id}, " f"state: {result}"
+                f"Hash shuffle aggregator id={self._aggregator_id}, state: {result}"
             )
 
     @staticmethod
