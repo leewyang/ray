@@ -83,6 +83,10 @@ DEFAULT_MAX_HASH_SHUFFLE_AGGREGATORS = env_integer(
     "RAY_DATA_MAX_HASH_SHUFFLE_AGGREGATORS", 128
 )
 
+DEFAULT_GPU_SHUFFLE_MEMORY_FRACTION = float(
+    os.environ.get("RAY_DATA_GPU_SHUFFLE_MEMORY_FRACTION", "0.6")
+)
+
 DEFAULT_SCHEDULING_STRATEGY = "SPREAD"
 
 # This default enables locality-based scheduling in Ray for tasks where arg data
@@ -605,6 +609,15 @@ class DataContext:
     join_operator_actor_num_cpus_override: float = None
     hash_shuffle_operator_actor_num_cpus_override: float = None
     hash_aggregate_operator_actor_num_cpus_override: float = None
+
+    # When True, HashShuffleAggregator actors request num_gpus=0.001 so Ray
+    # places them on GPU-equipped nodes, keeping cuDF shards local.
+    # Set to True when your dataset consists of cuDF blocks.
+    gpu_shuffle_enabled: bool = False
+
+    # Fraction of free GPU memory each aggregator actor may use before
+    # spilling partitions to host memory (Arrow).  Used by Phase 3.
+    gpu_shuffle_memory_fraction: float = DEFAULT_GPU_SHUFFLE_MEMORY_FRACTION
 
     scheduling_strategy: SchedulingStrategyT = DEFAULT_SCHEDULING_STRATEGY
     scheduling_strategy_large_args: SchedulingStrategyT = (

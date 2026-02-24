@@ -201,9 +201,9 @@ class ConcatAggregation(ShuffleAggregation):
     def finalize(self, partition_shards_map: Dict[int, List[Block]]) -> Iterator[Block]:
         """Concatenates blocks and optionally sorts by key columns."""
 
-        assert len(partition_shards_map) == 1, (
-            f"Single input-sequence is expected (got {len(partition_shards_map)})"
-        )
+        assert (
+            len(partition_shards_map) == 1
+        ), f"Single input-sequence is expected (got {len(partition_shards_map)})"
 
         blocks = partition_shards_map[0]
         if not blocks:
@@ -319,16 +319,16 @@ def _shuffle_block(
                 block, hash_cols=key_columns, num_partitions=num_partitions
             )
         else:
-            assert isinstance(block, pa.Table), (
-                f"Expected Pyarrow's `Table`, got {type(block)}"
-            )
+            assert isinstance(
+                block, pa.Table
+            ), f"Expected Pyarrow's `Table`, got {type(block)}"
             block_partitions = hash_partition(
                 block, hash_cols=key_columns, num_partitions=num_partitions
             )
     else:
-        assert 0 <= override_partition_id < num_partitions, (
-            f"Expected override partition id < {num_partitions} (got {override_partition_id})"
-        )
+        assert (
+            0 <= override_partition_id < num_partitions
+        ), f"Expected override partition id < {num_partitions} (got {override_partition_id})"
 
         block_partitions = {override_partition_id: block}
 
@@ -644,9 +644,9 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         #   - Input sequence id -> Task id -> Task
         #
         # NOTE: Input sequences correspond to the outputs of the input operators
-        self._shuffling_tasks: DefaultDict[int, Dict[int, MetadataOpTask]] = (
-            defaultdict(dict)
-        )
+        self._shuffling_tasks: DefaultDict[
+            int, Dict[int, MetadataOpTask]
+        ] = defaultdict(dict)
 
         self._next_aggregate_task_idx: int = 0
         # Aggregating tasks are mapped like following
@@ -675,9 +675,9 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         #
         #   input_sequence_id -> partition_id -> _PartitionStats
         #
-        self._partitions_stats: DefaultDict[int, Dict[int, _PartitionStats]] = (
-            defaultdict(dict)
-        )
+        self._partitions_stats: DefaultDict[
+            int, Dict[int, _PartitionStats]
+        ] = defaultdict(dict)
 
         self._health_monitoring_started: bool = False
         self._health_monitoring_start_time: float = 0.0
@@ -804,17 +804,17 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
                 self._shuffle_bar.update(increment=input_block_metadata.num_rows or 0)
 
             # TODO update metrics
-            task = self._shuffling_tasks[input_index][cur_shuffle_task_idx] = (
-                MetadataOpTask(
-                    task_index=cur_shuffle_task_idx,
-                    object_ref=input_block_partition_shards_metadata_tuple_ref,
-                    task_done_callback=functools.partial(
-                        _on_partitioning_done, cur_shuffle_task_idx
-                    ),
-                    task_resource_bundle=ExecutionResources.from_resource_dict(
-                        shuffle_task_resource_bundle
-                    ),
-                )
+            task = self._shuffling_tasks[input_index][
+                cur_shuffle_task_idx
+            ] = MetadataOpTask(
+                task_index=cur_shuffle_task_idx,
+                object_ref=input_block_partition_shards_metadata_tuple_ref,
+                task_done_callback=functools.partial(
+                    _on_partitioning_done, cur_shuffle_task_idx
+                ),
+                task_resource_bundle=ExecutionResources.from_resource_dict(
+                    shuffle_task_resource_bundle
+                ),
             )
             if task.get_requested_resource_bundle() is not None:
                 self._shuffling_resource_usage = self._shuffling_resource_usage.add(
@@ -1197,6 +1197,11 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
             "allow_out_of_order_execution": True,
         }
 
+        if self.data_context.gpu_shuffle_enabled:
+            # Request a tiny GPU fraction so Ray schedules the actor on a GPU node.
+            # The actual GPU memory budget is enforced separately (Phase 3).
+            remote_args["num_gpus"] = 0.001
+
         return remote_args
 
     @abc.abstractmethod
@@ -1400,18 +1405,18 @@ class AggregatorPool:
         target_max_block_size: Optional[int],
         min_max_shards_compaction_thresholds: Optional[Tuple[int, int]] = None,
     ):
-        assert num_partitions >= 1, (
-            f"Number of partitions has to be >= 1 (got {num_partitions})"
-        )
+        assert (
+            num_partitions >= 1
+        ), f"Number of partitions has to be >= 1 (got {num_partitions})"
 
         self._target_max_block_size = target_max_block_size
         self._num_input_seqs = num_input_seqs
         self._num_partitions = num_partitions
         self._num_aggregators: int = num_aggregators
-        self._aggregator_partition_map: Dict[int, List[int]] = (
-            self._allocate_partitions(
-                num_partitions=num_partitions,
-            )
+        self._aggregator_partition_map: Dict[
+            int, List[int]
+        ] = self._allocate_partitions(
+            num_partitions=num_partitions,
         )
 
         self._aggregators: List[ray.actor.ActorHandle] = []
@@ -1420,11 +1425,11 @@ class AggregatorPool:
             aggregation_factory
         )
 
-        self._aggregator_ray_remote_args: Dict[str, Any] = (
-            self._derive_final_shuffle_aggregator_ray_remote_args(
-                aggregator_ray_remote_args,
-                self._aggregator_partition_map,
-            )
+        self._aggregator_ray_remote_args: Dict[
+            str, Any
+        ] = self._derive_final_shuffle_aggregator_ray_remote_args(
+            aggregator_ray_remote_args,
+            self._aggregator_partition_map,
         )
 
         self._min_max_shards_compaction_thresholds = (
@@ -1570,9 +1575,9 @@ class AggregatorPool:
             DEFAULT_HASH_SHUFFLE_AGGREGATOR_MAX_CONCURRENCY,
         )
 
-        assert max_concurrency >= 1, (
-            f"{max_partitions_per_aggregator=}, {DEFAULT_MAX_HASH_SHUFFLE_AGGREGATORS}"
-        )
+        assert (
+            max_concurrency >= 1
+        ), f"{max_partitions_per_aggregator=}, {DEFAULT_MAX_HASH_SHUFFLE_AGGREGATORS}"
 
         # NOTE: ShuffleAggregator is configured as threaded actor to allow for
         #       multiple requests to be handled "concurrently" (par GIL) --
@@ -1702,12 +1707,12 @@ class HashShuffleAggregator:
 
         # Per-sequence mapping of partition-id to `PartitionState` with individual
         # locks for thread-safe block accumulation
-        self._input_seq_partition_buckets: Dict[int, Dict[int, PartitionBucket]] = (
-            self._allocate_partition_buckets(
-                num_input_seqs,
-                target_partition_ids,
-                min_num_blocks_compaction_threshold,
-            )
+        self._input_seq_partition_buckets: Dict[
+            int, Dict[int, PartitionBucket]
+        ] = self._allocate_partition_buckets(
+            num_input_seqs,
+            target_partition_ids,
+            min_num_blocks_compaction_threshold,
         )
 
         self._bg_thread = threading.Thread(

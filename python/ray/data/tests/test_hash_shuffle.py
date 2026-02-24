@@ -620,6 +620,146 @@ def test_aggregator_ray_remote_args_partial_override(ray_start_regular):
         assert "memory" in op._aggregator_pool._aggregator_ray_remote_args
 
 
+def _make_single_input_op_mock(size_bytes=2 * GiB, num_blocks=16):
+    logical_op_mock = MagicMock(LogicalOperator)
+    logical_op_mock.infer_metadata.return_value = BlockMetadata(
+        num_rows=None,
+        size_bytes=size_bytes,
+        exec_stats=None,
+        input_files=None,
+    )
+    logical_op_mock.estimated_num_outputs.return_value = num_blocks
+    op_mock = MagicMock(PhysicalOperator)
+    op_mock._output_dependencies = []
+    op_mock._logical_operators = [logical_op_mock]
+    return op_mock
+
+
+@pytest.mark.parametrize(
+    "operator_factory",
+    [
+        pytest.param(
+            lambda op_mock, ctx: HashShuffleOperator(
+                input_op=op_mock,
+                data_context=ctx,
+                key_columns=("id",),
+            ),
+            id="HashShuffleOperator",
+        ),
+        pytest.param(
+            lambda op_mock, ctx: HashAggregateOperator(
+                input_op=op_mock,
+                data_context=ctx,
+                aggregation_fns=[Count()],
+                key_columns=("id",),
+            ),
+            id="HashAggregateOperator",
+        ),
+    ],
+)
+def test_gpu_shuffle_enabled_adds_num_gpus(ray_start_regular, operator_factory):
+    """When gpu_shuffle_enabled=True, aggregator remote args include num_gpus=0.001."""
+    import copy
+
+    ctx = copy.copy(DataContext.get_current())
+    ctx.gpu_shuffle_enabled = True
+
+    op_mock = _make_single_input_op_mock()
+
+    with (
+        patch(
+            "ray.data._internal.execution.operators.hash_shuffle.ray.cluster_resources",
+            return_value={"CPU": 4.0, "memory": 32 * GiB},
+        ),
+        patch(
+            "ray.data._internal.execution.operators.hash_shuffle._get_total_cluster_resources",
+            return_value=ExecutionResources(cpu=4.0, memory=32 * GiB),
+        ),
+    ):
+        op = operator_factory(op_mock, ctx)
+
+    assert op._aggregator_pool._aggregator_ray_remote_args["num_gpus"] == 0.001
+
+
+def test_gpu_shuffle_enabled_adds_num_gpus_join(ray_start_regular):
+    """When gpu_shuffle_enabled=True, JoinOperator aggregator remote args include num_gpus=0.001."""
+    import copy
+
+    ctx = copy.copy(DataContext.get_current())
+    ctx.gpu_shuffle_enabled = True
+
+    left_op_mock = _make_single_input_op_mock(size_bytes=1 * GiB, num_blocks=10)
+    right_op_mock = _make_single_input_op_mock(size_bytes=1 * GiB, num_blocks=10)
+
+    with patch(
+        "ray.data._internal.execution.operators.hash_shuffle.ray.cluster_resources",
+        return_value={"CPU": 4.0, "memory": 32 * GiB},
+    ):
+        op = JoinOperator(
+            left_input_op=left_op_mock,
+            right_input_op=right_op_mock,
+            data_context=ctx,
+            left_key_columns=("id",),
+            right_key_columns=("id",),
+            join_type=JoinType.INNER,
+        )
+
+    assert op._aggregator_pool._aggregator_ray_remote_args["num_gpus"] == 0.001
+
+
+def test_gpu_shuffle_disabled_by_default(ray_start_regular):
+    """By default (gpu_shuffle_enabled=False), num_gpus is absent from remote args."""
+    op_mock = _make_single_input_op_mock()
+
+    with (
+        patch(
+            "ray.data._internal.execution.operators.hash_shuffle.ray.cluster_resources",
+            return_value={"CPU": 4.0, "memory": 32 * GiB},
+        ),
+        patch(
+            "ray.data._internal.execution.operators.hash_shuffle._get_total_cluster_resources",
+            return_value=ExecutionResources(cpu=4.0, memory=32 * GiB),
+        ),
+    ):
+        op = HashShuffleOperator(
+            input_op=op_mock,
+            data_context=DataContext.get_current(),
+            key_columns=("id",),
+        )
+
+    assert "num_gpus" not in op._aggregator_pool._aggregator_ray_remote_args
+
+
+def test_gpu_shuffle_num_gpus_overridable(ray_start_regular):
+    """aggregator_ray_remote_args_override can override num_gpus set by gpu_shuffle_enabled."""
+    import copy
+
+    ctx = copy.copy(DataContext.get_current())
+    ctx.gpu_shuffle_enabled = True
+
+    op_mock = _make_single_input_op_mock()
+
+    with (
+        patch(
+            "ray.data._internal.execution.operators.hash_shuffle.ray.cluster_resources",
+            return_value={"CPU": 4.0, "memory": 32 * GiB},
+        ),
+        patch(
+            "ray.data._internal.execution.operators.hash_shuffle._get_total_cluster_resources",
+            return_value=ExecutionResources(cpu=4.0, memory=32 * GiB),
+        ),
+    ):
+        op = HashShuffleOperator(
+            input_op=op_mock,
+            data_context=ctx,
+            key_columns=("id",),
+            aggregator_ray_remote_args_override={"num_gpus": 1.0},
+        )
+
+    # Override should win over the default 0.001
+    assert op._aggregator_pool._aggregator_ray_remote_args["num_gpus"] == 1.0
+
+
 if __name__ == "__main__":
     import sys
 

@@ -145,12 +145,8 @@ class CudfBlockAccessor(TableBlockAccessor):
             drop=True
         )
 
-    def schema(self) -> Any:
-        from ray.data._internal.pandas_block import PandasBlockSchema
-
-        dtypes = self._table.dtypes
-        schema = PandasBlockSchema(names=list(self._table.columns), types=list(dtypes))
-        return schema
+    def schema(self) -> "pyarrow.Schema":
+        return self._table.to_arrow().schema
 
     def to_pandas(self) -> "pandas.DataFrame":
         return self._table.to_pandas()
