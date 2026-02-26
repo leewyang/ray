@@ -67,6 +67,7 @@ from ray.data.block import (
     BlockExecStats,
     BlockMetadataWithSchema,
     BlockStats,
+    BlockType,
     _take_first_non_empty_schema,
     to_stats,
 )
@@ -239,6 +240,10 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         # This ensures on_start callback (if registered) can modify the transformer
         # before serialization (e.g., for Iceberg schema evolution).
         self.__map_transformer_ref = None
+        # When True (default), cuDF output blocks are converted to Arrow before
+        # being stored in the object store. Set to False by the Planner for
+        # intermediate cuDF→cuDF steps to avoid unnecessary round-trips.
+        self._convert_cudf_output: bool = True
 
     @property
     def _map_transformer_ref(self):
@@ -281,6 +286,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         kwargs = self._map_task_kwargs.copy()
         for fn in self._map_task_kwargs_fns:
             kwargs.update(fn())
+        kwargs["_convert_cudf_output"] = self._convert_cudf_output
         return kwargs
 
     def get_additional_split_factor(self) -> int:
@@ -739,6 +745,19 @@ def _map_task(
 
         with MemoryProfiler(data_context.memory_usage_poll_interval_s) as profiler:
             for block in map_transformer.apply_transform(block_iter, ctx):
+                # cuDF blocks can only be deserialized on GPU workers. Convert to
+                # Arrow before storing in the object store so blocks are universally
+                # accessible. Downstream cuDF tasks convert Arrow → cuDF on input
+                # via to_batch_format("cudf") → ArrowBlockAccessor.to_cudf().
+                # When _convert_cudf_output is False (set by the Planner for
+                # intermediate cuDF→cuDF steps), skip the conversion to avoid
+                # an unnecessary cuDF→Arrow→cuDF round-trip.
+                accessor = BlockAccessor.for_block(block)
+                if (
+                    kwargs.get("_convert_cudf_output", True)
+                    and accessor.block_type() == BlockType.CUDF
+                ):
+                    block = accessor.to_arrow()
                 block_meta = BlockAccessor.for_block(block).get_metadata()
                 block_schema = BlockAccessor.for_block(block).schema()
 

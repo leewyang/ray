@@ -202,6 +202,7 @@ class Planner:
         physical_dag, op_map = self._plan_recursively(
             logical_plan.dag, logical_plan.context
         )
+        self._configure_cudf_boundaries(physical_dag, op_map)
         physical_plan = PhysicalPlan(physical_dag, op_map, logical_plan.context)
         return physical_plan
 
@@ -265,6 +266,51 @@ class Planner:
         # Also add the final operator (in case the loop didn't catch it)
         op_map[physical_op] = logical_op
         return physical_op, op_map
+
+    def _configure_cudf_boundaries(
+        self,
+        physical_dag: PhysicalOperator,
+        op_map: Dict[PhysicalOperator, LogicalOperator],
+    ) -> None:
+        """Suppress cuDF→Arrow conversion for intermediate GPU→GPU steps.
+
+        For a chain of consecutive cuDF-producing MapBatches operators, only the
+        last one (the one feeding into a non-cuDF consumer or the sink) should
+        convert its output blocks to Arrow. Intermediate operators skip the
+        conversion to avoid an unnecessary cuDF→Arrow→cuDF round-trip.
+        """
+        from ray.data._internal.execution.operators.map_operator import MapOperator
+        from ray.data._internal.logical.operators.map_operator import MapBatches
+
+        # Build a mapping from each operator to the list of its consumers.
+        consumer_map: Dict[PhysicalOperator, List[PhysicalOperator]] = {}
+        visited: set = set()
+        stack = [physical_dag]
+        while stack:
+            op = stack.pop()
+            if op in visited:
+                continue
+            visited.add(op)
+            for dep in op.input_dependencies:
+                consumer_map.setdefault(dep, []).append(op)
+                stack.append(dep)
+
+        def _is_cudf_op(phys_op: PhysicalOperator) -> bool:
+            logical_op = op_map.get(phys_op)
+            return (
+                isinstance(logical_op, MapBatches) and logical_op.batch_format == "cudf"
+            )
+
+        # For each cuDF-producing MapOperator, suppress Arrow conversion when
+        # every downstream consumer is also a cuDF operator.
+        for phys_op in op_map:
+            if not isinstance(phys_op, MapOperator):
+                continue
+            if not _is_cudf_op(phys_op):
+                continue
+            consumers = consumer_map.get(phys_op, [])
+            if consumers and all(_is_cudf_op(c) for c in consumers):
+                phys_op._convert_cudf_output = False
 
     def _create_checkpoint_callback(self, checkpoint_config) -> LoadCheckpointCallback:
         """Factory method to create the LoadCheckpointCallback.

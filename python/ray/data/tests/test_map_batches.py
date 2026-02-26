@@ -846,7 +846,8 @@ def test_map_batches_struct_field_type_divergence(shutdown_only):
 
 
 @pytest.mark.skipif(not CUDF_AVAILABLE, reason="cuDF not available")
-def test_map_batches_cudf_identity(ray_start_2_cpus_1_gpu_shared):
+@pytest.mark.parametrize("ray_start_regular", [{"num_gpus": 1}], indirect=True)
+def test_map_batches_cudf_identity(ray_start_regular):
     """Test that batch_format='cudf' passes cudf.DataFrames through identity UDF."""
     ds = ray.data.range(100)
 
@@ -859,15 +860,15 @@ def test_map_batches_cudf_identity(ray_start_2_cpus_1_gpu_shared):
         batch_format="cudf",
         batch_size=10,
         num_gpus=1,
-    ).materialize()  # materialize to CPU
-
+    )
     assert result.count() == 100
     rows = result.take_all()
     assert [r["id"] for r in rows] == list(range(100))
 
 
 @pytest.mark.skipif(not CUDF_AVAILABLE, reason="cuDF not available")
-def test_map_batches_cudf_transform(ray_start_2_cpus_1_gpu_shared):
+@pytest.mark.parametrize("ray_start_regular", [{"num_gpus": 1}], indirect=True)
+def test_map_batches_cudf_transform(ray_start_regular):
     """Test that a cuDF transform UDF produces correct output."""
     ds = ray.data.from_pandas(pd.DataFrame({"x": [1, 2, 3]}))
     result = ds.map_batches(
@@ -882,7 +883,8 @@ def test_map_batches_cudf_transform(ray_start_2_cpus_1_gpu_shared):
 
 
 @pytest.mark.skipif(not CUDF_AVAILABLE, reason="cuDF not available")
-def test_map_batches_cudf_chained_transforms(ray_start_2_cpus_1_gpu_shared):
+@pytest.mark.parametrize("ray_start_regular", [{"num_gpus": 1}], indirect=True)
+def test_map_batches_cudf_chained_transforms(ray_start_regular):
     """Test that chained cuDF transform UDFs produce correct output."""
 
     def transform1(df):
@@ -894,20 +896,16 @@ def test_map_batches_cudf_chained_transforms(ray_start_2_cpus_1_gpu_shared):
         return df.assign(z=df["y"] * 3)
 
     ds = ray.data.from_pandas(pd.DataFrame({"x": [1, 2, 3]}))
-    result = (
-        ds.map_batches(
-            transform1,
-            batch_format="cudf",
-            batch_size=10,
-            num_gpus=1,
-        )
-        .map_batches(
-            transform2,
-            batch_format="cudf",
-            batch_size=10,
-            num_gpus=1,
-        )
-        .materialize()
+    result = ds.map_batches(
+        transform1,
+        batch_format="cudf",
+        batch_size=10,
+        num_gpus=1,
+    ).map_batches(
+        transform2,
+        batch_format="cudf",
+        batch_size=10,
+        num_gpus=1,
     )
     out = result.to_pandas()
     assert list(out["x"]) == [1, 2, 3]
