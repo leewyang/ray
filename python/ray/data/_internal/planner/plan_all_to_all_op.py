@@ -7,6 +7,7 @@ from ray.data._internal.execution.operators.base_physical_operator import (
 from ray.data._internal.logical.operators import (
     AbstractAllToAll,
     Aggregate,
+    GPUShuffleMapGroups,
     RandomizeBlocks,
     RandomShuffle,
     Repartition,
@@ -35,6 +36,28 @@ def _plan_gpu_shuffle_repartition(
         data_context,
         key_columns=tuple(normalized_key_columns),
         num_partitions=logical_op.num_outputs,
+    )
+
+
+def _plan_gpu_shuffle_map_groups(
+    data_context: DataContext,
+    logical_op: GPUShuffleMapGroups,
+    input_physical_op: PhysicalOperator,
+) -> PhysicalOperator:
+    from ray.data._internal.gpu_shuffle.hash_shuffle import GPUShuffleOperator
+
+    return GPUShuffleOperator(
+        input_physical_op,
+        data_context,
+        key_columns=tuple(logical_op.key_columns),
+        num_partitions=logical_op.num_outputs,
+        post_shuffle_udf=logical_op.udf,
+        keys_for_udf=logical_op.key_columns,
+        batch_format=logical_op.batch_format,
+        fn_args=logical_op.fn_args,
+        fn_kwargs=logical_op.fn_kwargs,
+        fn_constructor_args=logical_op.fn_constructor_args,
+        fn_constructor_kwargs=logical_op.fn_constructor_kwargs,
     )
 
 
@@ -159,8 +182,14 @@ def plan_all_to_all_op(
             debug_limit_shuffle_execution_to_num_blocks,
         )
 
+    elif isinstance(op, GPUShuffleMapGroups):
+        return _plan_gpu_shuffle_map_groups(data_context, op, input_physical_dag)
+
     elif isinstance(op, Aggregate):
-        if data_context.shuffle_strategy == ShuffleStrategy.HASH_SHUFFLE:
+        if data_context.shuffle_strategy in (
+            ShuffleStrategy.HASH_SHUFFLE,
+            ShuffleStrategy.GPU_SHUFFLE,
+        ):
             return _plan_hash_shuffle_aggregate(data_context, op, input_physical_dag)
 
         debug_limit_shuffle_execution_to_num_blocks = data_context.get_config(

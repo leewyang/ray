@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from ray.data._internal.logical.interfaces import (
     LogicalOperator,
@@ -240,3 +240,49 @@ class Aggregate(AbstractAllToAll):
         self.aggs = aggs
         self.num_partitions = num_partitions
         self.batch_format = batch_format
+
+
+class GPUShuffleMapGroups(AbstractAllToAll):
+    """Logical operator for fused GPU shuffle + per-group UDF application.
+
+    Produced by ``GroupedData.map_groups()`` when
+    ``DataContext.shuffle_strategy == ShuffleStrategy.GPU_SHUFFLE``.
+
+    The UDF is applied directly inside the ``GPUShuffleActor`` immediately
+    after extraction, so the full-size input partition never passes through
+    the Ray object store as Arrow. Only the (typically much smaller) UDF
+    result is serialised to Arrow and stored.
+    """
+
+    def __init__(
+        self,
+        input_op: LogicalOperator,
+        key_columns: List[str],
+        udf: Callable,
+        num_partitions: int,
+        batch_format: Optional[str],
+        fn_args: Tuple,
+        fn_kwargs: Dict[str, Any],
+        fn_constructor_args: Optional[Tuple],
+        fn_constructor_kwargs: Optional[Dict[str, Any]],
+    ):
+        super().__init__(
+            input_op,
+            num_outputs=num_partitions,
+            name=f"GPUShuffleMapGroups(key_columns={key_columns})",
+        )
+        self.key_columns = key_columns
+        self.udf = udf
+        self.batch_format = batch_format
+        self.fn_args = fn_args
+        self.fn_kwargs = fn_kwargs
+        self.fn_constructor_args = fn_constructor_args
+        self.fn_constructor_kwargs = fn_constructor_kwargs
+
+    def infer_metadata(self) -> "BlockMetadata":
+        assert len(self.input_dependencies) == 1
+        return self.input_dependencies[0].infer_metadata()
+
+    def infer_schema(self) -> Optional["Schema"]:
+        # Output schema depends on the UDF return type and is not statically known.
+        return None

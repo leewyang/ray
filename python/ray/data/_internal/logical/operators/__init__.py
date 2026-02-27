@@ -3,6 +3,7 @@
 from ray.data._internal.logical.operators.all_to_all_operator import (
     AbstractAllToAll,
     Aggregate,
+    GPUShuffleMapGroups,
     RandomizeBlocks,
     RandomShuffle,
     Repartition,
@@ -42,6 +43,7 @@ from ray.data._internal.logical.operators.write_operator import Write
 __all__ = [
     "AbstractAllToAll",
     "AbstractFrom",
+    "GPUShuffleMapGroups",
     "AbstractMap",
     "AbstractOneToOne",
     "AbstractUDFMap",

@@ -483,7 +483,7 @@ class Dataset:
         self,
         fn: UserDefinedFunction[DataBatch, DataBatch],
         *,
-        batch_size: Union[int, None, Literal["default"]] = None,
+        batch_size: Union[int, None, Literal["default", "block"]] = None,
         compute: Optional[ComputeStrategy] = None,
         batch_format: Optional[str] = "default",
         zero_copy_batch: bool = True,
@@ -624,7 +624,11 @@ class Dataset:
                 entire blocks as batches (blocks may contain different numbers of rows).
                 The actual size of the batch provided to ``fn`` may be smaller than
                 ``batch_size`` if ``batch_size`` doesn't evenly divide the block(s) sent
-                to a given map task. Default ``batch_size`` is ``None``.
+                to a given map task. Pass ``"block"`` to explicitly process one complete
+                block per batch; this is the same as ``None`` but is accepted even when
+                ``num_gpus`` is specified (use it when your UDF is designed to operate on
+                a whole pre-shuffled block rather than fixed-size mini-batches).
+                Default ``batch_size`` is ``None``.
             compute: The compute strategy to use for the map operation.
 
                 * If ``compute`` is not specified for a function, will use ``ray.data.TaskPoolStrategy()`` to launch concurrent tasks based on the available resources and number of input blocks.
@@ -716,13 +720,16 @@ class Dataset:
             A new :class:`Dataset` with the transformation applied to each batch.
         """  # noqa: E501
         use_gpus = num_gpus is not None and num_gpus > 0
-        if use_gpus and (batch_size is None or batch_size == "default"):
+        if batch_size == "block":
+            batch_size = None
+        elif use_gpus and (batch_size is None or batch_size == "default"):
             raise ValueError(
                 "You must provide `batch_size` to `map_batches` when requesting GPUs. "
                 "The optimal batch size depends on the model, data, and GPU used. "
                 "We recommend using the largest batch size that doesn't result "
                 "in your GPU device running out of memory. You can view the GPU memory "
-                "usage via the Ray dashboard."
+                "usage via the Ray dashboard. "
+                "Pass batch_size='block' to process one entire block per batch."
             )
 
         if isinstance(batch_size, int) and batch_size < 1:

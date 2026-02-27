@@ -266,6 +266,34 @@ class CudfBlockAccessor(TableBlockAccessor):
 
         return ret, BlockMetadataWithSchema.from_block(ret, stats=stats.build())
 
+    def _get_group_boundaries_sorted(self, keys: List[str]) -> np.ndarray:
+        """GPU-native group boundary detection.
+
+        Detects transitions between groups entirely on GPU using cuDF
+        shift/compare, transferring only the small boundary-index array to CPU.
+
+        NOTE: NaN key values follow IEEE 754 semantics (NaN != NaN), so
+        consecutive NaN rows are treated as *distinct* groups. This differs
+        from the base-class numpy implementation which treats consecutive NaN
+        values as the *same* group.
+        """
+        if self.num_rows() == 0:
+            return np.array([], dtype=np.int32)
+        if not keys:
+            return np.array([0, self.num_rows()])
+
+        # Detect where key values change — runs entirely on GPU.
+        # shift(1) introduces a null in row 0, and key columns may themselves
+        # contain nulls, so (key_df != shifted) can produce a null-valued
+        # boolean DataFrame.  cuDF's any(axis=1) does not accept nulls, so we
+        # fill them with True (null comparison → treat as a group boundary).
+        key_df = self._table[keys]
+        shifted = key_df.shift(1)
+        changed = (key_df != shifted).fillna(True).any(axis=1)
+        # Transfer only boundary indices (small int array) to CPU
+        boundary_starts = changed.to_numpy().nonzero()[0]
+        return np.append(boundary_starts, self.num_rows()).astype(np.int32)
+
     def iter_rows(
         self, public_row_format: bool
     ) -> Iterator[Union[Mapping, np.ndarray]]:

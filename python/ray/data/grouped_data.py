@@ -9,6 +9,7 @@ from ray.data.aggregate import AggregateFn, Count, Max, Mean, Min, Std, Sum
 from ray.data.block import (
     Block,
     BlockAccessor,
+    BlockType,
     CallableClass,
     DataBatch,
     UserDefinedFunction,
@@ -236,6 +237,46 @@ class GroupedData:
                 # Blocks must be sorted after repartitioning, such that group
                 # of rows sharing the same key values are co-located
                 sort=True,
+            )
+        elif self._dataset.context.shuffle_strategy == ShuffleStrategy.GPU_SHUFFLE:
+            # Fused path: the UDF runs directly inside GPUShuffleActor right
+            # after extraction, so the full input partition never touches the
+            # Ray object store as Arrow.  Only the UDF results are serialised.
+            if self._key is None:
+                _fused_keys: List[str] = []
+            elif isinstance(self._key, str):
+                _fused_keys = [self._key]
+            elif isinstance(self._key, List):
+                _fused_keys = self._key
+            else:
+                raise ValueError(
+                    f"Group-by keys are expected to either be a single column (str) "
+                    f"or a list of columns (got '{self._key}')"
+                )
+            num_partitions = (
+                self._num_partitions
+                or self._dataset.context.gpu_shuffle_num_actors
+                or self._dataset.context.default_hash_shuffle_parallelism
+            )
+            from ray.data._internal.logical.interfaces import LogicalPlan
+            from ray.data._internal.logical.operators import GPUShuffleMapGroups
+
+            gpu_op = GPUShuffleMapGroups(
+                self._dataset._logical_plan.dag,
+                key_columns=_fused_keys,
+                udf=fn,
+                num_partitions=num_partitions,
+                batch_format=batch_format,
+                fn_args=tuple(fn_args or ()),
+                fn_kwargs=fn_kwargs or {},
+                fn_constructor_args=(
+                    tuple(fn_constructor_args) if fn_constructor_args else None
+                ),
+                fn_constructor_kwargs=fn_constructor_kwargs,
+            )
+            return Dataset(
+                self._dataset._plan.copy(),
+                LogicalPlan(gpu_op, self._dataset.context),
             )
         else:
             shuffled_ds = self._dataset.sort(self._key)
@@ -621,6 +662,12 @@ def _apply_udf_to_groups(
     NOTE: This function is defined at module level to avoid capturing closures and make it serializable.
     """
     block_accessor = BlockAccessor.for_block(block)
+
+    # When the UDF expects cuDF, convert the whole block once instead of
+    # converting each group slice individually (avoids N Arrow→cuDF copies).
+    if batch_format == "cudf" and block_accessor.block_type() != BlockType.CUDF:
+        block = block_accessor.to_cudf()
+        block_accessor = BlockAccessor.for_block(block)
 
     boundaries = block_accessor._get_group_boundaries_sorted(keys)
 
