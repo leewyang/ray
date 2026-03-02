@@ -121,6 +121,16 @@ class GPUShuffleActor:
     # Insert / extract interface (called by GPUShuffleOperator)
     # ------------------------------------------------------------------
 
+    def set_columns(self, columns: List[str]) -> None:
+        """Set column names externally (e.g. from the operator).
+
+        Needed when a rank receives shuffled data from peers but never gets
+        a direct ``insert_batch`` call, which is the only other place where
+        ``_columns`` is populated.
+        """
+        if self._columns is None:
+            self._columns = list(columns)
+
     def insert_batch(self, batch) -> int:
         """Hash-partition *batch* (Arrow Table) and route shards to peers.
 
@@ -239,7 +249,11 @@ class GPUShuffleActor:
                 cdf = cdf.sort_values(by=self._key_columns)
 
             # Apply UDF per group directly on the GPU-resident cuDF frame.
-            arrow_parts: List["pa.Table"] = []
+            # Collect results as cuDF on GPU and convert to Arrow once at
+            # the end to avoid thousands of small GPU→CPU transfers.
+            import cudf as _cudf
+
+            cudf_parts: List["_cudf.DataFrame"] = []
             if len(cdf) > 0:
                 accessor = CudfBlockAccessor(cdf)
                 boundaries = accessor._get_group_boundaries_sorted(keys)
@@ -251,10 +265,17 @@ class GPUShuffleActor:
                         list(result) if isinstance(result, IteratorABC) else [result]
                     )
                     for r in results:
-                        arrow_parts.append(BlockAccessor.for_block(r).to_arrow())
+                        if isinstance(r, _cudf.DataFrame):
+                            cudf_parts.append(r)
+                        else:
+                            # Non-cuDF result: wrap into cuDF so we can
+                            # still do a single bulk GPU→CPU transfer.
+                            arrow_r = BlockAccessor.for_block(r).to_arrow()
+                            cudf_parts.append(_cudf.DataFrame.from_arrow(arrow_r))
 
-            if arrow_parts:
-                block = pa.concat_tables(arrow_parts, promote_options="default")
+            if cudf_parts:
+                combined = _cudf.concat(cudf_parts, ignore_index=True)
+                block = combined.to_arrow(preserve_index=False)
             else:
                 block = pa.table({})
 
@@ -437,6 +458,7 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         self._fn_constructor_args = fn_constructor_args
         self._fn_constructor_kwargs = fn_constructor_kwargs
 
+        self._schema_columns: Optional[List[str]] = None
         self._next_block_idx: int = 0
         self._insert_tasks: Dict[int, MetadataOpTask] = {}
         self._extraction_tasks: Dict[int, DataOpTask] = {}
@@ -464,6 +486,12 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
     def _add_input_inner(self, bundle: RefBundle, input_index: int) -> None:
         self._shuffle_metrics.on_input_received(bundle)
         self._shuffled_blocks_stats.extend(to_stats(bundle.metadata))
+
+        # Capture column names from the first input bundle so we can
+        # broadcast them to all actors (including those that never
+        # receive a direct insert_batch call).
+        if self._schema_columns is None and bundle.schema is not None:
+            self._schema_columns = list(bundle.schema.names)
 
         for block_ref, metadata in zip(bundle.block_refs, bundle.metadata):
             actor = self._rank_pool.get_actor_for_block(self._next_block_idx)
@@ -496,6 +524,10 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         self._finalization_started = True
 
         for rank_idx, actor in enumerate(self._rank_pool.actors):
+            # Ensure every actor knows the column names, even those that
+            # never received a direct insert_batch (fewer blocks than ranks).
+            if self._schema_columns is not None:
+                actor.set_columns.remote(self._schema_columns)
             # Fire-and-forget: Ray serialises actor tasks per actor, so
             # insert_finished is guaranteed to run before extract_partitions.
             actor.insert_finished.remote()
