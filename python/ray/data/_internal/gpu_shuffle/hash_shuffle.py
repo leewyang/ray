@@ -248,32 +248,22 @@ class GPUShuffleActor:
             if self._key_columns:
                 cdf = cdf.sort_values(by=self._key_columns)
 
-            # Apply UDF per group directly on the GPU-resident cuDF frame.
-            # Collect results as cuDF on GPU and convert to Arrow once at
-            # the end to avoid thousands of small GPU→CPU transfers.
+            # Apply UDF to the full sorted partition.  The partition is
+            # already hash-partitioned by group keys and sorted, so the UDF
+            # receives all groups for its key-space contiguously.
             import cudf as _cudf
 
-            cudf_parts: List["_cudf.DataFrame"] = []
             if len(cdf) > 0:
-                accessor = CudfBlockAccessor(cdf)
-                boundaries = accessor._get_group_boundaries_sorted(keys)
-                for start, end in zip(boundaries[:-1], boundaries[1:]):
-                    group = accessor.slice(start, end, copy=False)
-                    group_batch = CudfBlockAccessor(group).to_batch_format(batch_format)
-                    result = udf(group_batch, *fn_args, **fn_kwargs)
-                    results = (
-                        list(result) if isinstance(result, IteratorABC) else [result]
-                    )
-                    for r in results:
-                        if isinstance(r, _cudf.DataFrame):
-                            cudf_parts.append(r)
-                        else:
-                            # Non-cuDF result: wrap into cuDF so we can
-                            # still do a single bulk GPU→CPU transfer.
-                            arrow_r = BlockAccessor.for_block(r).to_arrow()
-                            cudf_parts.append(_cudf.DataFrame.from_arrow(arrow_r))
-
-            if cudf_parts:
+                partition_batch = CudfBlockAccessor(cdf).to_batch_format(batch_format)
+                result = udf(partition_batch, *fn_args, **fn_kwargs)
+                results = list(result) if isinstance(result, IteratorABC) else [result]
+                cudf_parts: List["_cudf.DataFrame"] = []
+                for r in results:
+                    if isinstance(r, _cudf.DataFrame):
+                        cudf_parts.append(r)
+                    else:
+                        arrow_r = BlockAccessor.for_block(r).to_arrow()
+                        cudf_parts.append(_cudf.DataFrame.from_arrow(arrow_r))
                 combined = _cudf.concat(cudf_parts, ignore_index=True)
                 block = combined.to_arrow(preserve_index=False)
             else:
@@ -506,7 +496,7 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
                 task_index=task_idx,
                 object_ref=insert_ref,
                 task_done_callback=_on_insert_done,
-                task_resource_bundle=ExecutionResources(gpu=1),
+                task_resource_bundle=ExecutionResources(),
             )
             self._insert_tasks[task_idx] = task
 
@@ -514,7 +504,10 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
                 self._shuffle_bar.update(total=self._next_block_idx)
 
     def _is_inserting_done(self) -> bool:
-        return self._inputs_complete and len(self._insert_tasks) == 0
+        # Only require that all inserts have been *submitted*, not completed.
+        # Ray's per-actor task ordering guarantees that insert_finished (and
+        # extract) run after all pending insert_batch calls on each actor.
+        return self._inputs_complete
 
     def _try_finalize(self) -> None:
         """Schedule extraction once all inserts have completed."""
@@ -629,7 +622,10 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         return ExecutionResources(gpu=self._rank_pool.nranks)
 
     def incremental_resource_usage(self) -> ExecutionResources:
-        return ExecutionResources(gpu=1)
+        return ExecutionResources()
+
+    def current_logical_usage(self) -> ExecutionResources:
+        return self.base_resource_usage
 
     # ------------------------------------------------------------------
     # SubProgressBarMixin
