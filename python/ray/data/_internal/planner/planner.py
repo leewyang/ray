@@ -113,6 +113,20 @@ def plan_join_op(
     data_context: DataContext,
 ) -> PhysicalOperator:
     assert len(physical_children) == 2
+    from ray.data.context import ShuffleStrategy
+
+    if data_context.shuffle_strategy == ShuffleStrategy.GPU_SHUFFLE:
+        from ray.data._internal.gpu_shuffle.join import GPUJoinOperator
+
+        return GPUJoinOperator(
+            data_context=data_context,
+            left_input_op=physical_children[0],
+            right_input_op=physical_children[1],
+            join_type=logical_op.join_type,
+            left_key_columns=list(logical_op.left_key_columns),
+            right_key_columns=list(logical_op.right_key_columns),
+            num_partitions=logical_op.num_outputs,
+        )
     return JoinOperator(
         data_context=data_context,
         left_input_op=physical_children[0],

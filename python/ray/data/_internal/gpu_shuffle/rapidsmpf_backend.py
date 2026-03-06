@@ -247,3 +247,106 @@ class BulkRapidsMPFShuffler(BaseShufflingActor):  # pragma: no cover
                 stream=DEFAULT_STREAM,
             )
             yield partition_id, partition
+
+
+# Exempt this class from coverage — indirectly tested via GPU integration tests.
+class BulkRapidsMPFJoinShuffler(BulkRapidsMPFShuffler):  # pragma: no cover
+    """Two-phase shuffle variant for GPU joins.
+
+    Extends ``BulkRapidsMPFShuffler`` to support a right-then-left shuffle
+    sequence while sharing a single ``ProgressThread`` across both phases.
+
+    Creating a second ``ProgressThread`` on the same communicator (as
+    ``create_shuffler()`` would do) causes a SIGABRT in rapidsmpf's
+    ``FinishCounter::add_finished_chunk``.  This class avoids that by storing
+    one ``ProgressThread`` in :meth:`setup_worker` and reusing it across both
+    shufflers.
+    """
+
+    def setup_worker(self, root_address_bytes: bytes) -> None:
+        """Setup UCXX, RMM, and the Phase-1 (right) shuffler.
+
+        Overrides the parent to store a single ``ProgressThread`` that is
+        shared with the Phase-2 shuffler created in
+        :meth:`reset_for_left_shuffle`.
+        """
+        from rapidsmpf.progress_thread import ProgressThread
+        from rapidsmpf.shuffler import Shuffler
+
+        # Initialise UCXX communicator (sets self._comm, self.rank(), etc.)
+        from rapidsmpf.utils.ray_utils import BaseShufflingActor
+
+        BaseShufflingActor.setup_worker(self, root_address_bytes)
+
+        # RMM pool + buffer resource (identical to BulkRapidsMPFShuffler)
+        mr = RmmResourceAdaptor(
+            rmm.mr.PoolMemoryResource(
+                rmm.mr.CudaMemoryResource(),
+                initial_pool_size=self.rmm_pool_size,
+                maximum_pool_size=None,
+            )
+        )
+        rmm.mr.set_current_device_resource(mr)
+        memory_available = (
+            None
+            if self.spill_memory_limit is None
+            else {
+                MemoryType.DEVICE: LimitAvailableMemory(
+                    mr, limit=self.spill_memory_limit
+                )
+            }
+        )
+        self.br = BufferResource(device_mr=mr, memory_available=memory_available)
+        self.stats = Statistics(enable=self.enable_statistics, mr=mr)
+
+        # ONE ProgressThread shared for both phases.
+        self._progress_thread: "ProgressThread" = ProgressThread(
+            self._comm, self.stats
+        )
+        self._op_id: int = 0
+        self.shuffler: "Shuffler" = Shuffler(
+            self._comm,
+            self._progress_thread,
+            op_id=self._op_id,
+            total_num_partitions=self.total_nparts,
+            br=self.br,
+            statistics=self.stats,
+        )
+
+    def reset_for_left_shuffle(self, left_keys: list[str]) -> None:
+        """Transition to Phase 2: update shuffle keys and create a new Shuffler.
+
+        The existing ``shuffler`` is discarded without calling ``shutdown()``
+        because the shared ``ProgressThread`` must remain alive.  The new
+        shuffler uses an incremented ``op_id`` to distinguish Phase-2 traffic.
+
+        Parameters
+        ----------
+        left_keys
+            Column names to hash-partition on during Phase 2.
+        """
+        from rapidsmpf.shuffler import Shuffler
+
+        self.shuffle_on = left_keys
+        self._op_id += 1
+        # Do NOT call self.shuffler.shutdown() — that would tear down the
+        # shared ProgressThread and corrupt the communicator state.
+        self.shuffler = Shuffler(
+            self._comm,
+            self._progress_thread,
+            op_id=self._op_id,
+            total_num_partitions=self.total_nparts,
+            br=self.br,
+            statistics=self.stats,
+        )
+
+    def cleanup(self) -> None:
+        """Log statistics and release references without calling shutdown.
+
+        ``shutdown()`` would invalidate the shared ``ProgressThread``.  We
+        simply drop our references and let the GC/UCXX teardown handle cleanup.
+        """
+        if self.enable_statistics and self.stats is not None:
+            self.comm.logger.info(self.stats.report())
+        self.shuffler = None
+        self._progress_thread = None
