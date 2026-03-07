@@ -28,13 +28,11 @@ import logging
 from collections import deque
 from typing import (
     Any,
-    Callable,
     Deque,
     Dict,
     Iterator,
     List,
     Optional,
-    Tuple,
     Union,
 )
 
@@ -147,6 +145,18 @@ class GPUJoinActor:
         self._right_schema: Optional[pa.Schema] = None
         self._left_schema: Optional[pa.Schema] = None
 
+        # Accumulated state for deferred right-only rows across left chunks.
+        # For FULL_OUTER / RIGHT_OUTER, right-only rows cannot be emitted
+        # per-chunk because a right row that appears unmatched in chunk N may
+        # be matched by a left row in chunk N+1.  Instead, each execute_join
+        # call appends to these lists; flush=True (final chunk only) emits them.
+        self._deferred_right_only: bool = join_type in (
+            JoinType.FULL_OUTER,
+            JoinType.RIGHT_OUTER,
+        )
+        self._matched_keys_cdfs: List = []  # cudf.DataFrames of matched key rows
+        self._right_only_cdfs: List = []  # cudf.DataFrames of right-only candidate rows
+
     # ------------------------------------------------------------------
     # UCXX communicator setup
     # ------------------------------------------------------------------
@@ -253,46 +263,62 @@ class GPUJoinActor:
         """Signal no more left batches will be inserted."""
         self._shuffler.insert_finished()
 
+    def start_left_chunk(self) -> None:
+        """Reset the left shuffler for the next chunk (chunked left shuffle).
+
+        Called after ``execute_join`` completes for one chunk so that the actor
+        can accept a new round of ``insert_left_batch`` / ``left_insert_finished``
+        / ``execute_join`` for the following chunk.  ``stored_right_df`` is
+        preserved across chunks.
+        """
+        self._shuffler.reset_for_left_shuffle(self._left_key_columns)
+
     # ------------------------------------------------------------------
     # Phase 3 — join
     # ------------------------------------------------------------------
 
-    def execute_join(self) -> Iterator:
+    def execute_join(self, flush: bool = False) -> Iterator[BlockMetadataWithSchema]:
         """Extract left partitions and merge with stored right data.
 
         Streaming generator: yields alternating ``pa.Table`` /
         ``BlockMetadataWithSchema`` pairs following the Ray Data protocol.
 
-        For FULL_OUTER and RIGHT_OUTER we must not emit right-only rows per
-        partition: if an empty left partition is merged first we would emit all
-        of stored_right as right-only, then a later non-empty partition would
-        emit matched rows, duplicating those right rows. So we only yield
-        matched + left-only rows in the loop and emit right-only rows after
-        processing all left partitions (minus matched keys).
+        For FULL_OUTER and RIGHT_OUTER, right-only rows cannot be emitted
+        per-chunk: a right row unmatched in chunk N might be matched in chunk
+        N+1.  Matched key frames and right-only candidate frames are
+        accumulated in ``self._matched_keys_cdfs`` / ``self._right_only_cdfs``
+        across all chunks.  When ``flush=True`` (final chunk only) these
+        accumulated frames are reconciled and the true right-only rows are
+        emitted before the generator returns.  ``_stored_right_df`` is also
+        released on flush.
+
+        Args:
+            flush: If True, emit accumulated right-only rows after processing
+                this chunk's left partitions and release ``_stored_right_df``.
+                Must be True exactly once — for the final left chunk.
+
+        Yields:
+            BlockMetadataWithSchema: A block of data and its metadata.
+            BlockExecStats: The execution statistics of the block.
         """
         import cudf
-
         from rapidsmpf.utils.cudf import pylibcudf_to_cudf_dataframe
 
-        from ray.data.block import BlockExecStats, BlockMetadataWithSchema
+        from ray.data.block import BlockExecStats
 
         how = _CUDF_JOIN_MAP[self._join_type]
 
         left_columns = self._left_schema.names if self._left_schema is not None else []
-        left_value_columns = [c for c in left_columns if c not in self._left_key_columns]
+        left_value_columns = [
+            c for c in left_columns if c not in self._left_key_columns
+        ]
 
-        # construct merged schema from left and right schemas
         merged_schema = pa.unify_schemas([self._left_schema, self._right_schema])
 
-        deferred_right_only = self._join_type in (
-            JoinType.FULL_OUTER,
-            JoinType.RIGHT_OUTER,
-        )
-        # Set of cudf.DataFrames for matched keys and right-only rows
-        matched_keys_cdfs = []
-        right_only_cdfs = []
-
         for _, left_partition in self._shuffler.extract():
+            if left_partition.num_rows() == 0:
+                continue
+
             exec_stats_builder = BlockExecStats.builder()
             left_cdf = pylibcudf_to_cudf_dataframe(
                 left_partition, column_names=left_columns
@@ -304,61 +330,74 @@ class GPUJoinActor:
                 right_on=self._right_key_columns,
                 how=how,
             )
-            del left_cdf  # free left partition GPU memory immediately after merge
+            del left_cdf
             if len(result_cdf) == 0:
                 continue
 
-            if deferred_right_only:
+            if self._deferred_right_only:
                 right_only_mask = result_cdf[left_value_columns].isna().all(axis=1)
                 matched_mask = ~right_only_mask
                 if right_only_mask.any():
-                    # save right-only rows for later
-                    right_only_cdf = result_cdf[right_only_mask]
-                    right_only_cdfs.append(right_only_cdf)
+                    self._right_only_cdfs.append(result_cdf[right_only_mask])
                 if not matched_mask.any():
-                    # skip if no matched rows
                     continue
 
                 matched_cdf = result_cdf[matched_mask]
-                matched_keys = matched_cdf[self._left_key_columns].drop_duplicates()
-                matched_keys_cdfs.append(matched_keys)
+                self._matched_keys_cdfs.append(
+                    matched_cdf[self._left_key_columns].drop_duplicates()
+                )
                 result_cdf = matched_cdf
                 matched_cdf = None
 
-            # explicitly cast the result to the merged schema to avoid null type conversion errors
             final_schema = _normalize_schema_for_cudf(
-                pa.schema([field for field in merged_schema if field.name in result_cdf.columns])
+                pa.schema(
+                    [
+                        field
+                        for field in merged_schema
+                        if field.name in result_cdf.columns
+                    ]
+                )
             )
             block = result_cdf.to_arrow(preserve_index=False).cast(final_schema)
-            del result_cdf  # free GPU memory; data is now in Arrow (CPU/object store)
+            del result_cdf
             exec_stats = exec_stats_builder.build()
             stats = yield block
             if stats:
                 exec_stats.block_ser_time_s = stats.object_creation_dur_s
             yield BlockMetadataWithSchema.from_block(block, stats=exec_stats)
 
-        # Emit right-only rows whose key never matched after all left partitions have been processed
-        if deferred_right_only and len(self._stored_right_df) > 0:
-            matched_keys_cdf = cudf.concat(matched_keys_cdfs).drop_duplicates()
-            matched_keys_cdfs.clear()
-            right_only_cdf = cudf.concat(right_only_cdfs).drop_duplicates()
-            right_only_cdfs.clear()
-            right_only_cdf = right_only_cdf.merge(
-                matched_keys_cdf, on=self._right_key_columns, how="leftanti"
-            )
-            del matched_keys_cdf
+        if flush and self._deferred_right_only and len(self._stored_right_df) > 0:
+            if self._right_only_cdfs:
+                right_only_cdf = cudf.concat(
+                    self._right_only_cdfs, ignore_index=True
+                ).drop_duplicates()
+                self._right_only_cdfs.clear()
 
-            if len(right_only_cdf) > 0:
-                block = right_only_cdf.to_arrow(preserve_index=False).cast(merged_schema)
-                del right_only_cdf  # free GPU memory after Arrow conversion
-                exec_stats = BlockExecStats.builder().build()
-                stats = yield block
-                if stats:
-                    exec_stats.block_ser_time_s = stats.object_creation_dur_s
-                yield BlockMetadataWithSchema.from_block(block, stats=exec_stats)
+                if self._matched_keys_cdfs:
+                    matched_keys_cdf = cudf.concat(
+                        self._matched_keys_cdfs, ignore_index=True
+                    ).drop_duplicates()
+                    self._matched_keys_cdfs.clear()
+                    right_only_cdf = right_only_cdf.merge(
+                        matched_keys_cdf, on=self._right_key_columns, how="leftanti"
+                    )
+                    del matched_keys_cdf
 
-        # All joins complete — release right dataset GPU memory.
-        del self._stored_right_df
+                if len(right_only_cdf) > 0:
+                    block = right_only_cdf.to_arrow(preserve_index=False).cast(
+                        merged_schema
+                    )
+                    del right_only_cdf
+                    exec_stats = BlockExecStats.builder().build()
+                    stats = yield block
+                    if stats:
+                        exec_stats.block_ser_time_s = stats.object_creation_dur_s
+                    yield BlockMetadataWithSchema.from_block(block, stats=exec_stats)
+
+        if flush:
+            self._matched_keys_cdfs.clear()
+            self._right_only_cdfs.clear()
+            del self._stored_right_df
 
 
 # ---------------------------------------------------------------------------
@@ -399,10 +438,7 @@ class GPUJoinRankPool:
     def start(self) -> None:
         """Create actors and coordinate UCXX setup (blocks until complete)."""
         self._actors = [
-            GPUJoinActor.options(
-                num_gpus=1,
-                scheduling_strategy="SPREAD",
-            ).remote(
+            GPUJoinActor.options(num_gpus=1, scheduling_strategy="SPREAD",).remote(
                 nranks=self._nranks,
                 total_nparts=self._total_nparts,
                 left_key_columns=self._left_key_columns,
@@ -542,6 +578,12 @@ class GPUJoinOperator(PhysicalOperator, SubProgressBarMixin):
         self._finalization_started: bool = False
         self._output_queue: Deque[RefBundle] = deque()
 
+        # Chunked left shuffle: row threshold and tracking state.
+        # _chunk_index is used to generate unique extraction task IDs across chunks.
+        self._left_chunk_rows: int = data_context.gpu_join_left_chunk_rows
+        self._left_rows_in_chunk: int = 0
+        self._chunk_index: int = 0
+
         self._insert_stats: List[BlockStats] = []
         self._output_stats: List[BlockStats] = []
 
@@ -604,7 +646,7 @@ class GPUJoinOperator(PhysicalOperator, SubProgressBarMixin):
 
     def _submit_left_bundle(self, bundle: RefBundle) -> None:
         # Use a separate counter offset so right and left task IDs don't clash.
-        for block_ref, _metadata in zip(bundle.block_refs, bundle.metadata):
+        for block_ref, metadata in zip(bundle.block_refs, bundle.metadata):
             actor = self._rank_pool.get_actor_for_block(self._left_block_idx)
             insert_ref = actor.insert_left_batch.remote(block_ref)
             # Offset left indices past right indices to keep task IDs unique.
@@ -621,6 +663,11 @@ class GPUJoinOperator(PhysicalOperator, SubProgressBarMixin):
                 task_resource_bundle=ExecutionResources(),
             )
             self._insert_tasks[task_idx] = task
+
+            if self._left_chunk_rows > 0:
+                self._left_rows_in_chunk += metadata.num_rows or 0
+                if self._left_rows_in_chunk >= self._left_chunk_rows:
+                    self._cut_left_chunk()
 
     # ------------------------------------------------------------------
     # Phase transitions
@@ -653,8 +700,54 @@ class GPUJoinOperator(PhysicalOperator, SubProgressBarMixin):
         # meaning both input_done(0) and input_done(1) have fired.
         return self._inputs_complete
 
+    def _cut_left_chunk(self) -> None:
+        """Fire left_insert_finished + execute_join + start_left_chunk for the
+        current left chunk, then reset row counter for the next chunk.
+
+        All three calls are enqueued in the actor's FIFO mailbox immediately
+        after the preceding ``insert_left_batch`` calls, so no additional
+        synchronisation is needed.  ``start_left_chunk`` resets the shuffler
+        so that subsequent ``insert_left_batch`` calls begin a fresh epoch.
+        """
+        for rank_idx, actor in enumerate(self._rank_pool.actors):
+            if self._left_schema is not None:
+                actor.set_left_schema.remote(self._left_schema)
+            actor.left_insert_finished.remote()
+            block_gen = actor.execute_join.options(num_returns="streaming").remote()
+
+            task_idx = self._chunk_index * self._rank_pool.nranks + rank_idx
+
+            def _on_bundle_ready(bundle: RefBundle, _rank: int = rank_idx) -> None:
+                self._output_queue.append(bundle)
+                self._reduce_metrics.on_output_queued(bundle)
+
+            def _on_extraction_done(
+                exc: Optional[Exception],
+                _tidx: int = task_idx,
+            ) -> None:
+                self._extraction_tasks.pop(_tidx, None)
+
+            data_task = DataOpTask(
+                task_index=task_idx,
+                streaming_gen=block_gen,
+                output_ready_callback=_on_bundle_ready,
+                task_done_callback=_on_extraction_done,
+            )
+            self._extraction_tasks[task_idx] = data_task
+
+            empty_bundle = RefBundle([], schema=None, owns_blocks=False)
+            self._reduce_metrics.on_task_submitted(
+                task_idx, empty_bundle, task_id=data_task.get_task_id()
+            )
+
+            # Reset shuffler for the next chunk — FIFO after execute_join.
+            actor.start_left_chunk.remote()
+
+        self._left_rows_in_chunk = 0
+        self._chunk_index += 1
+
     def _try_finalize(self) -> None:
-        """Submit left_insert_finished + execute_join once all inserts are in."""
+        """Submit left_insert_finished + execute_join for the final left chunk."""
         if self._finalization_started or not self._is_inserting_done():
             return
         self._finalization_started = True
@@ -663,36 +756,38 @@ class GPUJoinOperator(PhysicalOperator, SubProgressBarMixin):
             if self._left_schema is not None:
                 actor.set_left_schema.remote(self._left_schema)
             actor.left_insert_finished.remote()
-            block_gen = actor.execute_join.options(num_returns="streaming").remote()
+            block_gen = actor.execute_join.options(num_returns="streaming").remote(
+                flush=True
+            )
 
-            def _on_bundle_ready(
-                bundle: RefBundle, _rank: int = rank_idx
-            ) -> None:
+            task_idx = self._chunk_index * self._rank_pool.nranks + rank_idx
+
+            def _on_bundle_ready(bundle: RefBundle, _rank: int = rank_idx) -> None:
                 self._output_queue.append(bundle)
                 self._reduce_metrics.on_output_queued(bundle)
 
             def _on_extraction_done(
                 exc: Optional[Exception],
-                _rank: int = rank_idx,
+                _tidx: int = task_idx,
                 actor_handle: ActorHandle = actor,
             ) -> None:
-                self._extraction_tasks.pop(_rank, None)
+                self._extraction_tasks.pop(_tidx, None)
                 try:
                     ray.kill(actor_handle, no_restart=True)
                 except Exception:
                     pass
 
             data_task = DataOpTask(
-                task_index=rank_idx,
+                task_index=task_idx,
                 streaming_gen=block_gen,
                 output_ready_callback=_on_bundle_ready,
                 task_done_callback=_on_extraction_done,
             )
-            self._extraction_tasks[rank_idx] = data_task
+            self._extraction_tasks[task_idx] = data_task
 
             empty_bundle = RefBundle([], schema=None, owns_blocks=False)
             self._reduce_metrics.on_task_submitted(
-                rank_idx, empty_bundle, task_id=data_task.get_task_id()
+                task_idx, empty_bundle, task_id=data_task.get_task_id()
             )
 
     # ------------------------------------------------------------------
@@ -715,9 +810,7 @@ class GPUJoinOperator(PhysicalOperator, SubProgressBarMixin):
     # ------------------------------------------------------------------
 
     def get_active_tasks(self) -> List[OpTask]:
-        return list(self._insert_tasks.values()) + list(
-            self._extraction_tasks.values()
-        )
+        return list(self._insert_tasks.values()) + list(self._extraction_tasks.values())
 
     def has_completed(self) -> bool:
         return (

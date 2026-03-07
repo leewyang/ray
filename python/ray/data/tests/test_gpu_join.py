@@ -6,16 +6,13 @@ dependencies.  Integration tests (marked with ``gpu``) require a real GPU.
 
 from __future__ import annotations
 
-from pandas.io.feather_format import arrow_table_to_pandas
-import pytest
 import pyarrow as pa
+import pytest
 
 import ray
 import ray.data
 from ray.data._internal.logical.operators import JoinType
 from ray.data.context import DataContext, ShuffleStrategy
-from ray.exceptions import RayTaskError
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -27,9 +24,7 @@ def _left_table(n: int = 10) -> pa.Table:
 
 
 def _right_table(n: int = 5) -> pa.Table:
-    return pa.table(
-        {"id": list(range(n)), "right_val": [f"R{i}" for i in range(n)]}
-    )
+    return pa.table({"id": list(range(n)), "right_val": [f"R{i}" for i in range(n)]})
 
 
 # ---------------------------------------------------------------------------
@@ -43,8 +38,6 @@ class TestPlanJoinOp:
     def test_gpu_shuffle_routes_to_gpu_join_operator(self, monkeypatch):
         """GPU_SHUFFLE strategy should produce a GPUJoinOperator."""
         from unittest.mock import MagicMock, patch
-
-        from ray.data._internal.planner.planner import plan_join_op
 
         logical_op = MagicMock()
         logical_op.join_type = JoinType.INNER
@@ -178,6 +171,9 @@ class TestGPUJoinOperatorPhasing:
         op._shuffle_bar = None
         op._shuffle_metrics = MagicMock()
         op._reduce_metrics = MagicMock()
+        op._left_chunk_rows = 0
+        op._left_rows_in_chunk = 0
+        op._chunk_index = 0
         return op, mock_pool
 
     def _make_bundle(self, n_blocks: int = 1):
@@ -311,14 +307,18 @@ class TestGPUJoinActorMethods:
         actor, _, _ = self._make_actor()
         table = pa.Table.from_pydict({"a": [1, 2], "b": [3, 4]})
         actor.set_right_schema(table.schema)
-        actor.set_right_schema(pa.Table.from_pydict({"c": [5, 6]}).schema)  # should be ignored
+        actor.set_right_schema(
+            pa.Table.from_pydict({"c": [5, 6]}).schema
+        )  # should be ignored
         assert actor._right_schema == table.schema
 
     def test_set_left_schema_only_sets_once(self):
         actor, _, _ = self._make_actor()
         table = pa.Table.from_pydict({"x": [1, 2], "y": [3, 4]})
         actor.set_left_schema(table.schema)
-        actor.set_left_schema(pa.Table.from_pydict({"z": [5, 6]}).schema)  # should be ignored
+        actor.set_left_schema(
+            pa.Table.from_pydict({"z": [5, 6]}).schema
+        )  # should be ignored
         assert actor._left_schema == table.schema
 
 
@@ -329,7 +329,7 @@ class TestGPUJoinActorMethods:
 
 class TestGPUJoinRankPool:
     def test_round_robin_distribution(self):
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
 
         from ray.data._internal.gpu_shuffle.join import GPUJoinRankPool
 
@@ -352,7 +352,6 @@ class TestGPUJoinRankPool:
         from unittest.mock import MagicMock, patch
 
         import ray as ray_mod
-
         from ray.data._internal.gpu_shuffle.join import GPUJoinRankPool
 
         pool = GPUJoinRankPool(
@@ -410,7 +409,6 @@ class TestBulkRapidsMPFJoinShuffler:
             sys.modules,
             {"rapidsmpf.shuffler": MagicMock(Shuffler=mock_shuffler_cls)},
         ):
-            import importlib
             import rapidsmpf.shuffler as rs_mod
 
             rs_mod.Shuffler = mock_shuffler_cls
@@ -705,4 +703,8 @@ class TestGPUJoinIntegration:
 
 
 if __name__ == "__main__":
-    TestGPUJoinIntegration().test_right_anti_join()
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main(["-v", __file__]))

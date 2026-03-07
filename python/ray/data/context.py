@@ -560,6 +560,11 @@ class DataContext:
         gpu_shuffle_spill_memory_limit: Device-to-host spill threshold per rank.
             ``"auto"`` uses 80% of ``gpu_shuffle_rmm_pool_size``; ``None`` disables
             spilling.
+        gpu_join_left_chunk_rows: Maximum number of left-side rows to shuffle and join
+            in a single chunk during a GPU join. When > 0, the left dataset is
+            processed in successive rounds of insert→extract→join, allowing result
+            blocks to be yielded before the entire left dataset is shuffled. 0
+            (default) processes all left rows in a single pass.
     """
 
     # `None` means the block size is infinite.
@@ -633,6 +638,10 @@ class DataContext:
     # Device→host spill threshold for each rank.
     # "auto" = 80% of rmm_pool_size; None = spilling disabled.
     gpu_shuffle_spill_memory_limit: Union[int, str, None] = "auto"
+
+    # Max left-side rows per chunk for GPU join chunked left shuffle.
+    # 0 = process all left rows in a single pass (no chunking).
+    gpu_join_left_chunk_rows: int = 0
 
     scheduling_strategy: SchedulingStrategyT = DEFAULT_SCHEDULING_STRATEGY
     scheduling_strategy_large_args: SchedulingStrategyT = (
