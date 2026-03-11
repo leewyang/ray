@@ -178,7 +178,7 @@ class CudfBlockAccessor(TableBlockAccessor):
         return dict(zip(columns, arrays))
 
     def to_arrow(self) -> "pyarrow.Table":
-        return self._table.to_arrow()
+        return self._table.to_arrow(preserve_index=False)
 
     def to_cudf(self) -> "cudf.DataFrame":
         return self._table

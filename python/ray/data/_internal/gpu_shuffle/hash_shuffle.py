@@ -117,6 +117,14 @@ class GPUShuffleActor:
         """
         self._shuffler.setup_worker(root_address)
 
+    def shutdown_and_exit(self) -> None:
+        """Gracefully tear down UCXX/rapidsmpf state, then exit the actor."""
+        try:
+            self._shuffler.cleanup()
+        except Exception:
+            pass
+        ray.actor.exit_actor()
+
     # ------------------------------------------------------------------
     # Insert / extract interface (called by GPUShuffleOperator)
     # ------------------------------------------------------------------
@@ -340,12 +348,14 @@ class GPURankPool:
         return self._actors[block_idx % self._nranks]
 
     def shutdown(self, force: bool = False) -> None:
-        if force:
-            for actor in self._actors:
-                try:
+        for actor in self._actors:
+            try:
+                if force:
                     ray.kill(actor)
-                except Exception:
-                    pass
+                else:
+                    actor.shutdown_and_exit.remote()
+            except Exception:
+                pass
         self._actors.clear()
 
 
@@ -551,13 +561,13 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
                 actor_handle: ActorHandle = actor,
             ) -> None:
                 self._extraction_tasks.pop(rank, None)
-                # Kill the actor immediately so its GPU is released.
+                # Shutdown the actor immediately so its GPU is released.
                 # All blocks are in the object store by the time extraction
                 # finishes; holding the actor alive would prevent downstream
                 # GPU tasks (e.g. map_groups with num_gpus=1) from being
                 # scheduled until the entire operator is shut down.
                 try:
-                    ray.kill(actor_handle, no_restart=True)
+                    actor_handle.shutdown_and_exit.remote()
                 except Exception:
                     pass
 

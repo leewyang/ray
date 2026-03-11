@@ -169,6 +169,14 @@ class GPUJoinActor:
         """Complete UCXX setup and create the Phase-1 shuffler."""
         self._shuffler.setup_worker(root_address)
 
+    def shutdown_and_exit(self) -> None:
+        """Gracefully tear down UCXX/rapidsmpf state, then exit the actor."""
+        try:
+            self._shuffler.cleanup()
+        except Exception:
+            pass
+        ray.actor.exit_actor()
+
     # ------------------------------------------------------------------
     # Column-schema helpers (needed for ranks that receive no batches)
     # ------------------------------------------------------------------
@@ -460,12 +468,14 @@ class GPUJoinRankPool:
         return self._actors[block_idx % self._nranks]
 
     def shutdown(self, force: bool = False) -> None:
-        if force:
-            for actor in self._actors:
-                try:
+        for actor in self._actors:
+            try:
+                if force:
                     ray.kill(actor)
-                except Exception:
-                    pass
+                else:
+                    actor.shutdown_and_exit.remote()
+            except Exception:
+                pass
         self._actors.clear()
 
 
@@ -773,7 +783,7 @@ class GPUJoinOperator(PhysicalOperator, SubProgressBarMixin):
             ) -> None:
                 self._extraction_tasks.pop(_tidx, None)
                 try:
-                    ray.kill(actor_handle, no_restart=True)
+                    actor_handle.shutdown_and_exit.remote()
                 except Exception:
                     pass
 

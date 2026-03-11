@@ -300,9 +300,7 @@ class BulkRapidsMPFJoinShuffler(BulkRapidsMPFShuffler):  # pragma: no cover
         self.stats = Statistics(enable=self.enable_statistics, mr=mr)
 
         # ONE ProgressThread shared for both phases.
-        self._progress_thread: "ProgressThread" = ProgressThread(
-            self._comm, self.stats
-        )
+        self._progress_thread: "ProgressThread" = ProgressThread(self._comm, self.stats)
         self._op_id: int = 0
         self.shuffler: "Shuffler" = Shuffler(
             self._comm,
