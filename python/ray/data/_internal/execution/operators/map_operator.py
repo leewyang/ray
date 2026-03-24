@@ -69,6 +69,7 @@ from ray.data.block import (
     BlockExecStats,
     BlockMetadataWithSchema,
     BlockStats,
+    BlockType,
     TaskExecWorkerStats,
     _take_first_non_empty_schema,
     to_stats,
@@ -230,6 +231,10 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         # too-large blocks, which may reduce parallelism for
         # the subsequent operator.
         self._additional_split_factor = None
+        # When True (default), cuDF output blocks are converted to Arrow before
+        # being stored in the object store. Set to False by the Planner for
+        # intermediate cuDF→cuDF steps to avoid unnecessary round-trips.
+        self._convert_cudf_output: bool = True
         # Callback functions that generate additional task kwargs
         # for the map task.
         self._map_task_kwargs_fns: List[Callable[[], Dict[str, Any]]] = []
@@ -286,6 +291,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         kwargs = self._map_task_kwargs.copy()
         for fn in self._map_task_kwargs_fns:
             kwargs.update(fn())
+        kwargs["_convert_cudf_output"] = self._convert_cudf_output
         return kwargs
 
     def get_additional_split_factor(self) -> int:
@@ -759,8 +765,20 @@ def _map_task(
 
         with MemoryProfiler(data_context.memory_usage_poll_interval_s) as profiler:
             for block in map_transformer.apply_transform(blocks_iter, ctx):
-                block_meta = BlockAccessor.for_block(block).get_metadata()
-                block_schema = BlockAccessor.for_block(block).schema()
+                # cuDF blocks can only be deserialized on GPU workers, so convert to Arrow
+                # before storing in the object store so blocks are universally accessible.
+                # If _convert_cudf_output is False (set by the Planner for cuDF→cuDF steps),
+                # skip the conversion to avoid an unnecessary cuDF→Arrow→cuDF round-trip.
+                block_accessor = BlockAccessor.for_block(block)
+                if (
+                    kwargs.get("_convert_cudf_output", True)
+                    and block_accessor.block_type() == BlockType.CUDF
+                ):
+                    block = block_accessor.to_arrow()
+                    block_accessor = BlockAccessor.for_block(block)
+
+                block_meta = block_accessor.get_metadata()
+                block_schema = block_accessor.schema()
 
                 # Finish processing before yielding the block!
                 blk_exec_stats_builder.finish()

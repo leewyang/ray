@@ -27,6 +27,10 @@ if TYPE_CHECKING:
     from rapidsmpf.shuffler import Shuffler
 
 
+_BulkRapidsMPFShuffler = None
+_BulkRapidsMPFJoinShuffler = None
+
+
 def align_down_to_256(value: int) -> int:
     return (value >> 8) << 8
 
@@ -61,6 +65,8 @@ def lazy_load() -> type[Any]:
         unpack_and_concat,
         unspill_partitions,
     )
+    from rapidsmpf.memory.buffer import MemoryType
+    from rapidsmpf.memory.buffer_resource import BufferResource, LimitAvailableMemory
     from rapidsmpf.rmm_resource_adaptor import RmmResourceAdaptor
     from rapidsmpf.statistics import Statistics
     from rapidsmpf.utils.cudf import cudf_to_pylibcudf_table
@@ -263,16 +269,124 @@ def lazy_load() -> type[Any]:
                 )
                 yield partition_id, partition
 
-    return BulkRapidsMPFShuffler
+    # Exempt this class from coverage —
+    class BulkRapidsMPFJoinShuffler(BulkRapidsMPFShuffler):  # pragma: no cover
+        """Two-phase shuffle variant for GPU joins.
 
+        Extends ``BulkRapidsMPFShuffler`` to support a right-then-left shuffle
+        sequence while sharing a single ``ProgressThread`` across both phases.
 
-_BulkRapidsMPFShuffler = None
+        Creating a second ``ProgressThread`` on the same communicator (as
+        ``create_shuffler()`` would do) causes a SIGABRT in rapidsmpf's
+        ``FinishCounter::add_finished_chunk``.  This class avoids that by storing
+        one ``ProgressThread`` in :meth:`setup_worker` and reusing it across both
+        shufflers.
+        """
+
+        def setup_worker(self, root_address_bytes: bytes) -> None:
+            """Setup UCXX, RMM, and the Phase-1 (right) shuffler.
+
+            Overrides the parent to store a single ``ProgressThread`` that is
+            shared with the Phase-2 shuffler created in
+            :meth:`reset_for_left_shuffle`.
+            """
+            from rapidsmpf.progress_thread import ProgressThread
+            from rapidsmpf.shuffler import Shuffler
+
+            # Initialise UCXX communicator (sets self._comm, self.rank(), etc.)
+            from rapidsmpf.utils.ray_utils import BaseShufflingActor
+
+            BaseShufflingActor.setup_worker(self, root_address_bytes)
+
+            # RMM pool + buffer resource (identical to BulkRapidsMPFShuffler)
+            mr = RmmResourceAdaptor(
+                rmm.mr.PoolMemoryResource(
+                    rmm.mr.CudaMemoryResource(),
+                    initial_pool_size=self.rmm_pool_size,
+                    maximum_pool_size=None,
+                )
+            )
+            rmm.mr.set_current_device_resource(mr)
+            memory_available = (
+                None
+                if self.spill_memory_limit is None
+                else {
+                    MemoryType.DEVICE: LimitAvailableMemory(
+                        mr, limit=self.spill_memory_limit
+                    )
+                }
+            )
+            self.br = BufferResource(device_mr=mr, memory_available=memory_available)
+            self.stats = Statistics(enable=self.enable_statistics, mr=mr)
+
+            # ONE ProgressThread shared for both phases.
+            self._progress_thread: "ProgressThread" = ProgressThread(
+                self._comm, self.stats
+            )
+            self._op_id: int = 0
+            self.shuffler: "Shuffler" = Shuffler(
+                self._comm,
+                self._progress_thread,
+                op_id=self._op_id,
+                total_num_partitions=self.total_nparts,
+                br=self.br,
+                statistics=self.stats,
+            )
+
+        def reset_for_left_shuffle(self, left_keys: list[str]) -> None:
+            """Transition to Phase 2: update shuffle keys and create a new Shuffler.
+
+            The existing ``shuffler`` is discarded without calling ``shutdown()``
+            because the shared ``ProgressThread`` must remain alive.  The new
+            shuffler uses an incremented ``op_id`` to distinguish Phase-2 traffic.
+
+            Parameters
+            ----------
+            left_keys
+                Column names to hash-partition on during Phase 2.
+            """
+            from rapidsmpf.shuffler import Shuffler
+
+            self.shuffle_on = left_keys
+            self._op_id += 1
+            # Do NOT call self.shuffler.shutdown() — that would tear down the
+            # shared ProgressThread and corrupt the communicator state.
+            self.shuffler = Shuffler(
+                self._comm,
+                self._progress_thread,
+                op_id=self._op_id,
+                total_num_partitions=self.total_nparts,
+                br=self.br,
+                statistics=self.stats,
+            )
+
+        def cleanup(self) -> None:
+            """Log statistics and release references without calling shutdown.
+
+            ``shutdown()`` would invalidate the shared ``ProgressThread``.  We
+            simply drop our references and let the GC/UCXX teardown handle cleanup.
+            """
+            if self.enable_statistics and self.stats is not None:
+                self.comm.logger.info(self.stats.report())
+            self.shuffler = None
+            self._progress_thread = None
+
+    global _BulkRapidsMPFShuffler
+    global _BulkRapidsMPFJoinShuffler
+    _BulkRapidsMPFShuffler = BulkRapidsMPFShuffler
+    _BulkRapidsMPFJoinShuffler = BulkRapidsMPFJoinShuffler
 
 
 def __getattr__(name: str) -> type:
     global _BulkRapidsMPFShuffler
+    global _BulkRapidsMPFJoinShuffler
+
     if name == "BulkRapidsMPFShuffler":
         if _BulkRapidsMPFShuffler is None:
-            _BulkRapidsMPFShuffler = lazy_load()
+            lazy_load()
         return _BulkRapidsMPFShuffler
+    elif name == "BulkRapidsMPFJoinShuffler":
+        if _BulkRapidsMPFJoinShuffler is None:
+            lazy_load()
+        return _BulkRapidsMPFJoinShuffler
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

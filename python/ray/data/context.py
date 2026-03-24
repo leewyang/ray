@@ -632,6 +632,9 @@ class DataContext:
         gpu_shuffle_setup_timeout_s: Maximum time in seconds to wait for UCXX
             communicator setup (actor creation + root/worker init) before raising
             a ``TimeoutError``. Defaults to 120 seconds.
+        gpu_join_left_chunk_rows: Maximum number of left-side rows to shuffle and
+            join in a single chunk during a GPU join. 0 (default) processes all
+            left rows in a single pass.
     """
 
     # `None` means the block size is infinite.
@@ -709,6 +712,10 @@ class DataContext:
     # Maximum seconds to wait for UCXX communicator setup before raising
     # TimeoutError.
     gpu_shuffle_setup_timeout_s: float = 120.0
+
+    # Max left-side rows per chunk for GPU join.
+    # 0 = process all left rows in a single pass (no chunking).
+    gpu_join_left_chunk_rows: int = 0
 
     scheduling_strategy: SchedulingStrategyT = DEFAULT_SCHEDULING_STRATEGY
     scheduling_strategy_large_args: SchedulingStrategyT = (

@@ -3,6 +3,7 @@
 from ray.data._internal.logical.operators.all_to_all_operator import (
     AbstractAllToAll,
     Aggregate,
+    GPUShuffleMapGroups,
     RandomizeBlocks,
     RandomShuffle,
     Repartition,
@@ -50,6 +51,7 @@ __all__ = [
     "Download",
     "Filter",
     "FlatMap",
+    "GPUShuffleMapGroups",
     "FromArrow",
     "FromBlocks",
     "FromItems",

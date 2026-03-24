@@ -75,6 +75,7 @@ logger = logging.getLogger(__name__)
 class BlockType(Enum):
     ARROW = "arrow"
     PANDAS = "pandas"
+    CUDF = "cudf"
 
 
 @DeveloperAPI
@@ -528,7 +529,7 @@ class BlockAccessor:
         # implements the Mapping protocol. Use bulk GPU->CPU transfer via
         # to_arrow() instead of the slow column-by-column Mapping path.
         elif _is_cudf_dataframe(batch):
-            return batch.to_arrow()
+            return batch.to_arrow(preserve_index=False)
 
         elif isinstance(batch, collections.abc.Mapping):
             if block_type is None or block_type == BlockType.ARROW:
@@ -584,6 +585,10 @@ class BlockAccessor:
             from ray.data._internal.pandas_block import PandasBlockAccessor
 
             return PandasBlockAccessor(block)
+        elif _is_cudf_dataframe(block):
+            from ray.data._internal.cudf_block import CudfBlockAccessor
+
+            return CudfBlockAccessor(block)
         elif isinstance(block, bytes):
             from ray.data._internal.arrow_block import ArrowBlockAccessor
 

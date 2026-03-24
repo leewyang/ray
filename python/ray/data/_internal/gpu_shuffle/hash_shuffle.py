@@ -1,9 +1,10 @@
-import functools
 import logging
 import time
 import typing
 from collections import deque
 from typing import (
+    Any,
+    Callable,
     Deque,
     Dict,
     Iterator,
@@ -28,18 +29,16 @@ from ray.data._internal.execution.interfaces.physical_operator import (
     DataOpTask,
     MetadataOpTask,
     OpTask,
-    estimate_total_num_of_blocks,
 )
 from ray.data._internal.execution.operators.hash_shuffle import (
     _get_total_cluster_resources,
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
 from ray.data._internal.stats import OpRuntimeMetrics
-from ray.data.block import BlockStats, to_stats
+from ray.data.block import BlockMetadataWithSchema, BlockStats, to_stats
 from ray.data.context import DataContext
 
 if typing.TYPE_CHECKING:
-
     from ray.data._internal.progress.base_progress import BaseProgressBar
 
 logger = logging.getLogger(__name__)
@@ -85,7 +84,8 @@ class GPUShuffleActor:
             rmm_pool_size=rmm_pool_size,
             spill_memory_limit=spill_memory_limit,
         )
-        self._columns = columns
+        self._columns: Optional[List[str]] = None
+        self._key_columns: List[str] = list(key_columns)
 
     # ------------------------------------------------------------------
     # UCXX communicator setup
@@ -120,9 +120,27 @@ class GPUShuffleActor:
         elapsed = time.perf_counter() - t0
         logger.info("UCXX setup_worker completed in %.2fs.", elapsed)
 
+    def shutdown_and_exit(self) -> None:
+        """Gracefully tear down UCXX/rapidsmpf state, then exit the actor."""
+        try:
+            self._shuffler.cleanup()
+        except Exception:
+            pass
+        ray.actor.exit_actor()
+
     # ------------------------------------------------------------------
     # Insert / extract interface (called by GPUShuffleOperator)
     # ------------------------------------------------------------------
+
+    def set_columns(self, columns: List[str]) -> None:
+        """Set column names externally (e.g. from the operator).
+
+        Needed when a rank receives shuffled data from peers but never gets
+        a direct ``insert_batch`` call, which is the only other place where
+        ``_columns`` is populated.
+        """
+        if self._columns is None:
+            self._columns = list(columns)
 
     def insert_batch(self, batch: pa.Table) -> int:
         """Hash-partition *batch* and route shards to peers.
@@ -140,21 +158,25 @@ class GPUShuffleActor:
         self._shuffler.insert_chunk(table=df, column_names=self._columns)
         return len(df)
 
-    def finish_and_extract(self) -> Iterator:
-        """Signal insertion is done, then yield one Arrow Table per output partition.
+    def insert_finished(self) -> None:
+        """Signal that no more batches will be inserted into this rank."""
+        self._shuffler.insert_finished()
 
-        Combines insert-finished and extraction into a single actor call so
-        correctness does not depend on actor task ordering.
+    def extract_partitions(self) -> Iterator:
+        """Yield one Arrow Table per output partition assigned to this rank.
+
+        This is a streaming generator; it must be called *after*
+        :meth:`insert_finished` (Ray's per-actor task ordering guarantees
+        this when both calls are submitted to the same actor handle).
 
         Follows the Ray Data streaming generator protocol: yield block then
         BlockMetadataWithSchema for each output partition.
         """
-        self._shuffler.insert_finished()
-
         from rapidsmpf.utils.cudf import pylibcudf_to_cudf_dataframe
 
         from ray.data.block import BlockExecStats, BlockMetadataWithSchema
 
+        # columns = self._columns or []
         for _, partition in self._shuffler.extract():
             exec_stats_builder = BlockExecStats.builder()
             cdf = pylibcudf_to_cudf_dataframe(
@@ -165,8 +187,106 @@ class GPUShuffleActor:
             exec_stats = exec_stats_builder.build()
             stats = yield block
             if stats:
-                object.__setattr__(
-                    exec_stats, "block_ser_time_s", stats.object_creation_dur_s
+                import dataclasses
+
+                exec_stats = dataclasses.replace(
+                    exec_stats,
+                    block_ser_time_s=stats.object_creation_dur_s,
+                )
+            yield BlockMetadataWithSchema.from_block(block, block_exec_stats=exec_stats)
+
+    def extract_and_apply(
+        self,
+        udf: Callable,
+        keys: List[str],
+        batch_format: Optional[str],
+        fn_args: Tuple,
+        fn_kwargs: Dict[str, Any],
+        fn_constructor_args: Optional[Tuple],
+        fn_constructor_kwargs: Optional[Dict[str, Any]],
+    ) -> Iterator[Tuple[pa.Table, BlockMetadataWithSchema]]:
+        """Fused extract + per-group UDF application on GPU.
+
+        Applies *udf* directly on each GPU-resident cuDF partition right after
+        extraction.  Only the (typically much smaller) UDF results are
+        converted to Arrow for the Ray object store, eliminating the
+        full-partition cuDF→Arrow→cuDF round-trip that would otherwise occur
+        between ``extract_partitions`` and a downstream ``MapBatches`` task.
+
+        Follows the same streaming generator protocol as ``extract_partitions``:
+        yields alternating ``block`` / ``BlockMetadataWithSchema`` pairs.
+
+        Args:
+            udf: The user-defined function (or callable class) to apply.
+            keys: Group-by key column names (empty list = global group).
+            batch_format: Format passed to each group before calling *udf*
+                (e.g. ``"cudf"``, ``"pandas"``, ``"pyarrow"``).
+            fn_args: Positional arguments forwarded to *udf*.
+            fn_kwargs: Keyword arguments forwarded to *udf*.
+            fn_constructor_args: If *udf* is a callable class, these are
+                passed to its ``__init__``.  One instance is created per rank.
+            fn_constructor_kwargs: Keyword arguments for the callable class
+                ``__init__``.
+
+        Yields:
+            Tuple[pa.Table, BlockMetadataWithSchema]:
+                A tuple of the extracted partition and its metadata.
+        """
+        from collections.abc import Iterator as IteratorABC
+
+        import pyarrow as pa
+        from rapidsmpf.utils.cudf import pylibcudf_to_cudf_dataframe
+
+        from ray.data._internal.cudf_block import CudfBlockAccessor
+        from ray.data.block import (
+            BlockAccessor,
+            BlockExecStats,
+            BlockMetadataWithSchema,
+        )
+
+        # Instantiate callable-class UDFs once per rank, mirroring the
+        # ActorPoolMapOperator behaviour for fn_constructor_args.
+        if fn_constructor_args is not None or fn_constructor_kwargs is not None:
+            udf = udf(*(fn_constructor_args or ()), **(fn_constructor_kwargs or {}))
+
+        columns = self._columns or []
+        for _, partition in self._shuffler.extract():
+            exec_stats_builder = BlockExecStats.builder()
+            cdf = pylibcudf_to_cudf_dataframe(partition, column_names=columns).copy(
+                deep=True
+            )
+            if self._key_columns:
+                cdf = cdf.sort_values(by=self._key_columns)
+
+            # Apply UDF to the full sorted partition.  The partition is
+            # already hash-partitioned by group keys and sorted, so the UDF
+            # receives all groups for its key-space contiguously.
+            import cudf as _cudf
+
+            if len(cdf) > 0:
+                partition_batch = CudfBlockAccessor(cdf).to_batch_format(batch_format)
+                result = udf(partition_batch, *fn_args, **fn_kwargs)
+                results = list(result) if isinstance(result, IteratorABC) else [result]
+                cudf_parts: List["_cudf.DataFrame"] = []
+                for r in results:
+                    if isinstance(r, _cudf.DataFrame):
+                        cudf_parts.append(r)
+                    else:
+                        arrow_r = BlockAccessor.for_block(r).to_arrow()
+                        cudf_parts.append(_cudf.DataFrame.from_arrow(arrow_r))
+                combined = _cudf.concat(cudf_parts, ignore_index=True)
+                block = combined.to_arrow(preserve_index=False)
+            else:
+                block = pa.table({})
+
+            exec_stats = exec_stats_builder.build()
+            stats = yield block
+            if stats:
+                import dataclasses
+
+                exec_stats = dataclasses.replace(
+                    exec_stats,
+                    block_ser_time_s=stats.object_creation_dur_s,
                 )
             yield BlockMetadataWithSchema.from_block(block, block_exec_stats=exec_stats)
 
@@ -254,7 +374,7 @@ class GPURankPool:
 
         Raises:
             TimeoutError: If UCXX setup does not complete within
-                ``gpu_shuffle_setup_timeout_s`` seconds.
+                ``setup_timeout_s`` seconds.
         """
         timeout = self._setup_timeout_s
         t_start = time.perf_counter()
@@ -271,7 +391,6 @@ class GPURankPool:
                 nranks=self._nranks,
                 total_nparts=self._total_nparts,
                 key_columns=self._key_columns,
-                columns=self._columns,
                 rmm_pool_size=self._rmm_pool_size,
                 spill_memory_limit=self._spill_memory_limit,
             )
@@ -324,9 +443,14 @@ class GPURankPool:
         return self._actors[block_idx % self._nranks]
 
     def shutdown(self, force: bool = False) -> None:
-        if force:
-            for actor in self._actors:
+        for actor in self._actors:
+            if force:
                 ray.kill(actor)
+            else:
+                try:
+                    actor.shutdown_and_exit.remote()
+                except Exception:
+                    pass
         self._actors.clear()
 
 
@@ -373,9 +497,9 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         [inputs_done()]            # called by the executor
         has_next() / _get_next_inner()   # streams output bundles
 
-    The ``finish_and_extract`` actor task is submitted once all inserts
-    complete; it signals insertion done and streams output partitions in a
-    single call.
+    The ``insert_finished`` + ``extract_partitions`` actor tasks are submitted
+    as fire-and-forget once all inserts complete; Ray's per-actor task ordering
+    guarantees correct sequencing without blocking the driver.
     """
 
     def __init__(
@@ -386,6 +510,13 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         key_columns: Tuple[str, ...],
         columns: Optional[List[str]] = None,
         num_partitions: Optional[int] = None,
+        post_shuffle_udf: Optional[Callable] = None,
+        keys_for_udf: Optional[List[str]] = None,
+        batch_format: Optional[str] = None,
+        fn_args: Optional[Tuple] = None,
+        fn_kwargs: Optional[Dict[str, Any]] = None,
+        fn_constructor_args: Optional[Tuple] = None,
+        fn_constructor_kwargs: Optional[Dict[str, Any]] = None,
     ):
         nranks = _derive_num_gpu_ranks(data_context)
         target_num_partitions = (
@@ -416,6 +547,16 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
             setup_timeout_s=data_context.gpu_shuffle_setup_timeout_s,
         )
 
+        # Optional fused UDF (set when planning GPUShuffleMapGroups).
+        self._post_shuffle_udf = post_shuffle_udf
+        self._keys_for_udf: List[str] = keys_for_udf or []
+        self._batch_format = batch_format
+        self._fn_args: Tuple = fn_args or ()
+        self._fn_kwargs: Dict[str, Any] = fn_kwargs or {}
+        self._fn_constructor_args = fn_constructor_args
+        self._fn_constructor_kwargs = fn_constructor_kwargs
+
+        self._schema_columns: Optional[List[str]] = None
         self._next_block_idx: int = 0
         self._insert_tasks: Dict[int, MetadataOpTask] = {}
         self._extraction_tasks: Dict[int, DataOpTask] = {}
@@ -444,6 +585,12 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         self._shuffle_metrics.on_input_received(bundle)
         self._shuffled_blocks_stats.extend(to_stats(bundle.metadata))
 
+        # Capture column names from the first input bundle so we can
+        # broadcast them to all actors (including those that never
+        # receive a direct insert_batch call).
+        if self._schema_columns is None and bundle.schema is not None:
+            self._schema_columns = list(bundle.schema.names)
+
         for block_ref, metadata in zip(bundle.block_refs, bundle.metadata):
             actor = self._rank_pool.get_actor_for_block(self._next_block_idx)
             insert_ref = actor.insert_batch.remote(block_ref)
@@ -457,7 +604,7 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
                 task_index=task_idx,
                 object_ref=insert_ref,
                 task_done_callback=_on_insert_done,
-                task_resource_bundle=None,
+                task_resource_bundle=ExecutionResources(),
             )
             self._insert_tasks[task_idx] = task
             self._shuffle_metrics.on_task_submitted(
@@ -470,7 +617,10 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
                 self._shuffle_bar.update(total=self._next_block_idx)
 
     def _is_inserting_done(self) -> bool:
-        return self._inputs_complete and len(self._insert_tasks) == 0
+        # Only require that all inserts have been *submitted*, not completed.
+        # Ray's per-actor task ordering guarantees that insert_finished (and
+        # extract) run after all pending insert_batch calls on each actor.
+        return self._inputs_complete
 
     def _try_finalize(self) -> None:
         """Schedule extraction once all inserts have completed."""
@@ -478,78 +628,61 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
             return
 
         self._finalization_started = True
-        # Running count of partitions extracted across all ranks.
-        # In the CPU path each partition has its own finalize task so
-        # partition_id naturally counts completed partitions.  Here a
-        # single rank yields many partitions, so we maintain an explicit
-        # counter to keep the metrics aligned.
-        self._num_partitions_reduced = 0
-
-        def _on_bundle_ready(bundle: RefBundle) -> None:
-            partition_id = self._num_partitions_reduced
-            self._num_partitions_reduced += 1
-
-            # Register a logical reduce "task" for this partition, mirroring
-            # the per-partition task lifecycle in the CPU path.
-            empty_bundle = RefBundle([], schema=None, owns_blocks=False)
-            self._reduce_metrics.on_task_submitted(
-                partition_id, empty_bundle, task_id=None
-            )
-
-            # Add finalized block to the output queue
-            self._output_queue.append(bundle)
-
-            # Update Finalize Metrics on task output generated
-            self._reduce_metrics.on_output_queued(bundle)
-            self._reduce_metrics.on_task_output_generated(
-                task_index=partition_id, output=bundle
-            )
-
-            # Mark the logical partition task as finished (each GPU
-            # partition produces exactly one block).
-            self._reduce_metrics.on_task_finished(
-                task_index=partition_id,
-                exception=None,
-                task_exec_stats=None,
-                task_exec_driver_stats=None,
-            )
-
-            _, num_outputs, num_rows = estimate_total_num_of_blocks(
-                self._num_partitions_reduced,
-                self.upstream_op_num_outputs(),
-                self._reduce_metrics,
-                total_num_tasks=self._num_partitions,
-            )
-            self._estimated_num_output_bundles = num_outputs
-            self._estimated_output_num_rows = num_rows
-
-            # Update Finalize progress bar
-            self._reduce_bar.update(
-                increment=bundle.num_rows() or 0, total=self.num_output_rows_total()
-            )
-
-        def _on_extraction_done(
-            exc: Optional[Exception],
-            worker_stats=None,
-            driver_stats=None,
-            rank: int = -1,
-        ) -> None:
-            self._extraction_tasks.pop(rank, None)
 
         for rank_idx, actor in enumerate(self._rank_pool.actors):
-            block_gen = actor.finish_and_extract.options(
-                num_returns="streaming"
-            ).remote()
+            # Ensure every actor knows the column names, even those that
+            # never received a direct insert_batch (fewer blocks than ranks).
+            if self._schema_columns is not None:
+                actor.set_columns.remote(self._schema_columns)
+            # Fire-and-forget: Ray serialises actor tasks per actor, so
+            # insert_finished is guaranteed to run before extract_partitions.
+            actor.insert_finished.remote()
+            if self._post_shuffle_udf is not None:
+                block_gen = actor.extract_and_apply.options(
+                    num_returns="streaming"
+                ).remote(
+                    self._post_shuffle_udf,
+                    self._keys_for_udf,
+                    self._batch_format,
+                    self._fn_args,
+                    self._fn_kwargs,
+                    self._fn_constructor_args,
+                    self._fn_constructor_kwargs,
+                )
+            else:
+                block_gen = actor.extract_partitions.options(
+                    num_returns="streaming"
+                ).remote()
+
+            def _on_bundle_ready(bundle: RefBundle, rank: int = rank_idx) -> None:
+                self._output_queue.append(bundle)
+                self._reduce_metrics.on_output_queued(bundle)
+
+            def _on_extraction_done(
+                exc: Optional[Exception],
+                worker_stats=None,
+                driver_stats=None,
+                _rank: int = rank_idx,
+                _actor_handle: ActorHandle = actor,
+            ) -> None:
+                self._extraction_tasks.pop(_rank, None)
+                try:
+                    _actor_handle.shutdown_and_exit.remote()
+                except Exception:
+                    pass
 
             data_task = DataOpTask(
                 task_index=rank_idx,
                 streaming_gen=block_gen,
                 output_ready_callback=_on_bundle_ready,
-                task_done_callback=functools.partial(
-                    _on_extraction_done, rank=rank_idx
-                ),
+                task_done_callback=_on_extraction_done,
             )
             self._extraction_tasks[rank_idx] = data_task
+
+            empty_bundle = RefBundle([], schema=None, owns_blocks=False)
+            self._reduce_metrics.on_task_submitted(
+                rank_idx, empty_bundle, task_id=data_task.get_task_id()
+            )
 
     # ------------------------------------------------------------------
     # Output interface
@@ -594,23 +727,15 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
     # Resource accounting
     # ------------------------------------------------------------------
 
-    def current_logical_usage(self) -> ExecutionResources:
-        return ExecutionResources(gpu=self._rank_pool.nranks)
-
     @property
     def base_resource_usage(self) -> ExecutionResources:
         return ExecutionResources(gpu=self._rank_pool.nranks)
 
     def incremental_resource_usage(self) -> ExecutionResources:
-        return ExecutionResources(gpu=1)
+        return ExecutionResources()
 
-    def get_actor_info(self):
-        from ray.data._internal.execution.interfaces.physical_operator import (
-            ActorPoolInfo,
-        )
-
-        n = len(self._rank_pool.actors)
-        return ActorPoolInfo(running=n, pending=0, restarting=0)
+    def current_logical_usage(self) -> ExecutionResources:
+        return self.base_resource_usage
 
     # ------------------------------------------------------------------
     # SubProgressBarMixin
@@ -624,6 +749,18 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
             self._shuffle_bar = pg
         elif name == "GPU Reduce":
             self._reduce_bar = pg
+
+    # ------------------------------------------------------------------
+    # Actor info
+    # ------------------------------------------------------------------
+
+    def get_actor_info(self):
+        from ray.data._internal.execution.interfaces.physical_operator import (
+            ActorPoolInfo,
+        )
+
+        n = len(self._rank_pool.actors)
+        return ActorPoolInfo(running=n, pending=0, restarting=0)
 
     # ------------------------------------------------------------------
     # Stats

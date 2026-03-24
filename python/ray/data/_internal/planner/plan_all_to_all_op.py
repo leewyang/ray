@@ -7,6 +7,7 @@ from ray.data._internal.execution.operators.base_physical_operator import (
 from ray.data._internal.logical.operators import (
     AbstractAllToAll,
     Aggregate,
+    GPUShuffleMapGroups,
     RandomizeBlocks,
     RandomShuffle,
     Repartition,
@@ -39,6 +40,28 @@ def _plan_gpu_shuffle_repartition(
         key_columns=tuple(normalized_key_columns),
         columns=columns,
         num_partitions=logical_op.num_outputs,
+    )
+
+
+def _plan_gpu_shuffle_map_groups(
+    data_context: DataContext,
+    logical_op: GPUShuffleMapGroups,
+    input_physical_op: PhysicalOperator,
+) -> PhysicalOperator:
+    from ray.data._internal.gpu_shuffle.hash_shuffle import GPUShuffleOperator
+
+    return GPUShuffleOperator(
+        input_physical_op,
+        data_context,
+        key_columns=tuple(logical_op.key_columns),
+        num_partitions=logical_op.num_outputs,
+        post_shuffle_udf=logical_op.udf,
+        keys_for_udf=logical_op.key_columns,
+        batch_format=logical_op.batch_format,
+        fn_args=logical_op.fn_args,
+        fn_kwargs=logical_op.fn_kwargs,
+        fn_constructor_args=logical_op.fn_constructor_args,
+        fn_constructor_kwargs=logical_op.fn_constructor_kwargs,
     )
 
 
@@ -180,6 +203,9 @@ def plan_all_to_all_op(
             data_context,
             debug_limit_shuffle_execution_to_num_blocks,
         )
+    elif isinstance(op, GPUShuffleMapGroups):
+        return _plan_gpu_shuffle_map_groups(data_context, op, input_physical_dag)
+
     else:
         raise ValueError(f"Found unknown logical operator during planning: {op}")
 
