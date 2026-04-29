@@ -26,8 +26,7 @@ There are three specific pain points:
  | Arrow   |--->| Hash  |--->| Object Store  |--->| MapBatches UDF |
  | (ser)   |    | Shuf. |    | (materialize) |    | (deser + run)  |
  +---------+    +-------+    +---------------+    +----------------+
-      |                            |                       |
-      v                            v                       v
+                                                            
     GPU->CPU                 CPU memory                 CPU->GPU
     transfer                 copy                       transfer
 ```
