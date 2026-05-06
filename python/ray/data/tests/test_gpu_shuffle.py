@@ -17,12 +17,20 @@ from ray.data._internal.execution.interfaces import (
     PhysicalOperator,
     RefBundle,
 )
+from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
+from ray.data._internal.execution.operators.map_operator import MapOperator
+from ray.data._internal.execution.operators.map_transformer import (
+    BlockMapTransformFn,
+    MapTransformer,
+)
 from ray.data._internal.gpu_shuffle.hash_shuffle import (
     GPURankPool,
     GPUShuffleActor,
     GPUShuffleOperator,
     _derive_num_gpu_ranks,
 )
+from ray.data._internal.logical.interfaces import PhysicalPlan
+from ray.data._internal.logical.rules.gpu_shuffle_fusion import FuseGPUShuffleMaps
 from ray.data._internal.gpu_shuffle.hash_aggregate import (
     GPUHashAggregateOperator,
     build_gpu_aggregation_plan,
@@ -78,6 +86,16 @@ def _make_data_context(
     ctx.gpu_shuffle_rmm_pool_size = gpu_shuffle_rmm_pool_size
     ctx.gpu_shuffle_spill_memory_limit = gpu_shuffle_spill_memory_limit
     return ctx
+
+
+def _identity_blocks(blocks, _):
+    yield from blocks
+
+
+def _make_block_transformer():
+    return MapTransformer(
+        [BlockMapTransformFn(_identity_blocks, disable_block_shaping=True)]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +366,71 @@ class TestGPUShuffleOperatorConstructor:
         assert op._extraction_tasks == {}
         assert not op._finalization_started
         assert len(op._output_queue) == 0
+
+
+class TestFuseGPUShuffleMaps:
+    def _make_plan(self, *, enabled: bool = True, downstream_num_gpus: int = 1):
+        ctx = _make_data_context(gpu_shuffle_num_actors=4)
+        ctx.set_config(FuseGPUShuffleMaps.CONFIG_KEY, enabled)
+
+        source = InputDataBuffer(ctx, input_data=[])
+        up_map = MapOperator.create(
+            _make_block_transformer(),
+            source,
+            ctx,
+            name="emit",
+            ray_remote_args={"num_gpus": 1},
+        )
+        shuffle = GPUShuffleOperator(
+            up_map,
+            ctx,
+            key_columns=("node",),
+            num_partitions=4,
+        )
+        down_map = MapOperator.create(
+            _make_block_transformer(),
+            shuffle,
+            ctx,
+            name="reduce",
+            ray_remote_args={"num_gpus": downstream_num_gpus},
+        )
+        return PhysicalPlan(
+            down_map,
+            {
+                source: MagicMock(LogicalOperator),
+                up_map: MagicMock(LogicalOperator),
+                shuffle: MagicMock(LogicalOperator),
+                down_map: MagicMock(LogicalOperator),
+            },
+            ctx,
+        )
+
+    def test_fuses_gpu_map_shuffle_gpu_map_chain(self):
+        plan = FuseGPUShuffleMaps().apply(self._make_plan())
+
+        assert isinstance(plan.dag, GPUShuffleOperator)
+        assert plan.dag.input_dependencies[0].name == "Input"
+        assert plan.dag._upstream_map_transformer is not None
+        assert plan.dag._downstream_map_transformer is not None
+        assert "emit" in plan.dag.name
+        assert "reduce" in plan.dag.name
+
+    def test_disabled_config_leaves_chain_unchanged(self):
+        plan = FuseGPUShuffleMaps().apply(self._make_plan(enabled=False))
+
+        assert isinstance(plan.dag, MapOperator)
+        assert isinstance(plan.dag.input_dependencies[0], GPUShuffleOperator)
+
+    def test_non_gpu_downstream_map_is_not_fused(self):
+        plan = FuseGPUShuffleMaps().apply(
+            self._make_plan(enabled=True, downstream_num_gpus=0)
+        )
+
+        assert isinstance(plan.dag, MapOperator)
+        shuffle = plan.dag.input_dependencies[0]
+        assert isinstance(shuffle, GPUShuffleOperator)
+        assert shuffle._upstream_map_transformer is not None
+        assert shuffle._downstream_map_transformer is None
 
 
 # ---------------------------------------------------------------------------
@@ -661,9 +744,9 @@ class TestPlanAllToAllOpRouting:
 class TestGPUHashAggregatePlanning:
     def _make_aggregate_op(self, aggs, key="user_id", num_partitions=8):
         return Aggregate(
-            input_op=MagicMock(LogicalOperator),
             key=key,
             aggs=list(aggs),
+            input_dependencies=[MagicMock(LogicalOperator)],
             num_partitions=num_partitions,
         )
 

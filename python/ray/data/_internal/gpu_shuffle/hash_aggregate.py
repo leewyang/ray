@@ -669,6 +669,11 @@ class GPUHashAggregateRankPool:
         ]
         _wait_for_refs_with_timeout(worker_refs, remaining, "setup_worker")
 
+    def configure_fused_maps(self, *args, **kwargs) -> None:
+        # GPU hash aggregate does not currently fuse adjacent map stages. This
+        # method keeps it compatible with GPUShuffleOperator.start().
+        return None
+
     def get_actor_for_block(self, block_idx: int) -> ActorHandle:
         return self._actors[block_idx % self._nranks]
 
