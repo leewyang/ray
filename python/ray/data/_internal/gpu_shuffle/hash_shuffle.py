@@ -4,6 +4,7 @@ import pickle
 import time
 import typing
 from typing import (
+    Any,
     Dict,
     Iterator,
     List,
@@ -21,6 +22,7 @@ from ray.data._internal.execution.interfaces import (
     ExecutionResources,
     PhysicalOperator,
     RefBundle,
+    TaskContext,
 )
 from ray.data._internal.execution.interfaces.physical_operator import (
     DataOpTask,
@@ -39,11 +41,33 @@ from ray.data.context import DataContext
 if typing.TYPE_CHECKING:
 
     from ray.data._internal.progress.base_progress import BaseProgressBar
+    from ray.data._internal.execution.operators.map_transformer import MapTransformer
 
 logger = logging.getLogger(__name__)
 
 # Arrow schema metadata key for the rapidsmpf partition ID.
 _GPU_PARTITION_ID_KEY = b"_gpu_partition_id"
+
+
+def _apply_map_transformer(
+    map_transformer: Optional["MapTransformer"],
+    data_context: Optional[DataContext],
+    op_name: str,
+    blocks: Iterator[Block],
+    task_kwargs: Optional[Dict[str, Any]] = None,
+) -> Iterator[Block]:
+    """Apply a fused Ray Data map transformer inside a GPU rank actor."""
+    if map_transformer is None:
+        yield from blocks
+        return
+
+    assert data_context is not None
+    ctx = TaskContext(task_idx=0, op_name=op_name)
+    if task_kwargs:
+        ctx.kwargs.update(task_kwargs)
+
+    with DataContext.current(data_context), TaskContext.current(ctx):
+        yield from map_transformer.apply_transform(blocks, ctx)
 
 # ---------------------------------------------------------------------------
 # GPU shuffle actor
@@ -90,6 +114,31 @@ class GPUShuffleActor:
         self._key_columns = key_columns
         self._should_sort = should_sort
         self._arrow_schema = None
+        self._upstream_map_transformer = None
+        self._upstream_map_task_kwargs = None
+        self._downstream_map_transformer = None
+        self._downstream_map_task_kwargs = None
+        self._data_context = None
+
+    def configure_fused_maps(
+        self,
+        upstream_map_transformer: Optional["MapTransformer"],
+        upstream_map_task_kwargs: Optional[Dict[str, Any]],
+        downstream_map_transformer: Optional["MapTransformer"],
+        downstream_map_task_kwargs: Optional[Dict[str, Any]],
+        data_context: Optional[DataContext],
+    ) -> None:
+        """Install map transformers that should execute on this shuffle rank."""
+        self._upstream_map_transformer = upstream_map_transformer
+        self._upstream_map_task_kwargs = upstream_map_task_kwargs
+        self._downstream_map_transformer = downstream_map_transformer
+        self._downstream_map_task_kwargs = downstream_map_task_kwargs
+        self._data_context = data_context
+
+        if self._upstream_map_transformer is not None:
+            self._upstream_map_transformer.init()
+        if self._downstream_map_transformer is not None:
+            self._downstream_map_transformer.init()
 
     # ------------------------------------------------------------------
     # UCXX communicator setup
@@ -136,16 +185,26 @@ class GPUShuffleActor:
         """
         import cudf
 
-        table = BlockAccessor.for_block(block).to_arrow()
-        df = cudf.DataFrame.from_arrow(table)
-        if self._columns is None:
-            # save columns from first batch, if not already set
-            self._columns = list(df.columns)
-        if self._arrow_schema is None:
-            # save arrow schema from first batch
-            self._arrow_schema = table.schema
-        self._shuffler.insert_chunk(table=df, column_names=self._columns)
-        return len(df)
+        rows_inserted = 0
+        mapped_blocks = _apply_map_transformer(
+            self._upstream_map_transformer,
+            self._data_context,
+            "GPUShuffle(fused upstream map)",
+            iter([block]),
+            self._upstream_map_task_kwargs,
+        )
+        for mapped_block in mapped_blocks:
+            table = BlockAccessor.for_block(mapped_block).to_arrow()
+            df = cudf.DataFrame.from_arrow(table)
+            if self._columns is None:
+                # save columns from first batch, if not already set
+                self._columns = list(df.columns)
+            if self._arrow_schema is None:
+                # save arrow schema from first batch
+                self._arrow_schema = table.schema
+            self._shuffler.insert_chunk(table=df, column_names=self._columns)
+            rows_inserted += len(df)
+        return rows_inserted
 
     def finish_and_extract(self) -> Iterator:
         """Signal insertion is done, then yield one Arrow Table per output partition.
@@ -185,6 +244,30 @@ class GPUShuffleActor:
                 if self._should_sort and len(cdf) > 0:
                     cdf = cdf.sort_values(by=self._key_columns)
                 block = cdf.to_arrow(preserve_index=False)
+
+            if self._downstream_map_transformer is not None:
+                transformed_blocks = list(
+                    _apply_map_transformer(
+                        self._downstream_map_transformer,
+                        self._data_context,
+                        "GPUShuffle(fused downstream map)",
+                        iter([block]),
+                        self._downstream_map_task_kwargs,
+                    )
+                )
+                if not transformed_blocks:
+                    block = block.slice(0, 0)
+                elif len(transformed_blocks) == 1:
+                    block = BlockAccessor.for_block(transformed_blocks[0]).to_arrow()
+                else:
+                    import pyarrow as pa
+
+                    block = pa.concat_tables(
+                        [
+                            BlockAccessor.for_block(transformed_block).to_arrow()
+                            for transformed_block in transformed_blocks
+                        ]
+                    )
 
             existing_metadata = block.schema.metadata or {}
             tagged_schema = block.schema.with_metadata(
@@ -361,6 +444,33 @@ class GPURankPool:
             t_done - t_start,
         )
 
+    def configure_fused_maps(
+        self,
+        upstream_map_transformer: Optional["MapTransformer"],
+        upstream_map_task_kwargs: Optional[Dict[str, Any]],
+        downstream_map_transformer: Optional["MapTransformer"],
+        downstream_map_task_kwargs: Optional[Dict[str, Any]],
+        data_context: Optional[DataContext],
+    ) -> None:
+        if upstream_map_transformer is None and downstream_map_transformer is None:
+            return
+
+        refs = [
+            actor.configure_fused_maps.remote(
+                upstream_map_transformer,
+                upstream_map_task_kwargs,
+                downstream_map_transformer,
+                downstream_map_task_kwargs,
+                data_context,
+            )
+            for actor in self._actors
+        ]
+        _wait_for_refs_with_timeout(
+            refs,
+            self._setup_timeout_s,
+            "configure_fused_maps",
+        )
+
     def get_actor_for_block(self, block_idx: int) -> ActorHandle:
         """Round-robin distribution of input blocks across ranks."""
         return self._actors[block_idx % self._nranks]
@@ -430,6 +540,11 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         columns: Optional[List[str]] = None,
         num_partitions: Optional[int] = None,
         should_sort: bool = False,
+        upstream_map_transformer: Optional["MapTransformer"] = None,
+        upstream_map_task_kwargs: Optional[Dict[str, Any]] = None,
+        downstream_map_transformer: Optional["MapTransformer"] = None,
+        downstream_map_task_kwargs: Optional[Dict[str, Any]] = None,
+        name: Optional[str] = None,
     ):
         nranks = _derive_num_gpu_ranks(data_context)
         target_num_partitions = (
@@ -440,9 +555,12 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
 
         super().__init__(
             name=(
-                f"GPUShuffle("
-                f"key_columns={key_columns}, "
-                f"num_partitions={target_num_partitions})"
+                name
+                or (
+                    f"GPUShuffle("
+                    f"key_columns={key_columns}, "
+                    f"num_partitions={target_num_partitions})"
+                )
             ),
             input_dependencies=[input_op],
             data_context=data_context,
@@ -450,6 +568,12 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
 
         self._key_columns = key_columns
         self._num_partitions = target_num_partitions
+        self._columns = columns
+        self._should_sort = should_sort
+        self._upstream_map_transformer = upstream_map_transformer
+        self._upstream_map_task_kwargs = upstream_map_task_kwargs
+        self._downstream_map_transformer = downstream_map_transformer
+        self._downstream_map_task_kwargs = downstream_map_task_kwargs
         self._rank_pool = GPURankPool(
             nranks=nranks,
             total_nparts=target_num_partitions,
@@ -484,6 +608,61 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
     def start(self, options: ExecutionOptions) -> None:
         super().start(options)
         self._rank_pool.start()
+        self._rank_pool.configure_fused_maps(
+            self._upstream_map_transformer,
+            self._upstream_map_task_kwargs,
+            self._downstream_map_transformer,
+            self._downstream_map_task_kwargs,
+            self.data_context,
+        )
+
+    def copy_with_fused_maps(
+        self,
+        *,
+        input_op: PhysicalOperator,
+        name: str,
+        upstream_map_transformer: Optional["MapTransformer"] = None,
+        upstream_map_task_kwargs: Optional[Dict[str, Any]] = None,
+        downstream_map_transformer: Optional["MapTransformer"] = None,
+        downstream_map_task_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> "GPUShuffleOperator":
+        upstream = upstream_map_transformer
+        if self._upstream_map_transformer is not None:
+            upstream = (
+                self._upstream_map_transformer
+                if upstream is None
+                else upstream.fuse(self._upstream_map_transformer)
+            )
+
+        downstream = self._downstream_map_transformer
+        if downstream_map_transformer is not None:
+            downstream = (
+                downstream_map_transformer
+                if downstream is None
+                else downstream.fuse(downstream_map_transformer)
+            )
+
+        return GPUShuffleOperator(
+            input_op,
+            self.data_context,
+            key_columns=self._key_columns,
+            columns=self._columns,
+            num_partitions=self._num_partitions,
+            should_sort=self._should_sort,
+            upstream_map_transformer=upstream,
+            upstream_map_task_kwargs=(
+                upstream_map_task_kwargs
+                if upstream_map_transformer is not None
+                else self._upstream_map_task_kwargs
+            ),
+            downstream_map_transformer=downstream,
+            downstream_map_task_kwargs=(
+                downstream_map_task_kwargs
+                if downstream_map_transformer is not None
+                else self._downstream_map_task_kwargs
+            ),
+            name=name,
+        )
 
     def _add_input_inner(self, bundle: RefBundle, input_index: int) -> None:
         self._shuffle_metrics.on_input_received(bundle)
