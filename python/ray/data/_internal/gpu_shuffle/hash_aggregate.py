@@ -1,6 +1,7 @@
 import logging
 import pickle
 import time
+import typing
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -13,14 +14,19 @@ from ray.data._internal.execution.operators.hash_shuffle import (
     _get_total_cluster_resources,
 )
 from ray.data._internal.gpu_shuffle.hash_shuffle import (
-    GPUShuffleOperator,
     _GPU_PARTITION_ID_KEY,
+    GPUShuffleOperator,
     _wait_for_refs_with_timeout,
 )
 from ray.data._internal.table_block import TableBlockAccessor
 from ray.data.aggregate import AggregateFn, AggregateFnV2, Count, Max, Mean, Min, Sum
 from ray.data.block import Block, BlockAccessor, BlockExecStats, BlockMetadataWithSchema
 from ray.data.context import DataContext
+
+if typing.TYPE_CHECKING:
+
+    from ray.data._internal.progress.base_progress import BaseProgressBar
+
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +74,9 @@ def _group_count(
     output_column: str,
 ):
     grouped = _groupby(df, key_columns)
-    return _rename_last_column(grouped[target_column].count().reset_index(), output_column)
+    return _rename_last_column(
+        grouped[target_column].count().reset_index(), output_column
+    )
 
 
 def _group_aggregate(
@@ -92,14 +100,171 @@ def _group_aggregate(
     return _rename_last_column(aggregated.reset_index(), output_column)
 
 
-def _merge_on_keys(left, right, key_columns: Tuple[str, ...]):
-    return left.merge(right, on=list(key_columns), how="outer")
+def _merge_on_keys(left, right, key_columns: Tuple[str, ...], *, how: str = "outer"):
+    return left.merge(right, on=list(key_columns), how=how)
 
 
-def _empty_dataframe(cudf, columns: Sequence[str]):
+def _left_merge_on_keys(left, right, key_columns: Tuple[str, ...]):
+    return _merge_on_keys(left, right, key_columns, how="left")
+
+
+def _get_column_dtype(df, column: str):
+    if column not in df.columns:
+        return None
+    return df[column].dtype
+
+
+def _schema_column_dtype(schema, column: Optional[str]):
+    if schema is None or column is None:
+        return None
+
+    try:
+        names = schema.names
+    except AttributeError:
+        return None
+
+    if not isinstance(names, (list, tuple)) or column not in names:
+        return None
+
+    try:
+        field = schema.field(column)
+        return field.type
+    except (AttributeError, KeyError, TypeError):
+        pass
+
+    try:
+        return schema.types[names.index(column)]
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _is_null_dtype(dtype) -> bool:
+    if dtype is None:
+        return False
+
+    try:
+        import pyarrow as pa
+
+        if isinstance(dtype, pa.DataType):
+            return pa.types.is_null(dtype)
+    except ImportError:
+        pass
+
+    return str(dtype) == "null"
+
+
+def _is_numeric_or_null_dtype(dtype) -> bool:
+    if _is_null_dtype(dtype):
+        return True
+
+    try:
+        import pyarrow as pa
+
+        if isinstance(dtype, pa.DataType):
+            return (
+                pa.types.is_integer(dtype)
+                or pa.types.is_floating(dtype)
+                or pa.types.is_decimal(dtype)
+            )
+    except ImportError:
+        pass
+
+    try:
+        from pandas.api.types import is_bool_dtype, is_numeric_dtype
+
+        return is_numeric_dtype(dtype) and not is_bool_dtype(dtype)
+    except (ImportError, TypeError):
+        return False
+
+
+def _normalize_intermediate_dtype(dtype, kind: str):
+    try:
+        import pyarrow as pa
+
+        if isinstance(dtype, pa.DataType):
+            if pa.types.is_null(dtype):
+                return "float64" if kind in ("key", "mean") else "int64"
+            if pa.types.is_int8(dtype):
+                return "int8"
+            if pa.types.is_int16(dtype):
+                return "int16"
+            if pa.types.is_int32(dtype):
+                return "int32"
+            if pa.types.is_int64(dtype):
+                return "int64"
+            if pa.types.is_uint8(dtype):
+                return "uint8"
+            if pa.types.is_uint16(dtype):
+                return "uint16"
+            if pa.types.is_uint32(dtype):
+                return "uint32"
+            if pa.types.is_uint64(dtype):
+                return "uint64"
+            if pa.types.is_float32(dtype):
+                return "float32"
+            if pa.types.is_float64(dtype):
+                return "float64"
+            if pa.types.is_boolean(dtype):
+                return "bool"
+            if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
+                return "str"
+    except ImportError:
+        pass
+
+    if _is_null_dtype(dtype):
+        return "float64" if kind in ("key", "mean") else "int64"
+    return dtype
+
+
+def _cast_column_to_dtype(df, column: str, dtype):
+    if dtype is None or column not in df.columns:
+        return
+    try:
+        df[column] = df[column].astype(dtype)
+    except (TypeError, ValueError, NotImplementedError):
+        try:
+            import cudf
+
+            is_all_null = len(df) == 0 or bool(df[column].isnull().all())
+            if isinstance(df, cudf.DataFrame) and is_all_null:
+                df[column] = cudf.Series([None] * len(df), dtype=dtype)
+        except (ImportError, TypeError, ValueError, NotImplementedError):
+            pass
+
+
+def _fill_missing_count(result, count_column: str, dtype=None):
+    if count_column not in result.columns:
+        result[count_column] = 0
+    else:
+        result[count_column] = result[count_column].fillna(0)
+    _cast_column_to_dtype(result, count_column, dtype)
+
+
+def _fill_missing_reduction(result, reduction_column: str, dtype):
+    if reduction_column not in result.columns:
+        result[reduction_column] = None
+    _cast_column_to_dtype(result, reduction_column, dtype)
+
+
+def _all_counts_zero(df, count_column: str) -> bool:
+    if len(df) == 0 or count_column not in df.columns:
+        return False
+    try:
+        return bool((df[count_column] == 0).all())
+    except TypeError:
+        return False
+
+
+def _empty_dataframe(
+    cudf,
+    columns: Sequence[str],
+    dtypes: Optional[Dict[str, Any]] = None,
+):
+    dtypes = dtypes or {}
     df = cudf.DataFrame()
     for column in columns:
         df[column] = []
+        _cast_column_to_dtype(df, column, dtypes.get(column))
     return df
 
 
@@ -128,6 +293,13 @@ class GPUAggregationSpec:
         """Return accumulator values for an empty global-aggregation input block."""
         return {column: None for column in self.accumulator_columns}
 
+    def partial_accumulator_dtypes(self, df, input_schema=None) -> Dict[str, Any]:
+        """Return preferred dtypes for partial accumulator columns."""
+        return {column: None for column in self.accumulator_columns}
+
+    def final_arrow_types(self, source_dtype_override=None) -> Dict[str, Any]:
+        return {}
+
 
 @dataclass
 class _BuiltinGPUAggregationSpec(GPUAggregationSpec):
@@ -136,6 +308,7 @@ class _BuiltinGPUAggregationSpec(GPUAggregationSpec):
     target_column: Optional[str]
     ignore_nulls: bool
     accumulator_prefix: str
+    source_dtype: Any = None
 
     @property
     def required_columns(self) -> Tuple[str, ...]:
@@ -151,12 +324,14 @@ class _BuiltinGPUAggregationSpec(GPUAggregationSpec):
             )
         return (f"{self.accumulator_prefix}_value",)
 
-    def partial_aggregate(self, df, key_columns: Tuple[str, ...]):
+    def partial_aggregate(self, df, key_columns: Tuple[str, ...], input_schema=None):
         if self.kind == "count":
             return self._partial_count(df, key_columns)
         if self.kind == "mean":
-            return self._partial_mean(df, key_columns)
-        return self._partial_simple_reduction(df, key_columns)
+            return self._partial_mean(df, key_columns, input_schema=input_schema)
+        return self._partial_simple_reduction(
+            df, key_columns, input_schema=input_schema
+        )
 
     def empty_global_partial_values(self) -> Dict[str, Any]:
         if self.kind == "count":
@@ -180,6 +355,50 @@ class _BuiltinGPUAggregationSpec(GPUAggregationSpec):
             return {sum_col: None, count_col: 0, null_count_col: 0}
         return super().empty_global_partial_values()
 
+    def partial_accumulator_dtypes(self, df, input_schema=None) -> Dict[str, Any]:
+        if self.kind == "count":
+            return {self.accumulator_columns[0]: "int64"}
+        if self.kind == "mean":
+            sum_col, count_col, null_count_col = self.accumulator_columns
+            return {
+                sum_col: self._target_accumulator_dtype(df, input_schema=input_schema),
+                count_col: "int64",
+                null_count_col: "int64",
+            }
+        return {
+            self.accumulator_columns[0]: self._target_accumulator_dtype(
+                df, input_schema=input_schema
+            )
+        }
+
+    def final_arrow_types(self, source_dtype_override=None) -> Dict[str, Any]:
+        source_dtype = self.source_dtype
+        if source_dtype is None:
+            source_dtype = source_dtype_override
+
+        if self.kind not in ("sum", "min", "max") or not _is_null_dtype(source_dtype):
+            return {}
+
+        import pyarrow as pa
+
+        return {self.output_name: pa.null()}
+
+    def _target_accumulator_dtype(self, df, input_schema=None):
+        dtype = self.source_dtype
+        if dtype is not None:
+            return _normalize_intermediate_dtype(dtype, self.kind)
+
+        dtype = _schema_column_dtype(input_schema, self.target_column)
+        if dtype is not None:
+            if self.kind in ("sum", "min", "max", "mean") and (
+                _is_numeric_or_null_dtype(dtype)
+            ):
+                return "float64"
+            return _normalize_intermediate_dtype(dtype, self.kind)
+
+        dtype = _get_column_dtype(df, self.target_column)
+        return _normalize_intermediate_dtype(dtype, self.kind)
+
     def final_aggregate(self, df, key_columns: Tuple[str, ...]):
         if self.kind == "count":
             return self._final_count(df, key_columns)
@@ -191,31 +410,48 @@ class _BuiltinGPUAggregationSpec(GPUAggregationSpec):
         acc_col = self.accumulator_columns[0]
         if self.target_column is None or not self.ignore_nulls:
             return _group_size(df, key_columns, acc_col)
-        return _group_count(df, key_columns, self.target_column, acc_col)
+
+        sizes = _group_size(df, key_columns, acc_col)
+        count_dtype = _get_column_dtype(sizes, acc_col)
+        counts = _group_count(df, key_columns, self.target_column, acc_col)
+        result = _left_merge_on_keys(sizes[list(key_columns)], counts, key_columns)
+        _fill_missing_count(result, acc_col, count_dtype)
+        return result[list(key_columns) + [acc_col]]
 
     def _final_count(self, df, key_columns: Tuple[str, ...]):
         acc_col = self.accumulator_columns[0]
         result = _group_aggregate(df, key_columns, acc_col, "sum", self.output_name)
         return result[list(key_columns) + [self.output_name]]
 
-    def _partial_simple_reduction(self, df, key_columns: Tuple[str, ...]):
+    def _partial_simple_reduction(
+        self, df, key_columns: Tuple[str, ...], input_schema=None
+    ):
         assert self.target_column is not None
 
         acc_col = self.accumulator_columns[0]
         size_col = f"{self.accumulator_prefix}_size"
         count_col = f"{self.accumulator_prefix}_count"
+        target_dtype = self._target_accumulator_dtype(df, input_schema=input_schema)
 
-        result = _group_aggregate(
-            df,
-            key_columns,
-            self.target_column,
-            self.kind,
-            acc_col,
-        )
-        counts = _group_count(df, key_columns, self.target_column, count_col)
         sizes = _group_size(df, key_columns, size_col)
-        result = _merge_on_keys(result, counts, key_columns)
-        result = _merge_on_keys(result, sizes, key_columns)
+        count_dtype = _get_column_dtype(sizes, size_col)
+        counts = _group_count(df, key_columns, self.target_column, count_col)
+        result = _left_merge_on_keys(sizes, counts, key_columns)
+        _fill_missing_count(result, count_col, count_dtype)
+
+        if _all_counts_zero(result, count_col):
+            result[acc_col] = None
+            _cast_column_to_dtype(result, acc_col, target_dtype)
+        else:
+            aggregated = _group_aggregate(
+                df,
+                key_columns,
+                self.target_column,
+                self.kind,
+                acc_col,
+            )
+            result = _left_merge_on_keys(result, aggregated, key_columns)
+            _fill_missing_reduction(result, acc_col, target_dtype)
 
         if self.ignore_nulls:
             null_mask = result[count_col] == 0
@@ -229,12 +465,23 @@ class _BuiltinGPUAggregationSpec(GPUAggregationSpec):
         acc_col = self.accumulator_columns[0]
         size_col = f"{self.accumulator_prefix}_partial_size"
         count_col = f"{self.accumulator_prefix}_partial_count"
+        acc_dtype = _get_column_dtype(df, acc_col)
 
-        result = _group_aggregate(df, key_columns, acc_col, self.kind, self.output_name)
         counts = _group_count(df, key_columns, acc_col, count_col)
         sizes = _group_size(df, key_columns, size_col)
-        result = _merge_on_keys(result, counts, key_columns)
-        result = _merge_on_keys(result, sizes, key_columns)
+        count_dtype = _get_column_dtype(sizes, size_col)
+        result = _left_merge_on_keys(sizes, counts, key_columns)
+        _fill_missing_count(result, count_col, count_dtype)
+
+        if _all_counts_zero(result, count_col):
+            result[self.output_name] = None
+            _cast_column_to_dtype(result, self.output_name, acc_dtype)
+        else:
+            aggregated = _group_aggregate(
+                df, key_columns, acc_col, self.kind, self.output_name
+            )
+            result = _left_merge_on_keys(result, aggregated, key_columns)
+            _fill_missing_reduction(result, self.output_name, acc_dtype)
 
         if self.ignore_nulls:
             null_mask = result[count_col] == 0
@@ -244,24 +491,35 @@ class _BuiltinGPUAggregationSpec(GPUAggregationSpec):
 
         return result[list(key_columns) + [self.output_name]]
 
-    def _partial_mean(self, df, key_columns: Tuple[str, ...]):
+    def _partial_mean(self, df, key_columns: Tuple[str, ...], input_schema=None):
         assert self.target_column is not None
 
         sum_col, count_col, null_count_col = self.accumulator_columns
         size_col = f"{self.accumulator_prefix}_size"
+        target_dtype = self._target_accumulator_dtype(df, input_schema=input_schema)
 
-        result = _group_aggregate(
-            df,
-            key_columns,
-            self.target_column,
-            "sum",
-            sum_col,
-        )
-        counts = _group_count(df, key_columns, self.target_column, count_col)
         sizes = _group_size(df, key_columns, size_col)
-        result = _merge_on_keys(result, counts, key_columns)
-        result = _merge_on_keys(result, sizes, key_columns)
+        count_dtype = _get_column_dtype(sizes, size_col)
+        counts = _group_count(df, key_columns, self.target_column, count_col)
+        result = _left_merge_on_keys(sizes, counts, key_columns)
+        _fill_missing_count(result, count_col, count_dtype)
+
+        if _all_counts_zero(result, count_col):
+            result[sum_col] = None
+            _cast_column_to_dtype(result, sum_col, target_dtype)
+        else:
+            sums = _group_aggregate(
+                df,
+                key_columns,
+                self.target_column,
+                "sum",
+                sum_col,
+            )
+            result = _left_merge_on_keys(result, sums, key_columns)
+            _fill_missing_reduction(result, sum_col, target_dtype)
+
         result[null_count_col] = result[size_col] - result[count_col]
+        _cast_column_to_dtype(result, null_count_col, count_dtype)
 
         if not self.ignore_nulls:
             result.loc[result[null_count_col] > 0, sum_col] = None
@@ -273,15 +531,18 @@ class _BuiltinGPUAggregationSpec(GPUAggregationSpec):
         final_sum_col = f"{self.accumulator_prefix}_final_sum"
         final_count_col = f"{self.accumulator_prefix}_final_count"
         final_null_count_col = f"{self.accumulator_prefix}_final_null_count"
+        sum_dtype = _get_column_dtype(df, sum_col)
 
-        sums = _group_aggregate(df, key_columns, sum_col, "sum", final_sum_col)
         counts = _group_aggregate(df, key_columns, count_col, "sum", final_count_col)
         null_counts = _group_aggregate(
             df, key_columns, null_count_col, "sum", final_null_count_col
         )
+        result = _left_merge_on_keys(counts, null_counts, key_columns)
 
-        result = _merge_on_keys(sums, counts, key_columns)
-        result = _merge_on_keys(result, null_counts, key_columns)
+        sums = _group_aggregate(df, key_columns, sum_col, "sum", final_sum_col)
+        result = _left_merge_on_keys(result, sums, key_columns)
+        _fill_missing_reduction(result, final_sum_col, sum_dtype)
+
         result[self.output_name] = result[final_sum_col] / result[final_count_col]
 
         null_mask = result[final_count_col] == 0
@@ -299,9 +560,12 @@ class GPUAggregationPlan:
         self,
         key_columns: Tuple[str, ...],
         specs: Tuple[GPUAggregationSpec, ...],
+        input_schema=None,
     ):
         self._key_columns = key_columns
         self._specs = specs
+        self._input_schema = input_schema
+        self._runtime_source_dtypes: Dict[int, Any] = {}
         self._is_global = len(key_columns) == 0
         global_key = _GLOBAL_AGGREGATE_KEY
         required_columns = {
@@ -309,9 +573,7 @@ class GPUAggregationPlan:
         }
         while global_key in required_columns:
             global_key = f"_{global_key}"
-        self._shuffle_key_columns = (
-            (global_key,) if self._is_global else key_columns
-        )
+        self._shuffle_key_columns = (global_key,) if self._is_global else key_columns
 
     @property
     def shuffle_key_columns(self) -> Tuple[str, ...]:
@@ -337,8 +599,77 @@ class GPUAggregationPlan:
             columns.extend(spec.accumulator_columns)
         return tuple(columns)
 
-    def partial_aggregate(self, df):
+    def _partial_output_dtypes(
+        self, df, key_columns: Tuple[str, ...], input_schema=None
+    ):
+        dtypes = {}
+        for column in key_columns:
+            if column not in df.columns:
+                continue
+            dtype = _schema_column_dtype(input_schema, column)
+            if dtype is not None:
+                dtype = _normalize_intermediate_dtype(dtype, "key")
+            else:
+                dtype = _get_column_dtype(df, column)
+            dtypes[column] = dtype
+        for spec in self._specs:
+            dtypes.update(
+                spec.partial_accumulator_dtypes(df, input_schema=input_schema)
+            )
+        return dtypes
+
+    def _normalize_partial_output(self, result, df, key_columns, input_schema=None):
+        for column, dtype in self._partial_output_dtypes(
+            df, key_columns, input_schema=input_schema
+        ).items():
+            _cast_column_to_dtype(result, column, dtype)
+        return result
+
+    def _observe_input_schema(self, input_schema):
+        if input_schema is None:
+            return
+
+        for index, spec in enumerate(self._specs):
+            target_column = getattr(spec, "target_column", None)
+            if target_column is None:
+                continue
+
+            observed_dtype = _schema_column_dtype(input_schema, target_column)
+            if observed_dtype is None:
+                continue
+
+            current_dtype = self._runtime_source_dtypes.get(index)
+            if current_dtype is None or _is_null_dtype(current_dtype):
+                self._runtime_source_dtypes[index] = observed_dtype
+
+    def _final_arrow_types(self):
+        types = {}
+        for index, spec in enumerate(self._specs):
+            source_dtype_override = None
+            if getattr(spec, "source_dtype", None) is None:
+                source_dtype_override = self._runtime_source_dtypes.get(index)
+            types.update(spec.final_arrow_types(source_dtype_override))
+        return types
+
+    def normalize_output_arrow(self, table):
+        arrow_types = self._final_arrow_types()
+        if not arrow_types:
+            return table
+
+        import pyarrow as pa
+
+        columns = []
+        for column_name in table.column_names:
+            if column_name in arrow_types:
+                columns.append(pa.nulls(table.num_rows, type=arrow_types[column_name]))
+            else:
+                columns.append(table[column_name])
+        return pa.table(columns, names=table.column_names)
+
+    def partial_aggregate(self, df, input_schema=None):
         import cudf
+
+        self._observe_input_schema(input_schema)
 
         if self._is_global:
             df = df.copy(deep=False)
@@ -351,17 +682,40 @@ class GPUAggregationPlan:
                 for spec in self._specs:
                     for column, value in spec.empty_global_partial_values().items():
                         values[column] = [value]
-                return cudf.DataFrame(values)[
+                result = cudf.DataFrame(values)[
                     list(key_columns) + list(self.accumulator_columns)
                 ]
-            return _empty_dataframe(cudf, list(key_columns) + list(self.accumulator_columns))
+                for column, dtype in self._partial_output_dtypes(
+                    df, key_columns, input_schema=input_schema
+                ).items():
+                    _cast_column_to_dtype(result, column, dtype)
+                return result
+            return _empty_dataframe(
+                cudf,
+                list(key_columns) + list(self.accumulator_columns),
+                dtypes=self._partial_output_dtypes(
+                    df, key_columns, input_schema=input_schema
+                ),
+            )
 
         result = None
         for spec in self._specs:
-            partial = spec.partial_aggregate(df, key_columns)
-            result = partial if result is None else _merge_on_keys(result, partial, key_columns)
+            if isinstance(spec, _BuiltinGPUAggregationSpec):
+                partial = spec.partial_aggregate(
+                    df, key_columns, input_schema=input_schema
+                )
+            else:
+                partial = spec.partial_aggregate(df, key_columns)
+            result = (
+                partial
+                if result is None
+                else _merge_on_keys(result, partial, key_columns)
+            )
 
         assert result is not None
+        result = self._normalize_partial_output(
+            result, df, key_columns, input_schema=input_schema
+        )
         return result[list(key_columns) + list(self.accumulator_columns)]
 
     def final_aggregate(self, df):
@@ -417,12 +771,14 @@ def _get_builtin_gpu_aggregation_spec(
     *,
     output_name: str,
     accumulator_prefix: str,
+    input_schema=None,
 ) -> Optional[GPUAggregationSpec]:
     if not isinstance(agg, AggregateFnV2):
         return None
 
     target_column = agg.get_target_column()
     ignore_nulls = agg._ignore_nulls
+    source_dtype = _schema_column_dtype(input_schema, target_column)
 
     if isinstance(agg, Count):
         return _BuiltinGPUAggregationSpec(
@@ -431,6 +787,7 @@ def _get_builtin_gpu_aggregation_spec(
             target_column=target_column,
             ignore_nulls=ignore_nulls,
             accumulator_prefix=accumulator_prefix,
+            source_dtype=source_dtype,
         )
 
     if target_column is None:
@@ -453,12 +810,14 @@ def _get_builtin_gpu_aggregation_spec(
         target_column=target_column,
         ignore_nulls=ignore_nulls,
         accumulator_prefix=accumulator_prefix,
+        source_dtype=source_dtype,
     )
 
 
 def build_gpu_aggregation_plan(
     key_columns: Tuple[str, ...],
     aggregation_fns: Tuple[AggregateFn, ...],
+    input_schema=None,
 ) -> Optional[GPUAggregationPlan]:
     if not aggregation_fns:
         return None
@@ -478,12 +837,13 @@ def build_gpu_aggregation_plan(
                 agg,
                 output_name=output_name,
                 accumulator_prefix=accumulator_prefix,
+                input_schema=input_schema,
             )
         if spec is None:
             return None
         specs.append(spec)
 
-    return GPUAggregationPlan(key_columns, tuple(specs))
+    return GPUAggregationPlan(key_columns, tuple(specs), input_schema=input_schema)
 
 
 def supports_gpu_hash_aggregate(aggregation_fns: Tuple[AggregateFn, ...]) -> bool:
@@ -549,7 +909,9 @@ class GPUHashAggregateActor:
         if required_columns:
             df = df[list(required_columns)]
 
-        partial = self._aggregation_plan.partial_aggregate(df)
+        partial = self._aggregation_plan.partial_aggregate(
+            df, input_schema=table.schema
+        )
         if self._shuffle_columns is None:
             self._shuffle_columns = list(partial.columns)
 
@@ -578,6 +940,7 @@ class GPUHashAggregateActor:
 
             output_df = self._aggregation_plan.final_aggregate(cdf)
             block = output_df.to_arrow(preserve_index=False)
+            block = self._aggregation_plan.normalize_output_arrow(block)
 
             existing_metadata = block.schema.metadata or {}
             tagged_schema = block.schema.with_metadata(
@@ -710,10 +1073,15 @@ class GPUHashAggregateOperator(GPUShuffleOperator):
         aggregation_fns: Tuple[AggregateFn, ...],
         *,
         num_partitions: Optional[int] = None,
+        input_schema=None,
     ):
-        aggregation_plan = build_gpu_aggregation_plan(key_columns, aggregation_fns)
+        aggregation_plan = build_gpu_aggregation_plan(
+            key_columns, aggregation_fns, input_schema=input_schema
+        )
         if aggregation_plan is None:
-            raise ValueError("GPUHashAggregateOperator received unsupported aggregations.")
+            raise ValueError(
+                "GPUHashAggregateOperator received unsupported aggregations."
+            )
 
         nranks = _derive_num_gpu_ranks(data_context)
         target_num_partitions = (
