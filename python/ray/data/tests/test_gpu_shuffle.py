@@ -12,6 +12,7 @@ import pyarrow as pa
 import pytest
 
 import ray
+import ray.data._internal.gpu_shuffle.hash_aggregate as hash_aggregate
 from ray.data._internal.execution.interfaces import (
     ExecutionResources,
     PhysicalOperator,
@@ -23,21 +24,20 @@ from ray.data._internal.execution.operators.map_transformer import (
     BlockMapTransformFn,
     MapTransformer,
 )
+from ray.data._internal.gpu_shuffle.hash_aggregate import (
+    GPUHashAggregateOperator,
+    _group_aggregate,
+    build_gpu_aggregation_plan,
+)
 from ray.data._internal.gpu_shuffle.hash_shuffle import (
     GPURankPool,
     GPUShuffleActor,
     GPUShuffleOperator,
     _derive_num_gpu_ranks,
 )
-from ray.data._internal.logical.interfaces import PhysicalPlan
-from ray.data._internal.logical.rules.gpu_shuffle_fusion import FuseGPUShuffleMaps
-from ray.data._internal.gpu_shuffle.hash_aggregate import (
-    GPUHashAggregateOperator,
-    build_gpu_aggregation_plan,
-    _group_aggregate,
-)
-from ray.data._internal.logical.interfaces import LogicalOperator
+from ray.data._internal.logical.interfaces import LogicalOperator, PhysicalPlan
 from ray.data._internal.logical.operators import Aggregate, Repartition
+from ray.data._internal.logical.rules.gpu_shuffle_fusion import FuseGPUShuffleMaps
 from ray.data._internal.planner.plan_all_to_all_op import plan_all_to_all_op
 from ray.data._internal.util import explain_plan
 from ray.data.aggregate import AsList, Count, Max, Mean, Min, Sum
@@ -820,6 +820,165 @@ class TestGPUHashAggregatePlanning:
         assert plan is not None
         assert len(plan.shuffle_key_columns) == 1
         assert plan.shuffle_key_columns[0].startswith("__ray_gpu_hash_aggregate")
+
+    def test_null_reductions_preserve_groups_and_accumulator_dtypes(self, monkeypatch):
+        original_group_aggregate = hash_aggregate._group_aggregate
+        original_group_count = hash_aggregate._group_count
+
+        def _drop_all_null_group_aggregate(
+            df, key_columns, target_column, aggregate_name, output_column
+        ):
+            result = original_group_aggregate(
+                df, key_columns, target_column, aggregate_name, output_column
+            )
+            counts = original_group_count(df, key_columns, target_column, "__count")
+            non_null_keys = counts[counts["__count"] > 0][list(key_columns)]
+            result = result.merge(non_null_keys, on=list(key_columns), how="inner")
+            if output_column in result.columns:
+                result[output_column] = result[output_column].astype(object)
+            return result
+
+        def _drop_zero_group_counts(df, key_columns, target_column, output_column):
+            result = original_group_count(df, key_columns, target_column, output_column)
+            return result[result[output_column] > 0]
+
+        monkeypatch.setattr(
+            hash_aggregate, "_group_aggregate", _drop_all_null_group_aggregate
+        )
+        monkeypatch.setattr(hash_aggregate, "_group_count", _drop_zero_group_counts)
+
+        plan = build_gpu_aggregation_plan(("user_id",), (Sum("value"),))
+        assert plan is not None
+        spec = plan._specs[0]
+
+        df = pd.DataFrame(
+            {
+                "user_id": pd.Series([0, 1, 2, 0], dtype="int64"),
+                "value": pd.Series([None, None, None, None], dtype="Int64"),
+            }
+        )
+        partial = spec.partial_aggregate(df, ("user_id",))
+        assert str(partial[spec.accumulator_columns[0]].dtype) == "Int64"
+
+        result = (
+            spec.final_aggregate(partial, ("user_id",))
+            .sort_values("user_id")
+            .reset_index(drop=True)
+        )
+
+        assert result.to_dict("records") == [
+            {"user_id": 0, "sum(value)": None},
+            {"user_id": 1, "sum(value)": None},
+            {"user_id": 2, "sum(value)": None},
+        ]
+
+        count_plan = build_gpu_aggregation_plan(
+            ("user_id",), (Count("value", ignore_nulls=True),)
+        )
+        assert count_plan is not None
+        count_spec = count_plan._specs[0]
+
+        count_partial = count_spec.partial_aggregate(df, ("user_id",))
+        count_result = (
+            count_spec.final_aggregate(count_partial, ("user_id",))
+            .sort_values("user_id")
+            .reset_index(drop=True)
+        )
+
+        assert count_result.to_dict("records") == [
+            {"user_id": 0, "count(value)": 0},
+            {"user_id": 1, "count(value)": 0},
+            {"user_id": 2, "count(value)": 0},
+        ]
+
+        null_schema = pa.schema(
+            [
+                ("user_id", pa.int64()),
+                ("value", pa.null()),
+            ]
+        )
+        null_plan = build_gpu_aggregation_plan(
+            ("user_id",), (Sum("value"),), input_schema=null_schema
+        )
+        output_table = pa.table(
+            {
+                "user_id": pa.array([0, 1, 2], type=pa.int64()),
+                "sum(value)": pa.array([None, None, None], type=pa.int64()),
+            }
+        )
+
+        assert null_plan.normalize_output_arrow(output_table).schema == pa.schema(
+            [
+                ("user_id", pa.int64()),
+                ("sum(value)", pa.null()),
+            ]
+        )
+
+        nan_key_plan = build_gpu_aggregation_plan(
+            ("item",), (Count(),), input_schema=pa.schema([("item", pa.null())])
+        )
+        nan_key_partial = pd.DataFrame(
+            {
+                "item": pd.Series([None], dtype=object),
+                nan_key_plan.accumulator_columns[0]: pd.Series([1], dtype="int64"),
+            }
+        )
+        normalized_nan_key_partial = nan_key_plan._normalize_partial_output(
+            nan_key_partial,
+            nan_key_partial,
+            ("item",),
+            input_schema=pa.schema([("item", pa.null())]),
+        )
+
+        assert str(normalized_nan_key_partial["item"].dtype) == "float64"
+        assert (
+            str(normalized_nan_key_partial[nan_key_plan.accumulator_columns[0]].dtype)
+            == "int64"
+        )
+
+        unknown_schema_plan = build_gpu_aggregation_plan(("A",), (Sum("B"),))
+        assert unknown_schema_plan is not None
+        unknown_schema_acc_col = unknown_schema_plan.accumulator_columns[0]
+        int_input = pd.DataFrame(
+            {
+                "A": pd.Series([0], dtype="int64"),
+                "B": pd.Series([1], dtype="int64"),
+            }
+        )
+        int_partial = pd.DataFrame(
+            {
+                "A": pd.Series([0], dtype="int64"),
+                unknown_schema_acc_col: pd.Series([1], dtype="int64"),
+            }
+        )
+        double_input = pd.DataFrame(
+            {
+                "A": pd.Series([0], dtype="int64"),
+                "B": pd.Series([1.0], dtype="float64"),
+            }
+        )
+        double_partial = pd.DataFrame(
+            {
+                "A": pd.Series([0], dtype="int64"),
+                unknown_schema_acc_col: pd.Series([1.0], dtype="float64"),
+            }
+        )
+
+        normalized_int_partial = unknown_schema_plan._normalize_partial_output(
+            int_partial,
+            int_input,
+            ("A",),
+            input_schema=pa.schema([("A", pa.int64()), ("B", pa.int64())]),
+        )
+        normalized_double_partial = unknown_schema_plan._normalize_partial_output(
+            double_partial,
+            double_input,
+            ("A",),
+            input_schema=pa.schema([("A", pa.int64()), ("B", pa.float64())]),
+        )
+
+        assert str(normalized_int_partial[unknown_schema_acc_col].dtype) == "float64"
+        assert str(normalized_double_partial[unknown_schema_acc_col].dtype) == "float64"
 
     def test_sum_falls_back_when_cudf_min_count_unimplemented(self):
         class _FakeAggregated:

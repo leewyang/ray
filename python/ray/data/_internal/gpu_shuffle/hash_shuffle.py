@@ -40,8 +40,8 @@ from ray.data.context import DataContext
 
 if typing.TYPE_CHECKING:
 
-    from ray.data._internal.progress.base_progress import BaseProgressBar
     from ray.data._internal.execution.operators.map_transformer import MapTransformer
+    from ray.data._internal.progress.base_progress import BaseProgressBar
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,7 @@ def _apply_map_transformer(
 
     with DataContext.current(data_context), TaskContext.current(ctx):
         yield from map_transformer.apply_transform(blocks, ctx)
+
 
 # ---------------------------------------------------------------------------
 # GPU shuffle actor
