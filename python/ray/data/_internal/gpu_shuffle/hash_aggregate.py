@@ -7,20 +7,22 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import ray
-import ray.exceptions
-from ray.actor import ActorHandle
 from ray.data._internal.execution.interfaces import PhysicalOperator
-from ray.data._internal.execution.operators.hash_shuffle import (
-    _get_total_cluster_resources,
-)
 from ray.data._internal.gpu_shuffle.hash_shuffle import (
     _GPU_PARTITION_ID_KEY,
+    GPURankPool,
     GPUShuffleOperator,
-    _wait_for_refs_with_timeout,
+    _derive_num_gpu_ranks,
 )
 from ray.data._internal.table_block import TableBlockAccessor
 from ray.data.aggregate import AggregateFn, AggregateFnV2, Count, Max, Mean, Min, Sum
-from ray.data.block import Block, BlockAccessor, BlockExecStats, BlockMetadataWithSchema
+from ray.data.block import (
+    Block,
+    BlockAccessor,
+    BlockExecStats,
+    BlockMetadataWithSchema,
+    BlockStats,
+)
 from ray.data.context import DataContext
 
 if typing.TYPE_CHECKING:
@@ -31,7 +33,7 @@ if typing.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_GLOBAL_AGGREGATE_KEY = "__ray_gpu_hash_aggregate_global_key"
+_GLOBAL_AGGREGATE_KEY = "__hash_aggregate_global_key"
 
 
 def _resolve_aggregation_names(aggregation_fns: Sequence[AggregateFn]) -> List[str]:
@@ -281,7 +283,7 @@ class GPUAggregationSpec:
     required_columns: Tuple[str, ...]
     accumulator_columns: Tuple[str, ...]
 
-    def partial_aggregate(self, df, key_columns: Tuple[str, ...]):
+    def partial_aggregate(self, df, key_columns: Tuple[str, ...], input_schema=None):
         """Return a cuDF DataFrame with key columns and accumulator columns."""
         raise NotImplementedError
 
@@ -423,9 +425,65 @@ class _BuiltinGPUAggregationSpec(GPUAggregationSpec):
         result = _group_aggregate(df, key_columns, acc_col, "sum", self.output_name)
         return result[list(key_columns) + [self.output_name]]
 
-    def _partial_simple_reduction(
-        self, df, key_columns: Tuple[str, ...], input_schema=None
+    def _group_size_and_count(
+        self,
+        df: Any,
+        key_columns: Tuple[str, ...],
+        target_column: str,
+        *,
+        size_col: str,
+        count_col: str,
+    ) -> Tuple[Any, Any]:
+        sizes = _group_size(df, key_columns, size_col)
+        count_dtype = _get_column_dtype(sizes, size_col)
+        counts = _group_count(df, key_columns, target_column, count_col)
+        result = _left_merge_on_keys(sizes, counts, key_columns)
+        _fill_missing_count(result, count_col, count_dtype)
+        return result, count_dtype
+
+    def _add_optional_reduction(
+        self,
+        result,
+        df,
+        key_columns: Tuple[str, ...],
+        *,
+        target_column: str,
+        aggregate_name: str,
+        output_column: str,
+        output_dtype: Any,
+        count_column: str,
     ):
+        if _all_counts_zero(result, count_column):
+            result[output_column] = None
+            _cast_column_to_dtype(result, output_column, output_dtype)
+            return result
+
+        aggregated = _group_aggregate(
+            df,
+            key_columns,
+            target_column,
+            aggregate_name,
+            output_column,
+        )
+        result = _left_merge_on_keys(result, aggregated, key_columns)
+        _fill_missing_reduction(result, output_column, output_dtype)
+        return result
+
+    def _apply_null_reduction_semantics(
+        self,
+        result,
+        *,
+        size_col: str,
+        count_col: str,
+        output_col: str,
+    ) -> None:
+        if self.ignore_nulls:
+            null_mask = result[count_col] == 0
+        else:
+            null_mask = result[size_col] != result[count_col]
+        result.loc[null_mask, output_col] = None
+
+    def _partial_simple_reduction(self, df, key_columns: Tuple[str, ...], input_schema=None):
         assert self.target_column is not None
 
         acc_col = self.accumulator_columns[0]
@@ -433,31 +491,26 @@ class _BuiltinGPUAggregationSpec(GPUAggregationSpec):
         count_col = f"{self.accumulator_prefix}_count"
         target_dtype = self._target_accumulator_dtype(df, input_schema=input_schema)
 
-        sizes = _group_size(df, key_columns, size_col)
-        count_dtype = _get_column_dtype(sizes, size_col)
-        counts = _group_count(df, key_columns, self.target_column, count_col)
-        result = _left_merge_on_keys(sizes, counts, key_columns)
-        _fill_missing_count(result, count_col, count_dtype)
-
-        if _all_counts_zero(result, count_col):
-            result[acc_col] = None
-            _cast_column_to_dtype(result, acc_col, target_dtype)
-        else:
-            aggregated = _group_aggregate(
-                df,
-                key_columns,
-                self.target_column,
-                self.kind,
-                acc_col,
-            )
-            result = _left_merge_on_keys(result, aggregated, key_columns)
-            _fill_missing_reduction(result, acc_col, target_dtype)
-
-        if self.ignore_nulls:
-            null_mask = result[count_col] == 0
-        else:
-            null_mask = result[size_col] != result[count_col]
-        result.loc[null_mask, acc_col] = None
+        result, _ = self._group_size_and_count(
+            df,
+            key_columns,
+            self.target_column,
+            size_col=size_col,
+            count_col=count_col,
+        )
+        result = self._add_optional_reduction(
+            result,
+            df,
+            key_columns,
+            target_column=self.target_column,
+            aggregate_name=self.kind,
+            output_column=acc_col,
+            output_dtype=target_dtype,
+            count_column=count_col,
+        )
+        self._apply_null_reduction_semantics(
+            result, size_col=size_col, count_col=count_col, output_col=acc_col
+        )
 
         return result[list(key_columns) + [acc_col]]
 
@@ -467,27 +520,29 @@ class _BuiltinGPUAggregationSpec(GPUAggregationSpec):
         count_col = f"{self.accumulator_prefix}_partial_count"
         acc_dtype = _get_column_dtype(df, acc_col)
 
-        counts = _group_count(df, key_columns, acc_col, count_col)
-        sizes = _group_size(df, key_columns, size_col)
-        count_dtype = _get_column_dtype(sizes, size_col)
-        result = _left_merge_on_keys(sizes, counts, key_columns)
-        _fill_missing_count(result, count_col, count_dtype)
-
-        if _all_counts_zero(result, count_col):
-            result[self.output_name] = None
-            _cast_column_to_dtype(result, self.output_name, acc_dtype)
-        else:
-            aggregated = _group_aggregate(
-                df, key_columns, acc_col, self.kind, self.output_name
-            )
-            result = _left_merge_on_keys(result, aggregated, key_columns)
-            _fill_missing_reduction(result, self.output_name, acc_dtype)
-
-        if self.ignore_nulls:
-            null_mask = result[count_col] == 0
-        else:
-            null_mask = result[size_col] != result[count_col]
-        result.loc[null_mask, self.output_name] = None
+        result, _ = self._group_size_and_count(
+            df,
+            key_columns,
+            acc_col,
+            size_col=size_col,
+            count_col=count_col,
+        )
+        result = self._add_optional_reduction(
+            result,
+            df,
+            key_columns,
+            target_column=acc_col,
+            aggregate_name=self.kind,
+            output_column=self.output_name,
+            output_dtype=acc_dtype,
+            count_column=count_col,
+        )
+        self._apply_null_reduction_semantics(
+            result,
+            size_col=size_col,
+            count_col=count_col,
+            output_col=self.output_name,
+        )
 
         return result[list(key_columns) + [self.output_name]]
 
@@ -498,25 +553,23 @@ class _BuiltinGPUAggregationSpec(GPUAggregationSpec):
         size_col = f"{self.accumulator_prefix}_size"
         target_dtype = self._target_accumulator_dtype(df, input_schema=input_schema)
 
-        sizes = _group_size(df, key_columns, size_col)
-        count_dtype = _get_column_dtype(sizes, size_col)
-        counts = _group_count(df, key_columns, self.target_column, count_col)
-        result = _left_merge_on_keys(sizes, counts, key_columns)
-        _fill_missing_count(result, count_col, count_dtype)
-
-        if _all_counts_zero(result, count_col):
-            result[sum_col] = None
-            _cast_column_to_dtype(result, sum_col, target_dtype)
-        else:
-            sums = _group_aggregate(
-                df,
-                key_columns,
-                self.target_column,
-                "sum",
-                sum_col,
-            )
-            result = _left_merge_on_keys(result, sums, key_columns)
-            _fill_missing_reduction(result, sum_col, target_dtype)
+        result, count_dtype = self._group_size_and_count(
+            df,
+            key_columns,
+            self.target_column,
+            size_col=size_col,
+            count_col=count_col,
+        )
+        result = self._add_optional_reduction(
+            result,
+            df,
+            key_columns,
+            target_column=self.target_column,
+            aggregate_name="sum",
+            output_column=sum_col,
+            output_dtype=target_dtype,
+            count_column=count_col,
+        )
 
         result[null_count_col] = result[size_col] - result[count_col]
         _cast_column_to_dtype(result, null_count_col, count_dtype)
@@ -565,7 +618,6 @@ class GPUAggregationPlan:
         self._key_columns = key_columns
         self._specs = specs
         self._input_schema = input_schema
-        self._runtime_source_dtypes: Dict[int, Any] = {}
         self._is_global = len(key_columns) == 0
         global_key = _GLOBAL_AGGREGATE_KEY
         required_columns = {
@@ -600,9 +652,12 @@ class GPUAggregationPlan:
         return tuple(columns)
 
     def _partial_output_dtypes(
-        self, df, key_columns: Tuple[str, ...], input_schema=None
-    ):
-        dtypes = {}
+        self,
+        df,
+        key_columns: Tuple[str, ...],
+        input_schema=None,
+    ) -> Dict[str, Any]:
+        dtypes: Dict[str, Any] = {}
         for column in key_columns:
             if column not in df.columns:
                 continue
@@ -618,17 +673,24 @@ class GPUAggregationPlan:
             )
         return dtypes
 
-    def _normalize_partial_output(self, result, df, key_columns, input_schema=None):
+    def _normalize_partial_output(
+        self,
+        result,
+        df,
+        key_columns: Tuple[str, ...],
+        input_schema=None,
+    ):
         for column, dtype in self._partial_output_dtypes(
             df, key_columns, input_schema=input_schema
         ).items():
             _cast_column_to_dtype(result, column, dtype)
         return result
 
-    def _observe_input_schema(self, input_schema):
+    def runtime_source_dtypes(self, input_schema) -> Dict[int, Any]:
         if input_schema is None:
-            return
+            return {}
 
+        source_dtypes: Dict[int, Any] = {}
         for index, spec in enumerate(self._specs):
             target_column = getattr(spec, "target_column", None)
             if target_column is None:
@@ -638,21 +700,40 @@ class GPUAggregationPlan:
             if observed_dtype is None:
                 continue
 
-            current_dtype = self._runtime_source_dtypes.get(index)
-            if current_dtype is None or _is_null_dtype(current_dtype):
-                self._runtime_source_dtypes[index] = observed_dtype
+            source_dtypes[index] = observed_dtype
+        return source_dtypes
 
-    def _final_arrow_types(self):
-        types = {}
+    @staticmethod
+    def merge_runtime_source_dtypes(
+        current: Dict[int, Any],
+        observed: Dict[int, Any],
+    ) -> Dict[int, Any]:
+        if not observed:
+            return current
+
+        merged = dict(current)
+        for index, observed_dtype in observed.items():
+            current_dtype = merged.get(index)
+            if current_dtype is None or _is_null_dtype(current_dtype):
+                merged[index] = observed_dtype
+        return merged
+
+    def _final_arrow_types(
+        self, runtime_source_dtypes: Optional[Dict[int, Any]] = None
+    ) -> Dict[str, Any]:
+        runtime_source_dtypes = runtime_source_dtypes or {}
+        types: Dict[str, Any] = {}
         for index, spec in enumerate(self._specs):
             source_dtype_override = None
             if getattr(spec, "source_dtype", None) is None:
-                source_dtype_override = self._runtime_source_dtypes.get(index)
+                source_dtype_override = runtime_source_dtypes.get(index)
             types.update(spec.final_arrow_types(source_dtype_override))
         return types
 
-    def normalize_output_arrow(self, table):
-        arrow_types = self._final_arrow_types()
+    def normalize_output_arrow(
+        self, table, runtime_source_dtypes: Optional[Dict[int, Any]] = None
+    ):
+        arrow_types = self._final_arrow_types(runtime_source_dtypes)
         if not arrow_types:
             return table
 
@@ -668,8 +749,6 @@ class GPUAggregationPlan:
 
     def partial_aggregate(self, df, input_schema=None):
         import cudf
-
-        self._observe_input_schema(input_schema)
 
         if self._is_global:
             df = df.copy(deep=False)
@@ -700,12 +779,9 @@ class GPUAggregationPlan:
 
         result = None
         for spec in self._specs:
-            if isinstance(spec, _BuiltinGPUAggregationSpec):
-                partial = spec.partial_aggregate(
-                    df, key_columns, input_schema=input_schema
-                )
-            else:
-                partial = spec.partial_aggregate(df, key_columns)
+            partial = spec.partial_aggregate(
+                df, key_columns, input_schema=input_schema
+            )
             result = (
                 partial
                 if result is None
@@ -846,10 +922,6 @@ def build_gpu_aggregation_plan(
     return GPUAggregationPlan(key_columns, tuple(specs), input_schema=input_schema)
 
 
-def supports_gpu_hash_aggregate(aggregation_fns: Tuple[AggregateFn, ...]) -> bool:
-    return build_gpu_aggregation_plan(tuple(), aggregation_fns) is not None
-
-
 @ray.remote(num_gpus=1)
 class GPUHashAggregateActor:
     """One GPU rank for hash shuffle plus aggregate."""
@@ -861,7 +933,7 @@ class GPUHashAggregateActor:
         aggregation_plan: GPUAggregationPlan,
         rmm_pool_size: Any = None,
         spill_memory_limit: Any = "auto",
-    ):
+    ) -> None:
         from ray.data._internal.gpu_shuffle.rapidsmpf_backend import (
             BulkRapidsMPFShuffler,
         )
@@ -875,6 +947,7 @@ class GPUHashAggregateActor:
             spill_memory_limit=spill_memory_limit,
         )
         self._shuffle_columns: Optional[List[str]] = None
+        self._runtime_source_dtypes: Dict[int, Any] = {}
 
     def setup_root(self) -> Tuple[int, bytes]:
         logger.info("UCXX setup_root starting on GPU hash aggregate rank 0.")
@@ -909,6 +982,12 @@ class GPUHashAggregateActor:
         if required_columns:
             df = df[list(required_columns)]
 
+        self._runtime_source_dtypes = (
+            self._aggregation_plan.merge_runtime_source_dtypes(
+                self._runtime_source_dtypes,
+                self._aggregation_plan.runtime_source_dtypes(table.schema),
+            )
+        )
         partial = self._aggregation_plan.partial_aggregate(
             df, input_schema=table.schema
         )
@@ -940,7 +1019,9 @@ class GPUHashAggregateActor:
 
             output_df = self._aggregation_plan.final_aggregate(cdf)
             block = output_df.to_arrow(preserve_index=False)
-            block = self._aggregation_plan.normalize_output_arrow(block)
+            block = self._aggregation_plan.normalize_output_arrow(
+                block, runtime_source_dtypes=self._runtime_source_dtypes
+            )
 
             existing_metadata = block.schema.metadata or {}
             tagged_schema = block.schema.with_metadata(
@@ -961,107 +1042,6 @@ class GPUHashAggregateActor:
             yield pickle.dumps(bm)
 
 
-class GPUHashAggregateRankPool:
-    def __init__(
-        self,
-        nranks: int,
-        total_nparts: int,
-        aggregation_plan: GPUAggregationPlan,
-        rmm_pool_size: Any,
-        spill_memory_limit: Any,
-        setup_timeout_s: float,
-    ):
-        self._nranks = nranks
-        self._total_nparts = total_nparts
-        self._aggregation_plan = aggregation_plan
-        self._rmm_pool_size = rmm_pool_size
-        self._spill_memory_limit = spill_memory_limit
-        self._setup_timeout_s = setup_timeout_s
-        self._actors: List[ActorHandle] = []
-        self._shutdown = False
-
-    @property
-    def is_shutdown(self) -> bool:
-        return self._shutdown
-
-    @property
-    def nranks(self) -> int:
-        return self._nranks
-
-    @property
-    def actors(self) -> List[ActorHandle]:
-        return self._actors
-
-    def start(self) -> None:
-        timeout = self._setup_timeout_s
-        t_start = time.perf_counter()
-
-        logger.info(
-            "GPUHashAggregateRankPool: creating %d actor(s) (total_nparts=%d).",
-            self._nranks,
-            self._total_nparts,
-        )
-        self._actors = [
-            GPUHashAggregateActor.options(
-                num_gpus=1,
-                scheduling_strategy="SPREAD",
-            ).remote(
-                nranks=self._nranks,
-                total_nparts=self._total_nparts,
-                aggregation_plan=self._aggregation_plan,
-                rmm_pool_size=self._rmm_pool_size,
-                spill_memory_limit=self._spill_memory_limit,
-            )
-            for _ in range(self._nranks)
-        ]
-
-        remaining = max(0, timeout - (time.perf_counter() - t_start))
-        try:
-            _, root_address_bytes = ray.get(
-                self._actors[0].setup_root.remote(), timeout=remaining
-            )
-        except ray.exceptions.GetTimeoutError:
-            raise TimeoutError(
-                "UCXX setup_root on GPU hash aggregate rank 0 did not complete "
-                f"within {timeout}s. Check GPU/network health."
-            )
-
-        remaining = max(0, timeout - (time.perf_counter() - t_start))
-        worker_refs = [
-            actor.setup_worker.remote(root_address_bytes) for actor in self._actors
-        ]
-        _wait_for_refs_with_timeout(worker_refs, remaining, "setup_worker")
-
-    def configure_fused_maps(self, *args, **kwargs) -> None:
-        # GPU hash aggregate does not currently fuse adjacent map stages. This
-        # method keeps it compatible with GPUShuffleOperator.start().
-        return None
-
-    def get_actor_for_block(self, block_idx: int) -> ActorHandle:
-        return self._actors[block_idx % self._nranks]
-
-    def shutdown(self, force: bool = False) -> None:
-        if force:
-            for actor in self._actors:
-                ray.kill(actor)
-        self._actors.clear()
-        self._shutdown = True
-
-
-def _derive_num_gpu_ranks(data_context: DataContext) -> int:
-    if data_context.gpu_shuffle_num_actors is not None:
-        return data_context.gpu_shuffle_num_actors
-
-    total_resources = _get_total_cluster_resources()
-    num_gpus = int(total_resources.gpu or 0)
-    if num_gpus == 0:
-        raise RuntimeError(
-            "ShuffleStrategy.GPU_SHUFFLE requires GPU resources in the cluster. "
-            "Set DataContext.gpu_shuffle_num_actors to override the number of ranks."
-        )
-    return num_gpus
-
-
 class GPUHashAggregateOperator(GPUShuffleOperator):
     """GPU-native hash aggregate using RAPIDS MPF for the shuffle stage."""
 
@@ -1070,14 +1050,10 @@ class GPUHashAggregateOperator(GPUShuffleOperator):
         data_context: DataContext,
         input_op: PhysicalOperator,
         key_columns: Tuple[str, ...],
-        aggregation_fns: Tuple[AggregateFn, ...],
+        aggregation_plan: GPUAggregationPlan,
         *,
         num_partitions: Optional[int] = None,
-        input_schema=None,
-    ):
-        aggregation_plan = build_gpu_aggregation_plan(
-            key_columns, aggregation_fns, input_schema=input_schema
-        )
+    ) -> None:
         if aggregation_plan is None:
             raise ValueError(
                 "GPUHashAggregateOperator received unsupported aggregations."
@@ -1091,6 +1067,19 @@ class GPUHashAggregateOperator(GPUShuffleOperator):
         )
         target_num_partitions = max(target_num_partitions, nranks)
 
+        rank_pool = GPURankPool(
+            nranks=nranks,
+            total_nparts=target_num_partitions,
+            setup_timeout_s=data_context.gpu_shuffle_setup_timeout_s,
+            actor_cls_factory=lambda: GPUHashAggregateActor,
+            actor_kwargs={
+                "aggregation_plan": aggregation_plan,
+                "rmm_pool_size": data_context.gpu_shuffle_rmm_pool_size,
+                "spill_memory_limit": data_context.gpu_shuffle_spill_memory_limit,
+            },
+            log_label="GPUHashAggregatePool",
+        )
+
         super().__init__(
             input_op,
             data_context,
@@ -1098,21 +1087,15 @@ class GPUHashAggregateOperator(GPUShuffleOperator):
             columns=None,
             num_partitions=target_num_partitions,
             should_sort=False,
+            name=(
+                f"GPUHashAggregate(key_columns={key_columns}, "
+                f"num_partitions={target_num_partitions})"
+            ),
+            nranks=nranks,
+            rank_pool=rank_pool,
         )
 
-        self._name = (
-            f"GPUHashAggregate(key_columns={key_columns}, "
-            f"num_partitions={target_num_partitions})"
-        )
         self._aggregation_plan = aggregation_plan
-        self._rank_pool = GPUHashAggregateRankPool(
-            nranks=nranks,
-            total_nparts=target_num_partitions,
-            aggregation_plan=aggregation_plan,
-            rmm_pool_size=data_context.gpu_shuffle_rmm_pool_size,
-            spill_memory_limit=data_context.gpu_shuffle_spill_memory_limit,
-            setup_timeout_s=data_context.gpu_shuffle_setup_timeout_s,
-        )
 
     def get_sub_progress_bar_names(self) -> List[str]:
         return ["GPU Shuffle", "GPU Aggregation"]
@@ -1123,7 +1106,7 @@ class GPUHashAggregateOperator(GPUShuffleOperator):
         elif name == "GPU Aggregation":
             self._reduce_bar = pg
 
-    def get_stats(self):
+    def get_stats(self) -> Dict[str, List[BlockStats]]:
         shuffle_name = f"{self._name}_shuffle"
         aggregate_name = f"{self._name}_aggregate"
         return {
