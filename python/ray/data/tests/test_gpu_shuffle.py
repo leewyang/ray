@@ -4,7 +4,8 @@ These tests do NOT require GPUs or the rapidsmpf/cudf/ucxx packages.
 All Ray actor calls are mocked so the tests run on a standard CPU cluster.
 """
 
-from typing import List
+import types
+from typing import Any, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -410,8 +411,8 @@ class TestFuseGPUShuffleMaps:
 
         assert isinstance(plan.dag, GPUShuffleOperator)
         assert plan.dag.input_dependencies[0].name == "Input"
-        assert plan.dag._upstream_map_transformer is not None
-        assert plan.dag._downstream_map_transformer is not None
+        assert plan.dag._upstream_map_stage.is_enabled
+        assert plan.dag._downstream_map_stage.is_enabled
         assert "emit" in plan.dag.name
         assert "reduce" in plan.dag.name
 
@@ -429,8 +430,8 @@ class TestFuseGPUShuffleMaps:
         assert isinstance(plan.dag, MapOperator)
         shuffle = plan.dag.input_dependencies[0]
         assert isinstance(shuffle, GPUShuffleOperator)
-        assert shuffle._upstream_map_transformer is not None
-        assert shuffle._downstream_map_transformer is None
+        assert shuffle._upstream_map_stage.is_enabled
+        assert not shuffle._downstream_map_stage.is_enabled
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +695,9 @@ class TestPlanAllToAllOpRouting:
             "ray.data._internal.execution.operators.hash_shuffle"
             "._get_total_cluster_resources",
             return_value=ExecutionResources(cpu=4, gpu=0),
+        ), patch(
+            "ray.data._internal.execution.operators.hash_shuffle.ray.put",
+            return_value=MagicMock(),
         ):
             logical_op = self._make_repartition_op(keys=["user_id"], num_outputs=8)
             input_physical_op = _make_input_op_mock()
@@ -786,12 +790,51 @@ class TestGPUHashAggregatePlanning:
 
         logical_op = self._make_aggregate_op([Count(), Sum("value")])
         input_physical_op = _make_input_op_mock()
+        original_build_plan = hash_aggregate.build_gpu_aggregation_plan
+        built_plans: List[Optional[hash_aggregate.GPUAggregationPlan]] = []
 
-        op = plan_all_to_all_op(logical_op, [input_physical_op], ctx)
+        def _build_plan_once(
+            *args: Any, **kwargs: Any
+        ) -> Optional[hash_aggregate.GPUAggregationPlan]:
+            plan = original_build_plan(*args, **kwargs)
+            built_plans.append(plan)
+            return plan
+
+        with patch(
+            "ray.data._internal.gpu_shuffle.hash_aggregate.build_gpu_aggregation_plan",
+            side_effect=_build_plan_once,
+        ) as mock_build_plan:
+            op = plan_all_to_all_op(logical_op, [input_physical_op], ctx)
 
         assert isinstance(op, GPUHashAggregateOperator)
         assert op._num_partitions == 8
         assert "GPUHashAggregate" in op.name
+        mock_build_plan.assert_called_once()
+        assert op._aggregation_plan is built_plans[0]
+
+    def test_gpu_hash_aggregate_operator_uses_prebuilt_plan(self):
+        ctx = DataContext()
+        ctx.gpu_shuffle_num_actors = 4
+        ctx._shuffle_strategy = ShuffleStrategy.GPU_SHUFFLE
+        input_physical_op = _make_input_op_mock()
+        aggregation_plan = build_gpu_aggregation_plan(
+            ("user_id",), (Count(), Sum("value"))
+        )
+
+        with patch(
+            "ray.data._internal.gpu_shuffle.hash_shuffle.GPURankPool"
+        ) as mock_default_pool:
+            op = GPUHashAggregateOperator(
+                ctx,
+                input_physical_op,
+                key_columns=("user_id",),
+                aggregation_plan=aggregation_plan,
+                num_partitions=8,
+            )
+
+        mock_default_pool.assert_not_called()
+        assert op._aggregation_plan is aggregation_plan
+        assert op._rank_pool.nranks == 4
 
     def test_gpu_shuffle_unsupported_aggregate_falls_back_to_cpu_hash_aggregate(self):
         from ray.data._internal.execution.operators.hash_aggregate import (
@@ -809,6 +852,9 @@ class TestGPUHashAggregatePlanning:
             "ray.data._internal.execution.operators.hash_shuffle"
             "._get_total_cluster_resources",
             return_value=ExecutionResources(cpu=4, memory=1024 * 1024 * 1024),
+        ), patch(
+            "ray.data._internal.execution.operators.hash_shuffle.ray.put",
+            return_value=MagicMock(),
         ):
             op = plan_all_to_all_op(logical_op, [input_physical_op], ctx)
 
@@ -820,6 +866,56 @@ class TestGPUHashAggregatePlanning:
         assert plan is not None
         assert len(plan.shuffle_key_columns) == 1
         assert plan.shuffle_key_columns[0].startswith("__ray_gpu_hash_aggregate")
+
+    def test_custom_aggregation_spec_receives_input_schema(self):
+        class _CustomSpec(hash_aggregate.GPUAggregationSpec):
+            output_name: str = "custom(value)"
+            required_columns: Tuple[str, ...] = ("value",)
+            accumulator_columns: Tuple[str, ...] = ("acc",)
+
+            def __init__(self) -> None:
+                self.seen_schema: Optional[pa.Schema] = None
+
+            def partial_aggregate(
+                self,
+                df: pd.DataFrame,
+                key_columns: Tuple[str, ...],
+                input_schema: Any = None,
+            ) -> pd.DataFrame:
+                self.seen_schema = input_schema
+                return pd.DataFrame(
+                    {
+                        key_columns[0]: df[key_columns[0]],
+                        "acc": df["value"],
+                    }
+                )
+
+            def final_aggregate(
+                self, df: pd.DataFrame, key_columns: Tuple[str, ...]
+            ) -> pd.DataFrame:
+                return pd.DataFrame(
+                    {
+                        key_columns[0]: df[key_columns[0]],
+                        self.output_name: df["acc"],
+                    }
+                )
+
+        fake_cudf = types.ModuleType("cudf")
+        fake_cudf.DataFrame = pd.DataFrame
+        schema = pa.schema([("user_id", pa.int64()), ("value", pa.int64())])
+        spec = _CustomSpec()
+        plan = hash_aggregate.GPUAggregationPlan(
+            ("user_id",), (spec,), input_schema=schema
+        )
+
+        with patch.dict("sys.modules", {"cudf": fake_cudf}):
+            partial = plan.partial_aggregate(
+                pd.DataFrame({"user_id": [1], "value": [2]}),
+                input_schema=schema,
+            )
+
+        assert spec.seen_schema is schema
+        assert partial.to_dict("list") == {"user_id": [1], "acc": [2]}
 
     def test_null_reductions_preserve_groups_and_accumulator_dtypes(self, monkeypatch):
         original_group_aggregate = hash_aggregate._group_aggregate

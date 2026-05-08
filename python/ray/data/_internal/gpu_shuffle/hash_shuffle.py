@@ -3,8 +3,10 @@ import logging
 import pickle
 import time
 import typing
+from dataclasses import dataclass
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterator,
     List,
@@ -13,6 +15,7 @@ from typing import (
     Union,
 )
 
+import pyarrow as pa
 import ray
 import ray.exceptions
 from ray.actor import ActorHandle
@@ -40,6 +43,7 @@ from ray.data.context import DataContext
 
 if typing.TYPE_CHECKING:
 
+    from ray.data._internal.execution.interfaces.physical_operator import ActorPoolInfo
     from ray.data._internal.execution.operators.map_transformer import MapTransformer
     from ray.data._internal.progress.base_progress import BaseProgressBar
 
@@ -49,25 +53,38 @@ logger = logging.getLogger(__name__)
 _GPU_PARTITION_ID_KEY = b"_gpu_partition_id"
 
 
-def _apply_map_transformer(
-    map_transformer: Optional["MapTransformer"],
-    data_context: Optional[DataContext],
-    op_name: str,
-    blocks: Iterator[Block],
-    task_kwargs: Optional[Dict[str, Any]] = None,
-) -> Iterator[Block]:
-    """Apply a fused Ray Data map transformer inside a GPU rank actor."""
-    if map_transformer is None:
-        yield from blocks
-        return
+@dataclass
+class _FusedMapStage:
+    """A fused Ray Data map transformer stage inside a GPU rank actor."""
+    transformer: Optional["MapTransformer"] = None
+    task_kwargs: Optional[Dict[str, Any]] = None
+    op_name: str = ""
 
-    assert data_context is not None
-    ctx = TaskContext(task_idx=0, op_name=op_name)
-    if task_kwargs:
-        ctx.kwargs.update(task_kwargs)
+    @property
+    def is_enabled(self) -> bool:
+        return self.transformer is not None
 
-    with DataContext.current(data_context), TaskContext.current(ctx):
-        yield from map_transformer.apply_transform(blocks, ctx)
+    def init(self) -> None:
+        if self.transformer is not None:
+            self.transformer.init()
+
+    def apply(
+        self,
+        data_context: Optional[DataContext],
+        blocks: Iterator[Block],
+    ) -> Iterator[Block]:
+        """Apply the map transformer to the blocks on the GPU rank actor."""
+        if self.transformer is None:
+            yield from blocks
+            return
+
+        assert data_context is not None
+        ctx = TaskContext(task_idx=0, op_name=self.op_name)
+        if self.task_kwargs:
+            ctx.kwargs.update(self.task_kwargs)
+
+        with DataContext.current(data_context), TaskContext.current(ctx):
+            yield from self.transformer.apply_transform(blocks, ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +116,7 @@ class GPUShuffleActor:
         rmm_pool_size: Union[int, str, None] = None,
         spill_memory_limit: Union[int, str, None] = "auto",
         should_sort: bool = False,
-    ):
+    ) -> None:
         from ray.data._internal.gpu_shuffle.rapidsmpf_backend import (
             BulkRapidsMPFShuffler,
         )
@@ -115,10 +132,12 @@ class GPUShuffleActor:
         self._key_columns = key_columns
         self._should_sort = should_sort
         self._arrow_schema = None
-        self._upstream_map_transformer = None
-        self._upstream_map_task_kwargs = None
-        self._downstream_map_transformer = None
-        self._downstream_map_task_kwargs = None
+        self._upstream_map_stage = _FusedMapStage(
+            op_name="GPUShuffle(fused upstream map)"
+        )
+        self._downstream_map_stage = _FusedMapStage(
+            op_name="GPUShuffle(fused downstream map)"
+        )
         self._data_context = None
 
     def configure_fused_maps(
@@ -130,16 +149,20 @@ class GPUShuffleActor:
         data_context: Optional[DataContext],
     ) -> None:
         """Install map transformers that should execute on this shuffle rank."""
-        self._upstream_map_transformer = upstream_map_transformer
-        self._upstream_map_task_kwargs = upstream_map_task_kwargs
-        self._downstream_map_transformer = downstream_map_transformer
-        self._downstream_map_task_kwargs = downstream_map_task_kwargs
+        self._upstream_map_stage = _FusedMapStage(
+            upstream_map_transformer,
+            upstream_map_task_kwargs,
+            "GPUShuffle(fused upstream map)",
+        )
+        self._downstream_map_stage = _FusedMapStage(
+            downstream_map_transformer,
+            downstream_map_task_kwargs,
+            "GPUShuffle(fused downstream map)",
+        )
         self._data_context = data_context
 
-        if self._upstream_map_transformer is not None:
-            self._upstream_map_transformer.init()
-        if self._downstream_map_transformer is not None:
-            self._downstream_map_transformer.init()
+        self._upstream_map_stage.init()
+        self._downstream_map_stage.init()
 
     # ------------------------------------------------------------------
     # UCXX communicator setup
@@ -187,12 +210,11 @@ class GPUShuffleActor:
         import cudf
 
         rows_inserted = 0
-        mapped_blocks = _apply_map_transformer(
-            self._upstream_map_transformer,
+
+        # apply any upstream fused map stages to the block.
+        mapped_blocks = self._upstream_map_stage.apply(
             self._data_context,
-            "GPUShuffle(fused upstream map)",
             iter([block]),
-            self._upstream_map_task_kwargs,
         )
         for mapped_block in mapped_blocks:
             table = BlockAccessor.for_block(mapped_block).to_arrow()
@@ -223,7 +245,6 @@ class GPUShuffleActor:
         """
         self._shuffler.insert_finished()
 
-        import pyarrow as pa
         from rapidsmpf.utils.cudf import pylibcudf_to_cudf_dataframe
 
         from ray.data.block import BlockExecStats, BlockMetadataWithSchema
@@ -246,29 +267,15 @@ class GPUShuffleActor:
                     cdf = cdf.sort_values(by=self._key_columns)
                 block = cdf.to_arrow(preserve_index=False)
 
-            if self._downstream_map_transformer is not None:
-                transformed_blocks = list(
-                    _apply_map_transformer(
-                        self._downstream_map_transformer,
+            # apply any downstream fused map stages to the shuffled block
+            if self._downstream_map_stage.is_enabled:
+                block = self._coalesce_transformed_blocks(
+                    block,
+                    self._downstream_map_stage.apply(
                         self._data_context,
-                        "GPUShuffle(fused downstream map)",
                         iter([block]),
-                        self._downstream_map_task_kwargs,
-                    )
+                    ),
                 )
-                if not transformed_blocks:
-                    block = block.slice(0, 0)
-                elif len(transformed_blocks) == 1:
-                    block = BlockAccessor.for_block(transformed_blocks[0]).to_arrow()
-                else:
-                    import pyarrow as pa
-
-                    block = pa.concat_tables(
-                        [
-                            BlockAccessor.for_block(transformed_block).to_arrow()
-                            for transformed_block in transformed_blocks
-                        ]
-                    )
 
             existing_metadata = block.schema.metadata or {}
             tagged_schema = block.schema.with_metadata(
@@ -288,73 +295,50 @@ class GPUShuffleActor:
             )
             yield pickle.dumps(bm)
 
+    def _coalesce_transformed_blocks(
+        self,
+        block: Block,
+        transformed_blocks: Iterator[Block],
+    ) -> Block:
+        """Coalesce a list of transformed blocks into a single block."""
+        transformed_blocks = list(transformed_blocks)
+        if not transformed_blocks:
+            return block.slice(0, 0)
+        if len(transformed_blocks) == 1:
+            return BlockAccessor.for_block(transformed_blocks[0]).to_arrow()
 
-def _wait_for_refs_with_timeout(
-    refs: List[ray.ObjectRef],
-    timeout_s: float,
-    task_name: str,
-) -> None:
-    """Poll ``refs`` in a loop, raising on timeout or task failure.
-
-    Logs incremental progress as tasks complete and raises any exceptions
-    from completed tasks eagerly (via ``ray.get``).
-    """
-    total = len(refs)
-    pending = list(refs)
-    t_start = time.perf_counter()
-
-    while pending:
-        elapsed = time.perf_counter() - t_start
-        if elapsed >= timeout_s:
-            pending_indices = [i for i, ref in enumerate(refs) if ref in pending]
-            raise TimeoutError(
-                f"{task_name} did not complete on {len(pending)}/{total} "
-                f"rank(s) within {timeout_s}s "
-                f"(pending ranks: {pending_indices}). "
-                f"Check GPU/network health."
-            )
-        ready, pending = ray.wait(pending, num_returns=len(pending), timeout=1)
-        if ready:
-            ray.get(ready)
-            logger.info(
-                "GPURankPool: %d/%d rank(s) completed %s.",
-                total - len(pending),
-                total,
-                task_name,
-            )
+        return pa.concat_tables(
+            [
+                BlockAccessor.for_block(transformed_block).to_arrow()
+                for transformed_block in transformed_blocks
+            ]
+        )
 
 
 # ---------------------------------------------------------------------------
-# GPURankPool — lifecycle manager for a set of GPUShuffleActors
+# GPU rank pools
 # ---------------------------------------------------------------------------
 
 
 class GPURankPool:
-    """Manages the lifecycle of ``GPUShuffleActor`` instances.
-
-    Analogous to ``AggregatorPool`` in the CPU hash-shuffle path, but for GPU
-    ranks coordinated through UCXX.
-    """
-
     def __init__(
         self,
+        *,
         nranks: int,
         total_nparts: int,
-        key_columns: List[str],
-        columns: Optional[List[str]],
-        rmm_pool_size: Union[int, str, None],
-        spill_memory_limit: Union[int, str, None],
         setup_timeout_s: float,
-        should_sort: bool = False,
-    ):
+        actor_cls_factory: Callable[[], Any],
+        actor_kwargs: Dict[str, Any],
+        log_label: str,
+        supports_fused_maps: bool = False,
+    ) -> None:
         self._nranks = nranks
         self._total_nparts = total_nparts
-        self._key_columns = key_columns
-        self._columns = columns
-        self._rmm_pool_size = rmm_pool_size
-        self._spill_memory_limit = spill_memory_limit
         self._setup_timeout_s = setup_timeout_s
-        self._should_sort = should_sort
+        self._actor_cls_factory = actor_cls_factory
+        self._actor_kwargs = actor_kwargs
+        self._log_label = log_label
+        self._supports_fused_maps = supports_fused_maps
         self._actors: List[ActorHandle] = []
         self._shutdown: bool = False
 
@@ -371,61 +355,48 @@ class GPURankPool:
         return self._actors
 
     def start(self) -> None:
-        """Create actors and coordinate UCXX setup.
-
-        This call *blocks* until all actors have finished UCXX initialisation.
-        It is invoked once from ``GPUShuffleOperator.start()`` before any data
-        flows through the pipeline.
-
-        Raises:
-            TimeoutError: If UCXX setup does not complete within
-                ``gpu_shuffle_setup_timeout_s`` seconds.
-        """
         timeout = self._setup_timeout_s
         t_start = time.perf_counter()
 
         logger.info(
-            "GPURankPool: creating %d GPUShuffleActor(s) "
-            "(total_nparts=%d, key_columns=%s).",
+            "%s: creating %d actor(s) (total_nparts=%d).",
+            self._log_label,
             self._nranks,
             self._total_nparts,
-            self._key_columns,
         )
+        actor_cls = self._actor_cls_factory()
         self._actors = [
-            GPUShuffleActor.options(num_gpus=1, scheduling_strategy="SPREAD",).remote(
+            actor_cls.options(num_gpus=1, scheduling_strategy="SPREAD",).remote(
                 nranks=self._nranks,
                 total_nparts=self._total_nparts,
-                key_columns=self._key_columns,
-                columns=self._columns,
-                rmm_pool_size=self._rmm_pool_size,
-                spill_memory_limit=self._spill_memory_limit,
-                should_sort=self._should_sort,
+                **self._actor_kwargs,
             )
             for _ in range(self._nranks)
         ]
         t_actors = time.perf_counter()
         logger.info(
-            "GPURankPool: %d actor(s) created in %.2fs.",
+            "%s: %d actor(s) created in %.2fs.",
+            self._log_label,
             self._nranks,
             t_actors - t_start,
         )
 
-        # Rank 0 establishes the root communicator; all ranks connect to it.
         remaining = max(0, timeout - (time.perf_counter() - t_start))
-        logger.info("GPURankPool: calling setup_root on rank 0.")
+        logger.info("%s: calling setup_root on rank 0.", self._log_label)
         try:
             _, root_address_bytes = ray.get(
                 self._actors[0].setup_root.remote(), timeout=remaining
             )
         except ray.exceptions.GetTimeoutError:
             raise TimeoutError(
-                f"UCXX setup_root on rank 0 did not complete within "
-                f"{timeout}s. Check GPU/network health."
+                f"UCXX setup_root on {self._log_label} rank 0 did not complete "
+                f"within {timeout}s. Check GPU/network health."
             )
         t_root = time.perf_counter()
         logger.info(
-            "GPURankPool: setup_root completed in %.2fs, "
+            "%s: setup_root completed in %.2fs, "
             "broadcasting root address (%d bytes) to %d worker(s).",
+            self._log_label,
             t_root - t_actors,
             len(root_address_bytes),
             self._nranks,
@@ -435,11 +406,12 @@ class GPURankPool:
         worker_refs = [
             actor.setup_worker.remote(root_address_bytes) for actor in self._actors
         ]
-        _wait_for_refs_with_timeout(worker_refs, remaining, "setup_worker")
+        self._wait_for_refs_with_timeout(worker_refs, remaining, "setup_worker")
         t_done = time.perf_counter()
         logger.info(
-            "GPURankPool: all %d worker(s) setup completed in %.2fs "
+            "%s: all %d worker(s) setup completed in %.2fs "
             "(total UCXX init: %.2fs).",
+            self._log_label,
             self._nranks,
             t_done - t_root,
             t_done - t_start,
@@ -453,6 +425,8 @@ class GPURankPool:
         downstream_map_task_kwargs: Optional[Dict[str, Any]],
         data_context: Optional[DataContext],
     ) -> None:
+        if not self._supports_fused_maps:
+            return
         if upstream_map_transformer is None and downstream_map_transformer is None:
             return
 
@@ -466,7 +440,7 @@ class GPURankPool:
             )
             for actor in self._actors
         ]
-        _wait_for_refs_with_timeout(
+        self._wait_for_refs_with_timeout(
             refs,
             self._setup_timeout_s,
             "configure_fused_maps",
@@ -482,6 +456,41 @@ class GPURankPool:
                 ray.kill(actor)
         self._actors.clear()
         self._shutdown = True
+
+    def _wait_for_refs_with_timeout(
+        self,
+        refs: List[ray.ObjectRef],
+        timeout_s: float,
+        task_name: str,
+    ) -> None:
+        """Poll ``refs`` in a loop, raising on timeout or task failure.
+
+        Logs incremental progress as tasks complete and raises any exceptions
+        from completed tasks eagerly (via ``ray.get``).
+        """
+        total = len(refs)
+        pending = list(refs)
+        t_start = time.perf_counter()
+
+        while pending:
+            elapsed = time.perf_counter() - t_start
+            if elapsed >= timeout_s:
+                pending_indices = [i for i, ref in enumerate(refs) if ref in pending]
+                raise TimeoutError(
+                    f"{task_name} did not complete on {len(pending)}/{total} "
+                    f"rank(s) within {timeout_s}s "
+                    f"(pending ranks: {pending_indices}). "
+                    f"Check GPU/network health."
+                )
+            ready, pending = ray.wait(pending, num_returns=len(pending), timeout=1)
+            if ready:
+                ray.get(ready)
+                logger.info(
+                    "GPURankPool: %d/%d rank(s) completed %s.",
+                    total - len(pending),
+                    total,
+                    task_name,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -546,8 +555,10 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         downstream_map_transformer: Optional["MapTransformer"] = None,
         downstream_map_task_kwargs: Optional[Dict[str, Any]] = None,
         name: Optional[str] = None,
-    ):
-        nranks = _derive_num_gpu_ranks(data_context)
+        nranks: Optional[int] = None,
+        rank_pool: Optional[GPURankPool] = None,
+    ) -> None:
+        nranks = nranks or _derive_num_gpu_ranks(data_context)
         target_num_partitions = (
             num_partitions or data_context.default_hash_shuffle_parallelism
         )
@@ -571,19 +582,30 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         self._num_partitions = target_num_partitions
         self._columns = columns
         self._should_sort = should_sort
-        self._upstream_map_transformer = upstream_map_transformer
-        self._upstream_map_task_kwargs = upstream_map_task_kwargs
-        self._downstream_map_transformer = downstream_map_transformer
-        self._downstream_map_task_kwargs = downstream_map_task_kwargs
-        self._rank_pool = GPURankPool(
+        self._upstream_map_stage = _FusedMapStage(
+            upstream_map_transformer,
+            upstream_map_task_kwargs,
+            "GPUShuffle(fused upstream map)",
+        )
+        self._downstream_map_stage = _FusedMapStage(
+            downstream_map_transformer,
+            downstream_map_task_kwargs,
+            "GPUShuffle(fused downstream map)",
+        )
+        self._rank_pool = rank_pool or GPURankPool(
             nranks=nranks,
             total_nparts=target_num_partitions,
-            key_columns=list(key_columns),
-            columns=columns,
-            rmm_pool_size=data_context.gpu_shuffle_rmm_pool_size,
-            spill_memory_limit=data_context.gpu_shuffle_spill_memory_limit,
             setup_timeout_s=data_context.gpu_shuffle_setup_timeout_s,
-            should_sort=should_sort,
+            actor_cls_factory=lambda: GPUShuffleActor,
+            actor_kwargs={
+                "key_columns": list(key_columns),
+                "columns": columns,
+                "rmm_pool_size": data_context.gpu_shuffle_rmm_pool_size,
+                "spill_memory_limit": data_context.gpu_shuffle_spill_memory_limit,
+                "should_sort": should_sort,
+            },
+            log_label="GPUShufflePool",
+            supports_fused_maps=True,
         )
 
         self._next_block_idx: int = 0
@@ -610,10 +632,10 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         super().start(options)
         self._rank_pool.start()
         self._rank_pool.configure_fused_maps(
-            self._upstream_map_transformer,
-            self._upstream_map_task_kwargs,
-            self._downstream_map_transformer,
-            self._downstream_map_task_kwargs,
+            self._upstream_map_stage.transformer,
+            self._upstream_map_stage.task_kwargs,
+            self._downstream_map_stage.transformer,
+            self._downstream_map_stage.task_kwargs,
             self.data_context,
         )
 
@@ -627,20 +649,43 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         downstream_map_transformer: Optional["MapTransformer"] = None,
         downstream_map_task_kwargs: Optional[Dict[str, Any]] = None,
     ) -> "GPUShuffleOperator":
+        """Copy this operator with fused map stages.
+
+        This is used by the ``FuseGPUShuffleMaps`` physical optimizer rule to
+        fuse compatible upstream and downstream map stages with the GPU shuffle.
+        """
+        def _merge_kwargs(
+            first: Optional[Dict[str, Any]],
+            second: Optional[Dict[str, Any]],
+        ) -> Optional[Dict[str, Any]]:
+            if first is None:
+                return second
+            if second is None:
+                return first
+            return {**first, **second}
+
         upstream = upstream_map_transformer
-        if self._upstream_map_transformer is not None:
+        upstream_kwargs = upstream_map_task_kwargs
+        if self._upstream_map_stage.transformer is not None:
             upstream = (
-                self._upstream_map_transformer
+                self._upstream_map_stage.transformer
                 if upstream is None
-                else upstream.fuse(self._upstream_map_transformer)
+                else upstream.fuse(self._upstream_map_stage.transformer)
+            )
+            upstream_kwargs = _merge_kwargs(
+                upstream_kwargs, self._upstream_map_stage.task_kwargs
             )
 
-        downstream = self._downstream_map_transformer
+        downstream = self._downstream_map_stage.transformer
+        downstream_kwargs = self._downstream_map_stage.task_kwargs
         if downstream_map_transformer is not None:
             downstream = (
                 downstream_map_transformer
                 if downstream is None
                 else downstream.fuse(downstream_map_transformer)
+            )
+            downstream_kwargs = _merge_kwargs(
+                downstream_kwargs, downstream_map_task_kwargs
             )
 
         return GPUShuffleOperator(
@@ -651,21 +696,14 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
             num_partitions=self._num_partitions,
             should_sort=self._should_sort,
             upstream_map_transformer=upstream,
-            upstream_map_task_kwargs=(
-                upstream_map_task_kwargs
-                if upstream_map_transformer is not None
-                else self._upstream_map_task_kwargs
-            ),
+            upstream_map_task_kwargs=upstream_kwargs,
             downstream_map_transformer=downstream,
-            downstream_map_task_kwargs=(
-                downstream_map_task_kwargs
-                if downstream_map_transformer is not None
-                else self._downstream_map_task_kwargs
-            ),
+            downstream_map_task_kwargs=downstream_kwargs,
             name=name,
         )
 
     def _add_input_inner(self, bundle: RefBundle, input_index: int) -> None:
+        """Add an input bundle to the shuffle."""
         self._shuffle_metrics.on_input_received(bundle)
         self._shuffled_blocks_stats.extend(to_stats(bundle.metadata))
 
@@ -695,6 +733,7 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
                 self._shuffle_bar.update(total=self._next_block_idx)
 
     def _is_inserting_done(self) -> bool:
+        """Check if all input bundles have been inserted."""
         return self._inputs_complete and len(self._insert_tasks) == 0
 
     def _try_finalize(self) -> None:
@@ -775,8 +814,8 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
 
         def _on_extraction_done(
             exc: Optional[Exception],
-            worker_stats=None,
-            driver_stats=None,
+            worker_stats: Optional[Any] = None,
+            driver_stats: Optional[Any] = None,
             rank: int = -1,
         ) -> None:
             self._extraction_tasks.pop(rank, None)
@@ -804,10 +843,12 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
     # ------------------------------------------------------------------
 
     def has_next(self) -> bool:
+        """Returns true if there are any more output bundles to be extracted."""
         self._try_finalize()
         return self._output_queue.has_next()
 
     def _get_next_inner(self) -> RefBundle:
+        """Get the next output bundle from the shuffle."""
         bundle = self._output_queue.get_next()
         self._reduce_metrics.on_output_dequeued(bundle)
         self._reduce_metrics.on_output_taken(bundle)
@@ -822,6 +863,7 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         return list(self._insert_tasks.values()) + list(self._extraction_tasks.values())
 
     def has_completed(self) -> bool:
+        """Returns true if the shuffle has completed."""
         return (
             self._finalization_started
             and len(self._extraction_tasks) == 0
@@ -833,6 +875,7 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
     # ------------------------------------------------------------------
 
     def _do_shutdown(self, force: bool = False) -> None:
+        """Shutdown the shuffle rank pool."""
         self._rank_pool.shutdown(force=True)
         super()._do_shutdown(force)
         self._insert_tasks.clear()
@@ -856,7 +899,7 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
     def incremental_resource_usage(self) -> ExecutionResources:
         return ExecutionResources(gpu=1)
 
-    def get_actor_info(self):
+    def get_actor_info(self) -> "ActorPoolInfo":
         from ray.data._internal.execution.interfaces.physical_operator import (
             ActorPoolInfo,
         )
@@ -889,7 +932,7 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
     # Stats
     # ------------------------------------------------------------------
 
-    def get_stats(self):
+    def get_stats(self) -> Dict[str, List[BlockStats]]:
         shuffle_name = f"{self._name}_shuffle"
         reduce_name = f"{self._name}_finalize"
         return {
