@@ -14,6 +14,7 @@ import pytest
 
 import ray
 import ray.data._internal.gpu_shuffle.hash_aggregate as hash_aggregate
+import ray.data._internal.gpu_shuffle.hash_shuffle as hash_shuffle
 from ray.data._internal.execution.interfaces import (
     ExecutionResources,
     PhysicalOperator,
@@ -200,11 +201,16 @@ class TestGPURankPool:
         return GPURankPool(
             nranks=nranks,
             total_nparts=total_nparts,
-            key_columns=["user_id"],
-            columns=None,
-            rmm_pool_size="auto",
-            spill_memory_limit="auto",
             setup_timeout_s=60.0,
+            actor_cls_factory=lambda: hash_shuffle.GPUShuffleActor,
+            actor_kwargs={
+                "key_columns": ["user_id"],
+                "columns": None,
+                "rmm_pool_size": "auto",
+                "spill_memory_limit": "auto",
+            },
+            log_label="GPUShufflePool",
+            supports_fused_maps=True,
         )
 
     def test_actors_empty_before_start(self):
@@ -864,8 +870,7 @@ class TestGPUHashAggregatePlanning:
         plan = build_gpu_aggregation_plan(tuple(), (Count(), Sum("value")))
 
         assert plan is not None
-        assert len(plan.shuffle_key_columns) == 1
-        assert plan.shuffle_key_columns[0].startswith("__ray_gpu_hash_aggregate")
+        assert plan.shuffle_key_columns == (hash_aggregate._GLOBAL_AGGREGATE_KEY,)
 
     def test_custom_aggregation_spec_receives_input_schema(self):
         class _CustomSpec(hash_aggregate.GPUAggregationSpec):
@@ -1418,11 +1423,16 @@ class TestGPURankPoolReal:
         return GPURankPool(
             nranks=nranks,
             total_nparts=total_nparts,
-            key_columns=["id"],
-            columns=None,
-            rmm_pool_size="auto",
-            spill_memory_limit="auto",
             setup_timeout_s=60.0,
+            actor_cls_factory=lambda: hash_shuffle.GPUShuffleActor,
+            actor_kwargs={
+                "key_columns": ["id"],
+                "columns": None,
+                "rmm_pool_size": "auto",
+                "spill_memory_limit": "auto",
+            },
+            log_label="GPUShufflePool",
+            supports_fused_maps=True,
         )
 
     def test_pool_start_creates_actors(self, ray_with_gpu):
