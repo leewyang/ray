@@ -15,13 +15,22 @@ import pytest
 import ray
 import ray.data._internal.gpu_shuffle.hash_aggregate as hash_aggregate
 from ray.actor import ActorClass, ActorHandle
-from ray.data._internal.execution.interfaces import ExecutionResources, PhysicalOperator
+from ray.data._internal.execution.interfaces import (
+    ExecutionResources,
+    PhysicalOperator,
+)
+from ray.data._internal.execution.operators.base_physical_operator import (
+    AllToAllOperator,
+)
+from ray.data._internal.execution.operators.map_operator import MapOperator
 from ray.data._internal.gpu_shuffle.hash_aggregate import (
     GPUAggregateFn,
     GPUAggregationPlan,
+    GPUGlobalAggregateOperator,
     GPUHashAggregateActor,
     GPUHashAggregateOperator,
     build_gpu_aggregation_plan,
+    create_gpu_aggregate_operator,
 )
 from ray.data._internal.logical.interfaces import LogicalOperator
 from ray.data._internal.logical.operators import Aggregate
@@ -93,7 +102,7 @@ class TestGPUHashAggregatePlanning:
             input_schema=schema,
         )
         assert isinstance(plan, GPUAggregationPlan), plan
-        assert plan.shuffle_key_columns == ("user_id",)
+        assert plan.key_columns == ("user_id",)
         assert plan.output_names == (
             "count()",
             "count(value)",
@@ -289,6 +298,102 @@ class TestGPUHashAggregatePlanning:
         mock_build_plan.assert_called_once()
         assert op._aggregation_plan is built_plans[0]
 
+    def test_gpu_shuffle_routes_global_aggregate_to_no_shuffle_operator(self):
+        ctx = DataContext()
+        ctx.gpu_shuffle_num_actors = 4
+        ctx._shuffle_strategy = ShuffleStrategy.GPU_SHUFFLE
+
+        logical_op = self._make_aggregate_op(
+            [Count(), Sum("value")],
+            key=None,
+            num_partitions=8,
+        )
+        input_physical_op = _make_input_op_mock()
+
+        with patch(
+            "ray.data._internal.gpu_shuffle.hash_aggregate.GPURankPool"
+        ) as mock_rank_pool:
+            op = plan_all_to_all_op(logical_op, [input_physical_op], ctx)
+
+        assert isinstance(op, GPUGlobalAggregateOperator)
+        assert isinstance(op, AllToAllOperator)
+        assert isinstance(op.input_dependencies[0], MapOperator)
+        assert op.input_dependencies[0].name.endswith("Partial")
+        assert op.num_outputs_total() == 1
+        assert "GPUGlobalAggregate" in op.name
+        mock_rank_pool.assert_not_called()
+
+    def test_gpu_shuffle_routes_global_custom_gpu_aggregate_to_no_shuffle_operator(
+        self,
+    ):
+        class _CustomGPUAggregate(GPUAggregateFn):
+            def __init__(self) -> None:
+                super().__init__(
+                    "custom(value)",
+                    on="value",
+                    ignore_nulls=True,
+                    accumulators=("acc",),
+                )
+
+            def partial_aggregate(
+                self,
+                df: Any,
+                key_columns: Tuple[str, ...],
+                accumulator_columns: Tuple[str, ...],
+                *,
+                input_schema: Any = None,
+            ) -> Any:
+                raise NotImplementedError
+
+            def final_aggregate(
+                self,
+                df: Any,
+                key_columns: Tuple[str, ...],
+                accumulator_columns: Tuple[str, ...],
+                output_name: str,
+            ) -> Any:
+                raise NotImplementedError
+
+        ctx = DataContext()
+        ctx.gpu_shuffle_num_actors = 4
+        ctx._shuffle_strategy = ShuffleStrategy.GPU_SHUFFLE
+
+        logical_op = self._make_aggregate_op(
+            [_CustomGPUAggregate()],
+            key=None,
+            input_schema=None,
+        )
+        input_physical_op = _make_input_op_mock()
+
+        op = plan_all_to_all_op(logical_op, [input_physical_op], ctx)
+
+        assert isinstance(op, GPUGlobalAggregateOperator)
+        assert isinstance(op, AllToAllOperator)
+        assert "GPUGlobalAggregate" in op.name
+
+    def test_gpu_shuffle_global_string_count_uses_no_shuffle_operator(self):
+        ctx = DataContext()
+        ctx.gpu_shuffle_num_actors = 4
+        ctx._shuffle_strategy = ShuffleStrategy.GPU_SHUFFLE
+
+        logical_op = self._make_aggregate_op(
+            [Count("text", ignore_nulls=True)],
+            key=None,
+            input_schema=pa.schema([("text", pa.string())]),
+        )
+        input_physical_op = _make_input_op_mock()
+
+        with patch(
+            "ray.data._internal.planner.plan_all_to_all_op._plan_hash_shuffle_aggregate",
+            return_value=input_physical_op,
+        ) as mock_cpu_plan:
+            op = plan_all_to_all_op(logical_op, [input_physical_op], ctx)
+
+        assert isinstance(op, GPUGlobalAggregateOperator)
+        assert isinstance(op, AllToAllOperator)
+        assert isinstance(op.input_dependencies[0], MapOperator)
+        mock_cpu_plan.assert_not_called()
+
     def test_gpu_hash_aggregate_operator_uses_prebuilt_plan(self):
         ctx = DataContext()
         ctx.gpu_shuffle_num_actors = 4
@@ -315,6 +420,44 @@ class TestGPUHashAggregatePlanning:
         assert op._aggregation_plan is aggregation_plan
         assert op._rank_pool.nranks == 4
 
+    def test_gpu_aggregate_factory_dispatches_by_plan_topology(self):
+        ctx = DataContext()
+        ctx.gpu_shuffle_num_actors = 4
+        ctx._shuffle_strategy = ShuffleStrategy.GPU_SHUFFLE
+        input_physical_op = _make_input_op_mock()
+
+        grouped_plan = build_gpu_aggregation_plan(
+            ("user_id",),
+            (Count(), Sum("value")),
+            input_schema=pa.schema([("user_id", pa.int64()), ("value", pa.int64())]),
+        )
+        assert isinstance(grouped_plan, GPUAggregationPlan), grouped_plan
+
+        grouped_op = create_gpu_aggregate_operator(
+            aggregation_plan=grouped_plan,
+            input_physical_op=input_physical_op,
+            data_context=ctx,
+            num_partitions=8,
+        )
+
+        assert isinstance(grouped_op, GPUHashAggregateOperator)
+
+        global_plan = build_gpu_aggregation_plan(
+            tuple(),
+            (Count(), Sum("value")),
+            input_schema=pa.schema([("value", pa.int64())]),
+        )
+        assert isinstance(global_plan, GPUAggregationPlan), global_plan
+
+        global_op = create_gpu_aggregate_operator(
+            aggregation_plan=global_plan,
+            input_physical_op=input_physical_op,
+            data_context=ctx,
+        )
+
+        assert isinstance(global_op, GPUGlobalAggregateOperator)
+        assert isinstance(global_op.input_dependencies[0], MapOperator)
+
     def test_gpu_shuffle_unsupported_aggregate_falls_back_to_cpu_hash_aggregate(self):
         from ray.data._internal.execution.operators.hash_aggregate import (
             HashAggregateOperator,
@@ -325,6 +468,36 @@ class TestGPUHashAggregatePlanning:
         ctx._shuffle_strategy = ShuffleStrategy.GPU_SHUFFLE
 
         logical_op = self._make_aggregate_op([AsList("value")])
+        input_physical_op = _make_input_op_mock(num_blocks=8, size_bytes=1024)
+
+        with patch(
+            "ray.data._internal.execution.operators.hash_shuffle"
+            "._get_total_cluster_resources",
+            return_value=ExecutionResources(cpu=4, memory=1024 * 1024 * 1024),
+        ), patch(
+            "ray.data._internal.execution.operators.hash_shuffle.ray.put",
+            return_value=MagicMock(),
+        ):
+            op = plan_all_to_all_op(logical_op, [input_physical_op], ctx)
+
+        assert isinstance(op, HashAggregateOperator)
+
+    def test_gpu_shuffle_unsupported_global_aggregate_falls_back_to_cpu_hash_aggregate(
+        self,
+    ):
+        from ray.data._internal.execution.operators.hash_aggregate import (
+            HashAggregateOperator,
+        )
+
+        ctx = DataContext()
+        ctx.gpu_shuffle_num_actors = 4
+        ctx._shuffle_strategy = ShuffleStrategy.GPU_SHUFFLE
+
+        logical_op = self._make_aggregate_op(
+            [AsList("value")],
+            key=None,
+            input_schema=pa.schema([("value", pa.int64())]),
+        )
         input_physical_op = _make_input_op_mock(num_blocks=8, size_bytes=1024)
 
         with patch(
@@ -363,10 +536,11 @@ class TestGPUHashAggregatePlanning:
 
         assert isinstance(op, HashAggregateOperator)
 
-    def test_global_aggregate_uses_synthetic_shuffle_key(self):
+    def test_global_aggregate_has_no_shuffle_key(self):
         plan = build_gpu_aggregation_plan(tuple(), (Count(), Sum("value")))
         assert isinstance(plan, GPUAggregationPlan), plan
-        assert plan.shuffle_key_columns == (hash_aggregate._GLOBAL_AGGREGATE_KEY,)
+        assert plan.key_columns == ()
+        assert plan.required_columns == ("value",)
 
     def test_required_columns_excludes_unused_input_columns(self):
         table = pa.table(
@@ -392,6 +566,17 @@ class TestGPUHashAggregatePlanning:
         )
         assert isinstance(plan, GPUAggregationPlan), plan
         assert plan.required_columns == ()
+
+    def test_global_count_target_columns_are_arrow_counted(self):
+        schema = pa.schema([("text", pa.string()), ("value", pa.int64())])
+        plan = build_gpu_aggregation_plan(
+            tuple(),
+            (Count("text", ignore_nulls=True), Sum("value")),
+            input_schema=schema,
+        )
+        assert isinstance(plan, GPUAggregationPlan), plan
+
+        assert plan.required_columns == ("text", "value")
 
     def test_merge_input_schema_unifies_value_dtype_across_blocks(self):
         block1 = pa.table({"value": pa.array([1], type=pa.int8())})
@@ -454,6 +639,29 @@ class TestGPUHashAggregatePlanning:
                 ("sum(value)", pa.null()),
             ]
         )
+
+    def test_normalize_output_arrow_keeps_non_null_values_with_null_schema(self):
+        null_schema = pa.schema(
+            [
+                ("user_id", pa.int64()),
+                ("value", pa.null()),
+            ]
+        )
+        null_plan = build_gpu_aggregation_plan(
+            ("user_id",), (Sum("value"),), input_schema=null_schema
+        )
+        assert isinstance(null_plan, GPUAggregationPlan), null_plan
+        output_table = pa.table(
+            {
+                "user_id": pa.array([0, 1], type=pa.int64()),
+                "sum(value)": pa.array([10, 20], type=pa.int64()),
+            }
+        )
+
+        normalized = null_plan.normalize_output_arrow(output_table)
+
+        assert normalized.column("sum(value)").to_pylist() == [10, 20]
+        assert normalized.schema.field("sum(value)").type == pa.int64()
 
     def test_normalize_output_arrow_preserves_values_when_runtime_schema_upgrades(
         self,
@@ -785,6 +993,27 @@ class TestGPUAggregationPlanReal:
         partial = plan.partial_aggregate(df)
         assert partial[plan.accumulator_columns[0]].iloc[0] == 3
 
+    def test_global_target_count_uses_arrow_count_real_gpu(self, ray_with_gpu):
+        plan = build_gpu_aggregation_plan(
+            tuple(),
+            (Count("text", ignore_nulls=True),),
+            input_schema=pa.schema([("text", pa.string())]),
+        )
+        assert isinstance(plan, GPUAggregationPlan), plan
+
+        block = pa.table({"text": pa.array(["a", None, "b"], type=pa.string())})
+        partial_block, _, runtime_schema = hash_aggregate._global_aggregate_partial(
+            plan,
+            block,
+        )
+        output_block, _ = hash_aggregate._global_aggregate_final(
+            plan,
+            runtime_schema,
+            partial_block,
+        )
+
+        assert output_block.to_pydict() == {"count(text)": [2]}
+
     def test_partial_aggregate_normalizes_null_key_column(self, ray_with_gpu):
         import cudf
 
@@ -985,12 +1214,16 @@ class TestGPUHashAggregateActorReal:
         assert isinstance(plan, GPUAggregationPlan), plan
 
         table = pa.table({"value": pa.array([1, None, 2, 5], type=pa.int64())})
-        actor = self._make_setup_actor(plan, total_nparts=1)
-        try:
-            assert ray.get(actor.insert_batch.remote(table)) == table.num_rows
-            result = self._collect_frame(actor)
-        finally:
-            ray.kill(actor)
+        partial_block, _, runtime_schema = hash_aggregate._global_aggregate_partial(
+            plan,
+            table,
+        )
+        output_block, _ = hash_aggregate._global_aggregate_final(
+            plan,
+            runtime_schema,
+            partial_block,
+        )
+        result = output_block.to_pandas()
 
         assert result.columns.tolist() == [
             "count()",

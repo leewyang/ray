@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import abc
+import functools
 import logging
 import pickle
 import time
-import types
 import typing
 from collections import defaultdict
 from typing import (
     Any,
     Dict,
+    Iterable,
     Iterator,
     List,
     Optional,
-    Sequence,
     Tuple,
     Union,
     cast,
@@ -22,13 +22,31 @@ from typing import (
 import pyarrow as pa
 
 import ray
-from ray.data._internal.execution.interfaces import PhysicalOperator
+from ray.data._internal.execution.interfaces import (
+    BlockEntry,
+    PhysicalOperator,
+    RefBundle,
+    TaskContext,
+)
+from ray.data._internal.execution.interfaces.transform_fn import (
+    AllToAllTransformFnResult,
+)
+from ray.data._internal.execution.operators.base_physical_operator import (
+    AllToAllOperator,
+)
+from ray.data._internal.execution.operators.map_operator import MapOperator
+from ray.data._internal.execution.operators.map_transformer import (
+    BlockMapTransformFn,
+    MapTransformer,
+)
+from ray.data._internal.execution.util import merge_label_selector
 from ray.data._internal.gpu_shuffle.hash_shuffle import (
     _GPU_PARTITION_ID_KEY,
     GPURankPool,
     GPUShuffleOperator,
     _derive_num_gpu_ranks,
 )
+from ray.data._internal.remote_fn import cached_remote_fn
 from ray.data._internal.table_block import TableBlockAccessor
 from ray.data.aggregate import AggregateFn, AggregateFnV2, Count, Max, Mean, Min, Sum
 from ray.data.block import (
@@ -38,6 +56,7 @@ from ray.data.block import (
     BlockMetadataWithSchema,
     BlockStats,
     Schema,
+    to_stats,
 )
 from ray.data.context import DataContext
 from ray.data.datatype import DataType
@@ -51,7 +70,12 @@ if typing.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_GLOBAL_AGGREGATE_KEY = "__hash_aggregate_global_key"
+_GLOBAL_GROUP_KEY_PREFIX = "__ray_global_group_key"
+_GLOBAL_AGGREGATE_SUB_PROGRESS_BAR_NAMES = (
+    "GPU Partial Aggregate",
+    "GPU Final Aggregate",
+)
+_GLOBAL_AGGREGATE_MIN_ROWS_PER_TASK = 4_000_000
 
 
 def _cast_cudf_column_dtype(
@@ -295,8 +319,22 @@ class GPUCount(GPUAggregateFn):
         accumulator_columns: Tuple[str, ...],
         *,
         input_schema: Optional[Schema] = None,
+        _is_global: bool = False,
     ) -> cudf.DataFrame:
         acc_col = accumulator_columns[0]
+        if _is_global:
+            import cudf
+
+            key_column = key_columns[0]
+            if self.target_column is None or not self.ignore_nulls:
+                count = len(df)
+            else:
+                count = int(df[self.target_column].count())
+
+            result = cudf.DataFrame({key_column: [0], acc_col: [count]})
+            _cast_cudf_column_dtype(result, acc_col, DataType.from_numpy("int64"))
+            return result[[key_column, acc_col]]
+
         grouped = df.groupby(list(key_columns), dropna=False)
         if self.target_column is None or not self.ignore_nulls:
             result = grouped.size().reset_index()
@@ -375,10 +413,28 @@ class GPUSum(GPUAggregateFn):
         accumulator_columns: Tuple[str, ...],
         *,
         input_schema: Optional[Schema] = None,
+        _is_global: bool = False,
     ) -> cudf.DataFrame:
         assert self.target_column is not None
         acc_col = accumulator_columns[0]
         output_dtype = self._reduction_dtype(df, input_schema)
+        if _is_global:
+            import cudf
+
+            key_column = key_columns[0]
+            size = len(df)
+            count = int(df[self.target_column].count())
+            if (self.ignore_nulls and count == 0) or (
+                not self.ignore_nulls and count != size
+            ):
+                value = None
+            else:
+                value = df[self.target_column].sum()
+
+            result = cudf.DataFrame({key_column: [0], acc_col: [value]})
+            _cast_cudf_column_dtype(result, acc_col, output_dtype)
+            return result[[key_column, acc_col]]
+
         size_col = f"{acc_col}_size"
         count_col = f"{acc_col}_count"
         grouped = df.groupby(list(key_columns), dropna=False)
@@ -537,10 +593,28 @@ class GPUMin(GPUAggregateFn):
         accumulator_columns: Tuple[str, ...],
         *,
         input_schema: Optional[Schema] = None,
+        _is_global: bool = False,
     ) -> cudf.DataFrame:
         assert self.target_column is not None
         acc_col = accumulator_columns[0]
         output_dtype = self._reduction_dtype(df, input_schema)
+        if _is_global:
+            import cudf
+
+            key_column = key_columns[0]
+            size = len(df)
+            count = int(df[self.target_column].count())
+            if (self.ignore_nulls and count == 0) or (
+                not self.ignore_nulls and count != size
+            ):
+                value = None
+            else:
+                value = df[self.target_column].min()
+
+            result = cudf.DataFrame({key_column: [0], acc_col: [value]})
+            _cast_cudf_column_dtype(result, acc_col, output_dtype)
+            return result[[key_column, acc_col]]
+
         size_col = f"{acc_col}_size"
         count_col = f"{acc_col}_count"
         grouped = df.groupby(list(key_columns), dropna=False)
@@ -701,10 +775,28 @@ class GPUMax(GPUAggregateFn):
         accumulator_columns: Tuple[str, ...],
         *,
         input_schema: Optional[Schema] = None,
+        _is_global: bool = False,
     ) -> cudf.DataFrame:
         assert self.target_column is not None
         acc_col = accumulator_columns[0]
         output_dtype = self._reduction_dtype(df, input_schema)
+        if _is_global:
+            import cudf
+
+            key_column = key_columns[0]
+            size = len(df)
+            count = int(df[self.target_column].count())
+            if (self.ignore_nulls and count == 0) or (
+                not self.ignore_nulls and count != size
+            ):
+                value = None
+            else:
+                value = df[self.target_column].max()
+
+            result = cudf.DataFrame({key_column: [0], acc_col: [value]})
+            _cast_cudf_column_dtype(result, acc_col, output_dtype)
+            return result[[key_column, acc_col]]
+
         size_col = f"{acc_col}_size"
         count_col = f"{acc_col}_count"
         grouped = df.groupby(list(key_columns), dropna=False)
@@ -865,12 +957,42 @@ class GPUMean(GPUAggregateFn):
         accumulator_columns: Tuple[str, ...],
         *,
         input_schema: Optional[Schema] = None,
+        _is_global: bool = False,
     ) -> cudf.DataFrame:
         assert self.target_column is not None
 
         sum_col, count_col, null_count_col = accumulator_columns
-        size_col = f"{sum_col}_size"
         output_dtype = self._reduction_dtype(df, input_schema)
+        if _is_global:
+            import cudf
+
+            key_column = key_columns[0]
+            size = len(df)
+            count = int(df[self.target_column].count())
+            null_count = size - count
+            if (self.ignore_nulls and count == 0) or (
+                not self.ignore_nulls and null_count > 0
+            ):
+                value = None
+            else:
+                value = df[self.target_column].sum()
+
+            result = cudf.DataFrame(
+                {
+                    key_column: [0],
+                    sum_col: [value],
+                    count_col: [count],
+                    null_count_col: [null_count],
+                }
+            )
+            _cast_cudf_column_dtype(result, sum_col, output_dtype)
+            _cast_cudf_column_dtype(result, count_col, DataType.from_numpy("int64"))
+            _cast_cudf_column_dtype(
+                result, null_count_col, DataType.from_numpy("int64")
+            )
+            return result[[key_column] + list(accumulator_columns)]
+
+        size_col = f"{sum_col}_size"
         grouped = df.groupby(list(key_columns), dropna=False)
 
         sizes = grouped.size().reset_index()
@@ -1005,20 +1127,6 @@ class GPUMean(GPUAggregateFn):
         return {output_name: pa.null()}
 
 
-def _empty_dataframe(
-    cudf_module: types.ModuleType,
-    columns: Sequence[str],
-    dtypes: Optional[Dict[str, Optional[DataType]]] = None,
-) -> cudf.DataFrame:
-    """Create an empty ``cudf.DataFrame`` with specified columns and dtypes."""
-    dtypes = dtypes or {}
-    df = cudf_module.DataFrame()
-    for column in columns:
-        df[column] = []
-        _cast_cudf_column_dtype(df, column, dtypes.get(column))
-    return df
-
-
 class GPUAggregationPlan:
     """Executable GPU aggregation plan shared by the driver and GPU actors.
 
@@ -1042,8 +1150,7 @@ class GPUAggregationPlan:
         self._key_columns = key_columns
         self._gpu_aggregates = gpu_aggregates
         self._input_schema = input_schema
-        self._is_global = not key_columns
-        self._shuffle_key_columns = key_columns
+        self._global_key_column: Optional[str] = None
 
         # Resolve duplicate aggregation names the same way TableBlockAccessor does.
         counts: Dict[str, int] = defaultdict(int)
@@ -1061,21 +1168,20 @@ class GPUAggregationPlan:
             f"{accumulator_prefix}_{index}" for index, _ in enumerate(gpu_aggregates)
         )
 
-        # If global aggregation (w/o key columns), use an artificial shuffle key.
-        if self._is_global:
-            # filter out empty target columns
-            required_columns = {
+        # Global reductions still use a one-column cuDF groupby internally, but this
+        # key is not a shuffle key and is never exposed in the final output.
+        if self.is_global:
+            reserved_columns = {
                 agg.target_column
                 for agg in gpu_aggregates
                 if agg.target_column is not None
             }
-            # ensure a unique global key by prepending an underscore if needed
-            # (just in case there is a collision)
-            global_key = _GLOBAL_AGGREGATE_KEY
-            while global_key in required_columns:
+            reserved_columns.update(self._output_names)
+            reserved_columns.update(self.accumulator_columns)
+            global_key = _GLOBAL_GROUP_KEY_PREFIX
+            while global_key in reserved_columns:
                 global_key = f"_{global_key}"
-            # set the shuffle key to the global key
-            self._shuffle_key_columns = (global_key,)
+            self._global_key_column = global_key
 
     @property
     def accumulator_columns(self) -> Tuple[str, ...]:
@@ -1086,6 +1192,16 @@ class GPUAggregationPlan:
         ):
             columns.extend(agg._accumulator_columns(accumulator_prefix))
         return tuple(columns)
+
+    @property
+    def is_global(self) -> bool:
+        """Return whether this plan is for a global aggregate."""
+        return not self._key_columns
+
+    @property
+    def key_columns(self) -> Tuple[str, ...]:
+        """Return the shuffle key columns for the GPU aggregation plan."""
+        return self._key_columns
 
     @property
     def output_names(self) -> Tuple[str, ...]:
@@ -1110,40 +1226,45 @@ class GPUAggregationPlan:
                 columns.append(target_column)
         return tuple(columns)
 
-    @property
-    def shuffle_key_columns(self) -> Tuple[str, ...]:
-        """Return the shuffle key columns for the GPU aggregation plan."""
-        return self._shuffle_key_columns
-
     def normalize_output_arrow(
         self,
         table: pa.Table,
         input_schema: Optional[Schema] = None,
     ) -> pa.Table:
+        """Normalize the output Arrow table according to the final Arrow types.
+
+        This ensures that columns with all nulls are assigned the expected Arrow type.
+        """
         arrow_types = self._final_arrow_types(input_schema)
         if not arrow_types:
             return table
 
         columns = []
         for column_name in table.column_names:
-            if column_name in arrow_types:
+            if (
+                column_name in arrow_types
+                and table[column_name].null_count == table.num_rows
+            ):
                 columns.append(pa.nulls(table.num_rows, type=arrow_types[column_name]))
             else:
                 columns.append(table[column_name])
         return pa.table(columns, names=table.column_names)
 
     def partial_aggregate(
-        self, df: cudf.DataFrame, input_schema: Optional[Schema] = None
+        self,
+        df: cudf.DataFrame,
+        input_schema: Optional[Schema] = None,
     ) -> cudf.DataFrame:
-        import cudf as cudf_module
+        import cudf
 
-        if self._is_global:
-            df = df.copy(deep=False)
-            df[self._shuffle_key_columns[0]] = 0
-
-        key_columns = self._shuffle_key_columns
+        if self.is_global:
+            assert self._global_key_column is not None
+            key_columns = (self._global_key_column,)
+        else:
+            key_columns = self._key_columns
         if len(df) == 0:
-            if self._is_global:
+            # construct empty output dataframe with the correct schema
+            if self.is_global:
                 values: Dict[str, List[Any]] = {key_columns[0]: [0]}
                 for agg, accumulator_prefix in zip(
                     self._gpu_aggregates,
@@ -1152,7 +1273,7 @@ class GPUAggregationPlan:
                     empty_values = agg._empty_global_partial_values(accumulator_prefix)
                     for column, value in empty_values.items():
                         values[column] = [value]
-                result = cudf_module.DataFrame(values)[
+                result = cudf.DataFrame(values)[
                     list(key_columns) + list(self.accumulator_columns)
                 ]
                 for column, dtype in self._partial_accumulator_dtypes(
@@ -1160,25 +1281,47 @@ class GPUAggregationPlan:
                 ).items():
                     _cast_cudf_column_dtype(result, column, dtype)
                 return result
-            return _empty_dataframe(
-                cudf_module,
-                list(key_columns) + list(self.accumulator_columns),
-                dtypes=self._partial_accumulator_dtypes(
-                    df, key_columns, input_schema=input_schema
-                ),
+
+            columns = list(key_columns) + list(self.accumulator_columns)
+            dtypes = self._partial_accumulator_dtypes(
+                df, key_columns, input_schema=input_schema
             )
+            result = cudf.DataFrame()
+            for column in columns:
+                result[column] = []
+                _cast_cudf_column_dtype(result, column, dtypes.get(column))
+            return result
 
         result = None
         for agg, accumulator_prefix in zip(
             self._gpu_aggregates, self._accumulator_prefixes
         ):
             accumulator_columns = agg._accumulator_columns(accumulator_prefix)
-            partial = agg.partial_aggregate(
-                df,
-                key_columns,
-                accumulator_columns,
-                input_schema=input_schema,
-            )
+            if self.is_global:
+                if isinstance(agg, (GPUCount, GPUSum, GPUMin, GPUMax, GPUMean)):
+                    partial = agg.partial_aggregate(
+                        df,
+                        key_columns,
+                        accumulator_columns,
+                        input_schema=input_schema,
+                        _is_global=True,
+                    )
+                else:
+                    global_df = df.copy(deep=False)
+                    global_df[key_columns[0]] = 0
+                    partial = agg.partial_aggregate(
+                        global_df,
+                        key_columns,
+                        accumulator_columns,
+                        input_schema=input_schema,
+                    )
+            else:
+                partial = agg.partial_aggregate(
+                    df,
+                    key_columns,
+                    accumulator_columns,
+                    input_schema=input_schema,
+                )
             result = (
                 partial
                 if result is None
@@ -1197,22 +1340,28 @@ class GPUAggregationPlan:
         df: cudf.DataFrame,
         input_schema: Optional[Schema] = None,
     ) -> cudf.DataFrame:
-        import cudf as cudf_module
+        import cudf
 
-        key_columns = self._shuffle_key_columns
-        output_columns = ([] if self._is_global else list(key_columns)) + list(
+        if self.is_global:
+            assert self._global_key_column is not None
+            key_columns = (self._global_key_column,)
+        else:
+            key_columns = self._key_columns
+        output_columns = ([] if self.is_global else list(key_columns)) + list(
             self.output_names
         )
 
         if len(df) == 0:
-            return _empty_dataframe(
-                cudf_module,
-                output_columns,
-                dtypes=self._final_cudf_dtypes(
-                    df,
-                    input_schema=input_schema,
-                ),
+            # construct empty output dataframe with the correct schema
+            dtypes = self._final_cudf_dtypes(
+                df,
+                input_schema=input_schema,
             )
+            result = cudf.DataFrame()
+            for column in output_columns:
+                result[column] = []
+                _cast_cudf_column_dtype(result, column, dtypes.get(column))
+            return result
 
         result = None
         for agg, output_name, accumulator_prefix in zip(
@@ -1232,8 +1381,8 @@ class GPUAggregationPlan:
             )
 
         assert result is not None
-        if self._is_global:
-            result = result.drop(columns=[self._shuffle_key_columns[0]])
+        if self.is_global:
+            result = result.drop(columns=[key_columns[0]])
 
         return result[output_columns]
 
@@ -1344,8 +1493,8 @@ class GPUAggregationPlan:
         input_schema = self._effective_input_schema(input_schema)
         dtypes: Dict[str, Optional[DataType]] = {}
 
-        if not self._is_global:
-            for column in self._shuffle_key_columns:
+        if not self.is_global:
+            for column in self.key_columns:
                 dtype = self._effective_column_dtype(column, input_schema)
                 if dtype is None:
                     dtype = _cudf_column_dtype(df, column)
@@ -1500,7 +1649,7 @@ class GPUHashAggregateActor:
         self._shuffler = BulkRapidsMPFShuffler(
             nranks=nranks,
             total_nparts=total_nparts,
-            shuffle_on=list(aggregation_plan.shuffle_key_columns),
+            shuffle_on=list(aggregation_plan.key_columns),
             rmm_pool_size=rmm_pool_size,
             spill_memory_limit=spill_memory_limit,
         )
@@ -1566,7 +1715,7 @@ class GPUHashAggregateActor:
         from rapidsmpf.utils.cudf import pylibcudf_to_cudf_dataframe
 
         self._shuffle_columns = self._shuffle_columns or list(
-            self._aggregation_plan.shuffle_key_columns
+            self._aggregation_plan.key_columns
             + self._aggregation_plan.accumulator_columns
         )
 
@@ -1623,12 +1772,14 @@ class GPUHashAggregateOperator(GPUShuffleOperator):
             raise ValueError(
                 "GPUHashAggregateOperator received unsupported aggregations."
             )
+        if len(key_columns) == 0 or aggregation_plan.is_global:
+            raise ValueError(
+                "GPUHashAggregateOperator only supports grouped GPU aggregations; "
+                "use create_gpu_aggregate_operator for topology selection."
+            )
 
         nranks = _derive_num_gpu_ranks(data_context)
-        if len(key_columns) == 0:
-            # global aggregation
-            target_num_partitions = 1
-        elif num_partitions is not None:
+        if num_partitions is not None:
             # user-specified number of partitions
             target_num_partitions = num_partitions
         else:
@@ -1658,7 +1809,7 @@ class GPUHashAggregateOperator(GPUShuffleOperator):
         super().__init__(
             input_op,
             data_context,
-            key_columns=aggregation_plan.shuffle_key_columns,
+            key_columns=aggregation_plan.key_columns,
             columns=None,
             num_partitions=target_num_partitions,
             should_sort=False,
@@ -1688,3 +1839,342 @@ class GPUHashAggregateOperator(GPUShuffleOperator):
             shuffle_name: self._shuffled_blocks_stats,
             aggregate_name: self._output_blocks_stats,
         }
+
+
+def _global_aggregate_partial(
+    aggregation_plan: GPUAggregationPlan,
+    *blocks: Block,
+) -> Tuple[Block, BlockMetadataWithSchema, Optional[pa.Schema]]:
+    import cudf
+
+    exec_stats_builder = BlockExecStats.builder()
+    runtime_input_schema = (
+        aggregation_plan._input_schema
+        if isinstance(aggregation_plan._input_schema, pa.Schema)
+        else None
+    )
+    projected_tables = []
+    required_columns = list(aggregation_plan._key_columns)
+    for agg in aggregation_plan._gpu_aggregates:
+        target_column = agg.target_column
+        if target_column is not None and target_column not in required_columns:
+            required_columns.append(target_column)
+    required_columns = tuple(required_columns)
+    total_num_rows = 0
+
+    for block in blocks:
+        block_accessor = BlockAccessor.for_block(block)
+        num_rows = block_accessor.num_rows()
+        total_num_rows += num_rows
+
+        table = block_accessor.to_arrow()
+        runtime_input_schema = aggregation_plan.merge_input_schema(
+            runtime_input_schema,
+            table.schema,
+        )
+        if required_columns:
+            projected_tables.append(table.select(list(required_columns)))
+
+    if required_columns:
+        if len(projected_tables) == 1:
+            projected_table = projected_tables[0]
+        else:
+            try:
+                projected_table = pa.concat_tables(
+                    projected_tables, promote_options="permissive"
+                )
+            except TypeError:
+                projected_table = pa.concat_tables(projected_tables, promote=True)
+        df = cudf.DataFrame.from_arrow(projected_table)
+    else:
+        df = cudf.DataFrame(index=range(total_num_rows))
+
+    partial = aggregation_plan.partial_aggregate(
+        df,
+        input_schema=runtime_input_schema,
+    )
+    partial_block = partial.to_arrow(preserve_index=False)
+    partial_meta = BlockMetadataWithSchema.from_block(
+        partial_block,
+        block_exec_stats=exec_stats_builder.build(),
+    )
+    return partial_block, partial_meta, runtime_input_schema
+
+
+def _global_aggregate_final(
+    aggregation_plan: GPUAggregationPlan,
+    runtime_input_schema: Optional[pa.Schema],
+    *partial_blocks: Block,
+) -> Tuple[Block, BlockMetadataWithSchema]:
+    import cudf
+
+    exec_stats_builder = BlockExecStats.builder()
+    partial_tables = [
+        BlockAccessor.for_block(partial_block).to_arrow()
+        for partial_block in partial_blocks
+    ]
+    if len(partial_tables) == 1:
+        partial_table = partial_tables[0]
+    else:
+        try:
+            partial_table = pa.concat_tables(
+                partial_tables, promote_options="permissive"
+            )
+        except TypeError:
+            partial_table = pa.concat_tables(partial_tables, promote=True)
+    partial_df = cudf.DataFrame.from_arrow(partial_table)
+
+    output_df = aggregation_plan.final_aggregate(
+        partial_df,
+        input_schema=runtime_input_schema,
+    )
+    output_block = output_df.to_arrow(preserve_index=False)
+    output_block = aggregation_plan.normalize_output_arrow(
+        output_block,
+        input_schema=runtime_input_schema,
+    )
+    output_meta = BlockMetadataWithSchema.from_block(
+        output_block,
+        block_exec_stats=exec_stats_builder.build(),
+    )
+    return output_block, output_meta
+
+
+def _global_row_count_from_blocks(
+    aggregation_plan: GPUAggregationPlan,
+    *blocks: Block,
+) -> Tuple[Block, BlockMetadataWithSchema]:
+    exec_stats_builder = BlockExecStats.builder()
+    total_num_rows = sum(BlockAccessor.for_block(block).num_rows() for block in blocks)
+    output_block = pa.table(
+        {
+            output_name: pa.array([total_num_rows], type=pa.int64())
+            for output_name in aggregation_plan.output_names
+        }
+    )
+    output_meta = BlockMetadataWithSchema.from_block(
+        output_block,
+        block_exec_stats=exec_stats_builder.build(),
+    )
+    return output_block, output_meta
+
+
+class GPUGlobalAggregateOperator(AllToAllOperator):
+    """GPU-native global aggregate with no hash shuffle stage.
+
+    Non-count aggregates use a streaming GPU partial map followed by a small final
+    all-to-all reduction. Pure row-count aggregations keep the metadata shortcut.
+    """
+
+    def __init__(
+        self,
+        data_context: DataContext,
+        input_op: PhysicalOperator,
+        aggregation_plan: GPUAggregationPlan,
+    ) -> None:
+        if not aggregation_plan.is_global:
+            raise ValueError(
+                "GPUGlobalAggregateOperator only supports global GPU aggregations; "
+                "use create_gpu_aggregate_operator for topology selection."
+            )
+
+        self._aggregation_plan = aggregation_plan
+        name = f"GPUGlobalAggregate(aggs={aggregation_plan.output_names})"
+
+        if all(
+            isinstance(agg, GPUCount) and agg.target_column is None
+            for agg in aggregation_plan._gpu_aggregates
+        ):
+            input_dependency = input_op
+            fn = functools.partial(
+                self._row_count,
+                aggregation_plan,
+                data_context,
+            )
+            sub_progress_bar_names = None
+        else:
+            input_dependency = MapOperator.create(
+                MapTransformer(
+                    [
+                        BlockMapTransformFn(
+                            functools.partial(
+                                self._partial_aggregate,
+                                aggregation_plan,
+                            ),
+                            disable_block_shaping=True,
+                        )
+                    ]
+                ),
+                input_op,
+                data_context,
+                name=f"{name}Partial",
+                min_rows_per_bundle=_GLOBAL_AGGREGATE_MIN_ROWS_PER_TASK,
+                supports_fusion=False,
+                ray_remote_args=merge_label_selector(
+                    {"num_gpus": 1, "max_calls": 0},
+                    data_context.execution_options.label_selector,
+                ),
+            )
+            fn = functools.partial(
+                self._final_aggregate,
+                aggregation_plan,
+                data_context,
+            )
+            sub_progress_bar_names = [_GLOBAL_AGGREGATE_SUB_PROGRESS_BAR_NAMES[1]]
+
+        super().__init__(
+            fn,
+            input_dependency,
+            data_context,
+            num_outputs=1,
+            sub_progress_bar_names=sub_progress_bar_names,
+            name=name,
+        )
+
+    @staticmethod
+    def _partial_aggregate(
+        aggregation_plan: GPUAggregationPlan,
+        blocks: Iterable[Block],
+        ctx: TaskContext,
+    ) -> Iterator[Block]:
+        del ctx
+        block_list = list(blocks)
+        if not block_list:
+            return
+
+        partial_block, _, _ = _global_aggregate_partial(
+            aggregation_plan,
+            *block_list,
+        )
+        yield partial_block
+
+    @staticmethod
+    def _final_aggregate(
+        aggregation_plan: GPUAggregationPlan,
+        data_context: DataContext,
+        refs: List[RefBundle],
+        ctx: TaskContext,
+    ) -> AllToAllTransformFnResult:
+        """Run final reduction over streaming GPU global aggregate partials."""
+        partial_blocks: List[Block] = []
+        input_owned = all(ref_bundle.owns_blocks for ref_bundle in refs)
+        for ref_bundle in refs:
+            partial_blocks.extend(ref_bundle.block_refs)
+
+        if len(partial_blocks) == 0:
+            return [], {}
+
+        runtime_input_schema = (
+            aggregation_plan._input_schema
+            if isinstance(aggregation_plan._input_schema, pa.Schema)
+            else None
+        )
+        label_selector = data_context.execution_options.label_selector
+        final_ray_remote_args = merge_label_selector({"num_gpus": 1}, label_selector)
+        final_task = cached_remote_fn(_global_aggregate_final)
+
+        final_block_ref, final_meta_ref = final_task.options(
+            **final_ray_remote_args,
+            num_returns=2,
+        ).remote(
+            aggregation_plan,
+            runtime_input_schema,
+            *partial_blocks,
+        )
+
+        _, final_bar_name = _GLOBAL_AGGREGATE_SUB_PROGRESS_BAR_NAMES
+        sub_progress_bar_dict = ctx.sub_progress_bar_dict or {}
+        final_bar = sub_progress_bar_dict.get(final_bar_name)
+        if final_bar is not None:
+            final_metadata = final_bar.fetch_until_complete([final_meta_ref])[0]
+        else:
+            final_metadata = ray.get(final_meta_ref)
+
+        output = [
+            RefBundle(
+                [BlockEntry(final_block_ref, final_metadata.metadata)],
+                owns_blocks=input_owned,
+                schema=final_metadata.schema,
+            )
+        ]
+        stats = {"final_aggregate": to_stats([final_metadata])}
+        return output, stats
+
+    @staticmethod
+    def _row_count(
+        aggregation_plan: GPUAggregationPlan,
+        data_context: DataContext,
+        refs: List[RefBundle],
+        ctx: TaskContext,
+    ) -> AllToAllTransformFnResult:
+        del ctx
+        input_blocks: List[Block] = []
+        input_owned = all(ref_bundle.owns_blocks for ref_bundle in refs)
+        total_num_rows = 0
+        for ref_bundle in refs:
+            input_blocks.extend(ref_bundle.block_refs)
+            num_rows = ref_bundle.num_rows()
+            if num_rows is None:
+                total_num_rows = -1
+            elif total_num_rows >= 0:
+                total_num_rows += num_rows
+
+        if len(input_blocks) == 0:
+            return [], {}
+
+        if total_num_rows >= 0:
+            output_block = pa.table(
+                {
+                    output_name: pa.array([total_num_rows], type=pa.int64())
+                    for output_name in aggregation_plan.output_names
+                }
+            )
+            output_metadata = BlockMetadataWithSchema.from_block(output_block)
+            output_ref = ray.put(output_block)
+        else:
+            label_selector = data_context.execution_options.label_selector
+            final_task = cached_remote_fn(_global_row_count_from_blocks)
+            output_ref, output_metadata_ref = final_task.options(
+                **merge_label_selector({}, label_selector),
+                num_returns=2,
+            ).remote(
+                aggregation_plan,
+                *input_blocks,
+            )
+            output_metadata = ray.get(output_metadata_ref)
+
+        output = [
+            RefBundle(
+                [BlockEntry(output_ref, output_metadata.metadata)],
+                owns_blocks=input_owned,
+                schema=output_metadata.schema,
+            )
+        ]
+        return output, {"final_aggregate": to_stats([output_metadata])}
+
+
+def create_gpu_aggregate_operator(
+    *,
+    aggregation_plan: GPUAggregationPlan,
+    input_physical_op: PhysicalOperator,
+    data_context: DataContext,
+    num_partitions: Optional[int] = None,
+) -> PhysicalOperator:
+    """Create the physical GPU aggregate operator for a GPU aggregation plan.
+
+    Supports both hash shuffle aggregations (groupby) and global aggregations (all-reduce).
+    """
+    if aggregation_plan.is_global:
+        return GPUGlobalAggregateOperator(
+            data_context,
+            input_physical_op,
+            aggregation_plan,
+        )
+
+    return GPUHashAggregateOperator(
+        data_context,
+        input_physical_op,
+        key_columns=aggregation_plan.key_columns,
+        aggregation_plan=aggregation_plan,
+        num_partitions=num_partitions,
+    )
