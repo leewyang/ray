@@ -71,10 +71,7 @@ logger = logging.getLogger(__name__)
 
 
 _GLOBAL_GROUP_KEY_PREFIX = "__ray_global_group_key"
-_GLOBAL_AGGREGATE_SUB_PROGRESS_BAR_NAMES = (
-    "GPU Partial Aggregate",
-    "GPU Final Aggregate",
-)
+_GLOBAL_AGGREGATE_PROGRESS_BAR_NAME = "GPU Aggregate"
 _GLOBAL_AGGREGATE_MIN_ROWS_PER_TASK = 4_000_000
 
 
@@ -83,9 +80,6 @@ def _cast_cudf_column_dtype(
 ) -> None:
     """Cast a ``cudf.DataFrame`` column to specified dtype in place."""
     if dtype is None or column not in df.columns:
-        return
-    dtype = DataType.from_dtype(dtype)
-    if dtype is None:
         return
 
     try:
@@ -185,6 +179,29 @@ class GPUAggregateFn(abc.ABC):
         """Aggregate one input block (as a ``cudf.DataFrame``) into GPU accumulator
         columns."""
         ...
+
+    def _partial_aggregate_global(
+        self,
+        df: Any,
+        key_columns: Tuple[str, ...],
+        accumulator_columns: Tuple[str, ...],
+        *,
+        input_schema: Optional[Schema] = None,
+    ) -> Any:
+        """Aggregate one input block for a global reduction.
+
+        The default implementation routes through the grouped partial aggregation path
+        by adding a synthetic constant key column.  Subclasses can override this when a
+        more efficient global aggregation implementation is available.
+        """
+        global_df = df.copy(deep=False)
+        global_df[key_columns[0]] = 0
+        return self.partial_aggregate(
+            global_df,
+            key_columns,
+            accumulator_columns,
+            input_schema=input_schema,
+        )
 
     @abc.abstractmethod
     def final_aggregate(
@@ -319,22 +336,8 @@ class GPUCount(GPUAggregateFn):
         accumulator_columns: Tuple[str, ...],
         *,
         input_schema: Optional[Schema] = None,
-        _is_global: bool = False,
     ) -> cudf.DataFrame:
         acc_col = accumulator_columns[0]
-        if _is_global:
-            import cudf
-
-            key_column = key_columns[0]
-            if self.target_column is None or not self.ignore_nulls:
-                count = len(df)
-            else:
-                count = int(df[self.target_column].count())
-
-            result = cudf.DataFrame({key_column: [0], acc_col: [count]})
-            _cast_cudf_column_dtype(result, acc_col, DataType.from_numpy("int64"))
-            return result[[key_column, acc_col]]
-
         grouped = df.groupby(list(key_columns), dropna=False)
         if self.target_column is None or not self.ignore_nulls:
             result = grouped.size().reset_index()
@@ -352,6 +355,27 @@ class GPUCount(GPUAggregateFn):
         )
         _fill_missing_count(result, acc_col, count_dtype)
         return result[list(key_columns) + [acc_col]]
+
+    def _partial_aggregate_global(
+        self,
+        df: cudf.DataFrame,
+        key_columns: Tuple[str, ...],
+        accumulator_columns: Tuple[str, ...],
+        *,
+        input_schema: Optional[Schema] = None,
+    ) -> cudf.DataFrame:
+        import cudf
+
+        acc_col = accumulator_columns[0]
+        key_column = key_columns[0]
+        if self.target_column is None or not self.ignore_nulls:
+            count = len(df)
+        else:
+            count = int(df[self.target_column].count())
+
+        result = cudf.DataFrame({key_column: [0], acc_col: [count]})
+        _cast_cudf_column_dtype(result, acc_col, DataType.from_numpy("int64"))
+        return result[[key_column, acc_col]]
 
     def final_aggregate(
         self,
@@ -413,28 +437,10 @@ class GPUSum(GPUAggregateFn):
         accumulator_columns: Tuple[str, ...],
         *,
         input_schema: Optional[Schema] = None,
-        _is_global: bool = False,
     ) -> cudf.DataFrame:
         assert self.target_column is not None
         acc_col = accumulator_columns[0]
         output_dtype = self._reduction_dtype(df, input_schema)
-        if _is_global:
-            import cudf
-
-            key_column = key_columns[0]
-            size = len(df)
-            count = int(df[self.target_column].count())
-            if (self.ignore_nulls and count == 0) or (
-                not self.ignore_nulls and count != size
-            ):
-                value = None
-            else:
-                value = df[self.target_column].sum()
-
-            result = cudf.DataFrame({key_column: [0], acc_col: [value]})
-            _cast_cudf_column_dtype(result, acc_col, output_dtype)
-            return result[[key_column, acc_col]]
-
         size_col = f"{acc_col}_size"
         count_col = f"{acc_col}_count"
         grouped = df.groupby(list(key_columns), dropna=False)
@@ -463,6 +469,33 @@ class GPUSum(GPUAggregateFn):
             null_mask = result[size_col] != result[count_col]
         result.loc[null_mask, acc_col] = None
         return result[list(key_columns) + [acc_col]]
+
+    def _partial_aggregate_global(
+        self,
+        df: cudf.DataFrame,
+        key_columns: Tuple[str, ...],
+        accumulator_columns: Tuple[str, ...],
+        *,
+        input_schema: Optional[Schema] = None,
+    ) -> cudf.DataFrame:
+        import cudf
+
+        assert self.target_column is not None
+        acc_col = accumulator_columns[0]
+        output_dtype = self._reduction_dtype(df, input_schema)
+        key_column = key_columns[0]
+        size = len(df)
+        count = int(df[self.target_column].count())
+        if (self.ignore_nulls and count == 0) or (
+            not self.ignore_nulls and count != size
+        ):
+            value = None
+        else:
+            value = df[self.target_column].sum()
+
+        result = cudf.DataFrame({key_column: [0], acc_col: [value]})
+        _cast_cudf_column_dtype(result, acc_col, output_dtype)
+        return result[[key_column, acc_col]]
 
     def final_aggregate(
         self,
@@ -593,28 +626,10 @@ class GPUMin(GPUAggregateFn):
         accumulator_columns: Tuple[str, ...],
         *,
         input_schema: Optional[Schema] = None,
-        _is_global: bool = False,
     ) -> cudf.DataFrame:
         assert self.target_column is not None
         acc_col = accumulator_columns[0]
         output_dtype = self._reduction_dtype(df, input_schema)
-        if _is_global:
-            import cudf
-
-            key_column = key_columns[0]
-            size = len(df)
-            count = int(df[self.target_column].count())
-            if (self.ignore_nulls and count == 0) or (
-                not self.ignore_nulls and count != size
-            ):
-                value = None
-            else:
-                value = df[self.target_column].min()
-
-            result = cudf.DataFrame({key_column: [0], acc_col: [value]})
-            _cast_cudf_column_dtype(result, acc_col, output_dtype)
-            return result[[key_column, acc_col]]
-
         size_col = f"{acc_col}_size"
         count_col = f"{acc_col}_count"
         grouped = df.groupby(list(key_columns), dropna=False)
@@ -643,6 +658,33 @@ class GPUMin(GPUAggregateFn):
             null_mask = result[size_col] != result[count_col]
         result.loc[null_mask, acc_col] = None
         return result[list(key_columns) + [acc_col]]
+
+    def _partial_aggregate_global(
+        self,
+        df: cudf.DataFrame,
+        key_columns: Tuple[str, ...],
+        accumulator_columns: Tuple[str, ...],
+        *,
+        input_schema: Optional[Schema] = None,
+    ) -> cudf.DataFrame:
+        import cudf
+
+        assert self.target_column is not None
+        acc_col = accumulator_columns[0]
+        output_dtype = self._reduction_dtype(df, input_schema)
+        key_column = key_columns[0]
+        size = len(df)
+        count = int(df[self.target_column].count())
+        if (self.ignore_nulls and count == 0) or (
+            not self.ignore_nulls and count != size
+        ):
+            value = None
+        else:
+            value = df[self.target_column].min()
+
+        result = cudf.DataFrame({key_column: [0], acc_col: [value]})
+        _cast_cudf_column_dtype(result, acc_col, output_dtype)
+        return result[[key_column, acc_col]]
 
     def final_aggregate(
         self,
@@ -775,28 +817,10 @@ class GPUMax(GPUAggregateFn):
         accumulator_columns: Tuple[str, ...],
         *,
         input_schema: Optional[Schema] = None,
-        _is_global: bool = False,
     ) -> cudf.DataFrame:
         assert self.target_column is not None
         acc_col = accumulator_columns[0]
         output_dtype = self._reduction_dtype(df, input_schema)
-        if _is_global:
-            import cudf
-
-            key_column = key_columns[0]
-            size = len(df)
-            count = int(df[self.target_column].count())
-            if (self.ignore_nulls and count == 0) or (
-                not self.ignore_nulls and count != size
-            ):
-                value = None
-            else:
-                value = df[self.target_column].max()
-
-            result = cudf.DataFrame({key_column: [0], acc_col: [value]})
-            _cast_cudf_column_dtype(result, acc_col, output_dtype)
-            return result[[key_column, acc_col]]
-
         size_col = f"{acc_col}_size"
         count_col = f"{acc_col}_count"
         grouped = df.groupby(list(key_columns), dropna=False)
@@ -825,6 +849,33 @@ class GPUMax(GPUAggregateFn):
             null_mask = result[size_col] != result[count_col]
         result.loc[null_mask, acc_col] = None
         return result[list(key_columns) + [acc_col]]
+
+    def _partial_aggregate_global(
+        self,
+        df: cudf.DataFrame,
+        key_columns: Tuple[str, ...],
+        accumulator_columns: Tuple[str, ...],
+        *,
+        input_schema: Optional[Schema] = None,
+    ) -> cudf.DataFrame:
+        import cudf
+
+        assert self.target_column is not None
+        acc_col = accumulator_columns[0]
+        output_dtype = self._reduction_dtype(df, input_schema)
+        key_column = key_columns[0]
+        size = len(df)
+        count = int(df[self.target_column].count())
+        if (self.ignore_nulls and count == 0) or (
+            not self.ignore_nulls and count != size
+        ):
+            value = None
+        else:
+            value = df[self.target_column].max()
+
+        result = cudf.DataFrame({key_column: [0], acc_col: [value]})
+        _cast_cudf_column_dtype(result, acc_col, output_dtype)
+        return result[[key_column, acc_col]]
 
     def final_aggregate(
         self,
@@ -957,41 +1008,11 @@ class GPUMean(GPUAggregateFn):
         accumulator_columns: Tuple[str, ...],
         *,
         input_schema: Optional[Schema] = None,
-        _is_global: bool = False,
     ) -> cudf.DataFrame:
         assert self.target_column is not None
 
         sum_col, count_col, null_count_col = accumulator_columns
         output_dtype = self._reduction_dtype(df, input_schema)
-        if _is_global:
-            import cudf
-
-            key_column = key_columns[0]
-            size = len(df)
-            count = int(df[self.target_column].count())
-            null_count = size - count
-            if (self.ignore_nulls and count == 0) or (
-                not self.ignore_nulls and null_count > 0
-            ):
-                value = None
-            else:
-                value = df[self.target_column].sum()
-
-            result = cudf.DataFrame(
-                {
-                    key_column: [0],
-                    sum_col: [value],
-                    count_col: [count],
-                    null_count_col: [null_count],
-                }
-            )
-            _cast_cudf_column_dtype(result, sum_col, output_dtype)
-            _cast_cudf_column_dtype(result, count_col, DataType.from_numpy("int64"))
-            _cast_cudf_column_dtype(
-                result, null_count_col, DataType.from_numpy("int64")
-            )
-            return result[[key_column] + list(accumulator_columns)]
-
         size_col = f"{sum_col}_size"
         grouped = df.groupby(list(key_columns), dropna=False)
 
@@ -1023,6 +1044,44 @@ class GPUMean(GPUAggregateFn):
         _cast_cudf_column_dtype(result, null_count_col, count_dtype)
 
         return result[list(key_columns) + list(accumulator_columns)]
+
+    def _partial_aggregate_global(
+        self,
+        df: cudf.DataFrame,
+        key_columns: Tuple[str, ...],
+        accumulator_columns: Tuple[str, ...],
+        *,
+        input_schema: Optional[Schema] = None,
+    ) -> cudf.DataFrame:
+        import cudf
+
+        assert self.target_column is not None
+
+        sum_col, count_col, null_count_col = accumulator_columns
+        output_dtype = self._reduction_dtype(df, input_schema)
+        key_column = key_columns[0]
+        size = len(df)
+        count = int(df[self.target_column].count())
+        null_count = size - count
+        if (self.ignore_nulls and count == 0) or (
+            not self.ignore_nulls and null_count > 0
+        ):
+            value = None
+        else:
+            value = df[self.target_column].sum()
+
+        result = cudf.DataFrame(
+            {
+                key_column: [0],
+                sum_col: [value],
+                count_col: [count],
+                null_count_col: [null_count],
+            }
+        )
+        _cast_cudf_column_dtype(result, sum_col, output_dtype)
+        _cast_cudf_column_dtype(result, count_col, DataType.from_numpy("int64"))
+        _cast_cudf_column_dtype(result, null_count_col, DataType.from_numpy("int64"))
+        return result[[key_column] + list(accumulator_columns)]
 
     def final_aggregate(
         self,
@@ -1298,23 +1357,12 @@ class GPUAggregationPlan:
         ):
             accumulator_columns = agg._accumulator_columns(accumulator_prefix)
             if self.is_global:
-                if isinstance(agg, (GPUCount, GPUSum, GPUMin, GPUMax, GPUMean)):
-                    partial = agg.partial_aggregate(
-                        df,
-                        key_columns,
-                        accumulator_columns,
-                        input_schema=input_schema,
-                        _is_global=True,
-                    )
-                else:
-                    global_df = df.copy(deep=False)
-                    global_df[key_columns[0]] = 0
-                    partial = agg.partial_aggregate(
-                        global_df,
-                        key_columns,
-                        accumulator_columns,
-                        input_schema=input_schema,
-                    )
+                partial = agg._partial_aggregate_global(
+                    df,
+                    key_columns,
+                    accumulator_columns,
+                    input_schema=input_schema,
+                )
             else:
                 partial = agg.partial_aggregate(
                     df,
@@ -2020,7 +2068,7 @@ class GPUGlobalAggregateOperator(AllToAllOperator):
                 aggregation_plan,
                 data_context,
             )
-            sub_progress_bar_names = [_GLOBAL_AGGREGATE_SUB_PROGRESS_BAR_NAMES[1]]
+            sub_progress_bar_names = [_GLOBAL_AGGREGATE_PROGRESS_BAR_NAME]
 
         super().__init__(
             fn,
@@ -2082,9 +2130,8 @@ class GPUGlobalAggregateOperator(AllToAllOperator):
             *partial_blocks,
         )
 
-        _, final_bar_name = _GLOBAL_AGGREGATE_SUB_PROGRESS_BAR_NAMES
         sub_progress_bar_dict = ctx.sub_progress_bar_dict or {}
-        final_bar = sub_progress_bar_dict.get(final_bar_name)
+        final_bar = sub_progress_bar_dict.get(_GLOBAL_AGGREGATE_PROGRESS_BAR_NAME)
         if final_bar is not None:
             final_metadata = final_bar.fetch_until_complete([final_meta_ref])[0]
         else:

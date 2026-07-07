@@ -4,6 +4,7 @@ The planning tests do not require GPUs. Tests marked ``gpu`` exercise cuDF and
 RAPIDS MPF paths on actual GPU hardware.
 """
 
+import inspect
 from typing import Any, List, Optional, Tuple, cast
 from unittest.mock import MagicMock, patch
 
@@ -229,6 +230,77 @@ class TestGPUHashAggregatePlanning:
         assert plan._gpu_aggregates == (gpu_agg,)
         assert plan.output_names == ("custom(value)",)
         assert plan.required_columns == ("user_id", "value")
+
+    def test_gpu_aggregate_global_hook(self):
+        class _FakeDataFrame(dict):
+            def __init__(self, *args, copied_with_deep=None, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.copied_with_deep = copied_with_deep
+
+            def copy(self, deep=False):
+                return _FakeDataFrame(self, copied_with_deep=deep)
+
+        class _CustomGPUAggregate(GPUAggregateFn):
+            def __init__(self) -> None:
+                super().__init__(
+                    "custom(value)",
+                    on="value",
+                    ignore_nulls=True,
+                    accumulators=("acc",),
+                )
+                self.seen_df = None
+                self.seen_schema = None
+
+            def partial_aggregate(
+                self,
+                df: Any,
+                key_columns: Tuple[str, ...],
+                accumulator_columns: Tuple[str, ...],
+                *,
+                input_schema: Any = None,
+            ) -> Any:
+                self.seen_df = df
+                self.seen_schema = input_schema
+                return "partial"
+
+            def final_aggregate(
+                self,
+                df: Any,
+                key_columns: Tuple[str, ...],
+                accumulator_columns: Tuple[str, ...],
+                output_name: str,
+            ) -> Any:
+                raise NotImplementedError
+
+        built_in_plan = build_gpu_aggregation_plan(
+            ("user_id",),
+            (Count(), Sum("value"), Min("value"), Max("value"), Mean("value")),
+            input_schema=pa.schema([("user_id", pa.int64()), ("value", pa.int64())]),
+        )
+        assert isinstance(built_in_plan, GPUAggregationPlan), built_in_plan
+        for gpu_agg in built_in_plan._gpu_aggregates:
+            assert (
+                "_is_global"
+                not in inspect.signature(gpu_agg.partial_aggregate).parameters
+            )
+
+        schema = pa.schema([("value", pa.int64())])
+        df = _FakeDataFrame({"value": [1, 2, 3]})
+        gpu_agg = _CustomGPUAggregate()
+
+        result = gpu_agg._partial_aggregate_global(
+            df,
+            ("__ray_global_group_key",),
+            ("acc",),
+            input_schema=schema,
+        )
+
+        assert result == "partial"
+        assert "__ray_global_group_key" not in df
+        assert gpu_agg.seen_df is not df
+        assert gpu_agg.seen_df.copied_with_deep is False
+        assert gpu_agg.seen_df["__ray_global_group_key"] == 0
+        assert gpu_agg.seen_schema is schema
 
     def test_gpu_shuffle_routes_custom_gpu_aggregate_without_input_schema(self):
         class _CustomGPUAggregate(GPUAggregateFn):
