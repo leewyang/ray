@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import functools
 import logging
 import pickle
 import time
@@ -10,6 +11,7 @@ from collections import defaultdict
 from typing import (
     Any,
     Dict,
+    Iterable,
     Iterator,
     List,
     Optional,
@@ -22,13 +24,31 @@ from typing import (
 import pyarrow as pa
 
 import ray
-from ray.data._internal.execution.interfaces import PhysicalOperator
+from ray.data._internal.execution.interfaces import (
+    BlockEntry,
+    PhysicalOperator,
+    RefBundle,
+    TaskContext,
+)
+from ray.data._internal.execution.interfaces.transform_fn import (
+    AllToAllTransformFnResult,
+)
+from ray.data._internal.execution.operators.base_physical_operator import (
+    AllToAllOperator,
+)
+from ray.data._internal.execution.operators.map_operator import MapOperator
+from ray.data._internal.execution.operators.map_transformer import (
+    BlockMapTransformFn,
+    MapTransformer,
+)
+from ray.data._internal.execution.util import merge_label_selector
 from ray.data._internal.gpu_shuffle.hash_shuffle import (
     _GPU_PARTITION_ID_KEY,
     GPURankPool,
     GPUShuffleOperator,
     _derive_num_gpu_ranks,
 )
+from ray.data._internal.remote_fn import cached_remote_fn
 from ray.data._internal.table_block import TableBlockAccessor
 from ray.data.aggregate import AggregateFn, AggregateFnV2, Count, Max, Mean, Min, Sum
 from ray.data.block import (
@@ -38,6 +58,7 @@ from ray.data.block import (
     BlockMetadataWithSchema,
     BlockStats,
     Schema,
+    to_stats,
 )
 from ray.data.context import DataContext
 from ray.data.datatype import DataType
@@ -52,6 +73,8 @@ logger = logging.getLogger(__name__)
 
 
 _GLOBAL_AGGREGATE_KEY = "__hash_aggregate_global_key"
+_GLOBAL_AGGREGATE_PROGRESS_BAR_NAME = "GPU Global Aggregate"
+_GLOBAL_AGGREGATE_MIN_ROWS_PER_TASK = 4_000_000
 
 
 def _cast_cudf_column_dtype(
@@ -1619,16 +1642,14 @@ class GPUHashAggregateOperator(GPUShuffleOperator):
         *,
         num_partitions: Optional[int] = None,
     ) -> None:
-        if aggregation_plan is None:
+        if len(key_columns) == 0 or aggregation_plan._is_global:
             raise ValueError(
-                "GPUHashAggregateOperator received unsupported aggregations."
+                "GPUHashAggregateOperator only supports grouped GPU aggregations; "
+                "use GPUGlobalAggregateOperator for global reductions."
             )
 
         nranks = _derive_num_gpu_ranks(data_context)
-        if len(key_columns) == 0:
-            # global aggregation
-            target_num_partitions = 1
-        elif num_partitions is not None:
+        if num_partitions is not None:
             # user-specified number of partitions
             target_num_partitions = num_partitions
         else:
@@ -1688,3 +1709,203 @@ class GPUHashAggregateOperator(GPUShuffleOperator):
             shuffle_name: self._shuffled_blocks_stats,
             aggregate_name: self._output_blocks_stats,
         }
+
+
+class GPUGlobalAggregateOperator(AllToAllOperator):
+    """GPU-native global aggregate without a hash shuffle stage.
+
+    This operator handles global aggregations, such as ``count()`` or ``sum()``
+    without group-by keys. Since all input rows contribute to a single global
+    aggregate result, it does not need the RAPIDS MPF hash shuffle used by
+    ``GPUHashAggregateOperator``.
+
+    Execution is split into two GPU stages. A map stage runs partial aggregation
+    over input bundles and emits one partial result block per task. The
+    all-to-all stage then launches a single GPU task that concatenates those
+    partial blocks and runs the final reduction.
+    """
+
+    def __init__(
+        self,
+        data_context: DataContext,
+        input_op: PhysicalOperator,
+        aggregation_plan: GPUAggregationPlan,
+    ) -> None:
+        if not aggregation_plan._is_global:
+            raise ValueError(
+                "GPUGlobalAggregateOperator only supports global GPU aggregations."
+            )
+
+        self._aggregation_plan = aggregation_plan
+        name = f"GPUGlobalAggregate(aggs={aggregation_plan.output_names})"
+        input_dependency = MapOperator.create(
+            MapTransformer(
+                [
+                    BlockMapTransformFn(
+                        functools.partial(
+                            self._partial_aggregate,
+                            aggregation_plan,
+                        ),
+                        disable_block_shaping=True,
+                    )
+                ]
+            ),
+            input_op,
+            data_context,
+            name=f"{name}Partial",
+            min_rows_per_bundle=_GLOBAL_AGGREGATE_MIN_ROWS_PER_TASK,
+            supports_fusion=False,
+            ray_remote_args=merge_label_selector(
+                {"num_gpus": 1, "max_calls": 0},
+                data_context.execution_options.label_selector,
+            ),
+        )
+
+        super().__init__(
+            functools.partial(
+                self._final_aggregate,
+                aggregation_plan,
+                data_context,
+            ),
+            input_dependency,
+            data_context,
+            num_outputs=1,
+            sub_progress_bar_names=[_GLOBAL_AGGREGATE_PROGRESS_BAR_NAME],
+            name=name,
+        )
+
+    @staticmethod
+    def _partial_aggregate(
+        aggregation_plan: GPUAggregationPlan,
+        blocks: Iterable[Block],
+        ctx: TaskContext,
+    ) -> Iterator[Block]:
+        import cudf
+
+        del ctx
+        block_list = list(blocks)
+        if not block_list:
+            return
+
+        runtime_input_schema = (
+            aggregation_plan._input_schema
+            if isinstance(aggregation_plan._input_schema, pa.Schema)
+            else None
+        )
+        projected_tables = []
+        required_columns = aggregation_plan.required_columns
+        total_num_rows = 0
+
+        for block in block_list:
+            block_accessor = BlockAccessor.for_block(block)
+            total_num_rows += block_accessor.num_rows()
+
+            table = block_accessor.to_arrow()
+            runtime_input_schema = aggregation_plan.merge_input_schema(
+                runtime_input_schema,
+                table.schema,
+            )
+            if required_columns:
+                projected_tables.append(table.select(list(required_columns)))
+
+        if required_columns:
+            try:
+                projected_table = pa.concat_tables(
+                    projected_tables, promote_options="permissive"
+                )
+            except TypeError:
+                projected_table = pa.concat_tables(projected_tables, promote=True)
+            df = cudf.DataFrame.from_arrow(projected_table)
+        else:
+            # no required columns for this aggregation, e.g. count()
+            # create a dummy dataframe with same number of rows to avoid converting
+            # arrow data to cudf columns unnecessarily
+            df = cudf.DataFrame(index=range(total_num_rows))
+
+        partial = aggregation_plan.partial_aggregate(
+            df,
+            input_schema=runtime_input_schema,
+        )
+        partial_block = partial.to_arrow(preserve_index=False)
+        yield partial_block
+
+    @staticmethod
+    def _global_aggregate_final(
+        aggregation_plan: GPUAggregationPlan,
+        *partial_blocks: Block,
+    ) -> Tuple[Block, BlockMetadataWithSchema]:
+        """Run the final GPU reduction over global aggregate partial blocks.
+
+        This is a static method so ``cached_remote_fn`` can use the class-level
+        function as a Ray remote task without serializing an operator instance.
+        """
+        import cudf
+
+        exec_stats_builder = BlockExecStats.builder()
+        partial_tables = [
+            BlockAccessor.for_block(partial_block).to_arrow()
+            for partial_block in partial_blocks
+        ]
+        try:
+            partial_table = pa.concat_tables(
+                partial_tables, promote_options="permissive"
+            )
+        except TypeError:
+            partial_table = pa.concat_tables(partial_tables, promote=True)
+        partial_df = cudf.DataFrame.from_arrow(partial_table)
+
+        # invoke GPU final reduction over partial blocks
+        output_df = aggregation_plan.final_aggregate(partial_df)
+
+        output_block = output_df.to_arrow(preserve_index=False)
+        output_block = aggregation_plan.normalize_output_arrow(output_block)
+        output_meta = BlockMetadataWithSchema.from_block(
+            output_block,
+            block_exec_stats=exec_stats_builder.build(),
+        )
+        return output_block, output_meta
+
+    @staticmethod
+    def _final_aggregate(
+        aggregation_plan: GPUAggregationPlan,
+        data_context: DataContext,
+        refs: List[RefBundle],
+        ctx: TaskContext,
+    ) -> AllToAllTransformFnResult:
+        partial_blocks: List[Block] = []
+        input_owned = all(ref_bundle.owns_blocks for ref_bundle in refs)
+        for ref_bundle in refs:
+            partial_blocks.extend(ref_bundle.block_refs)
+
+        if not partial_blocks:
+            return [], {}
+
+        final_task = cached_remote_fn(
+            GPUGlobalAggregateOperator._global_aggregate_final
+        )
+        final_block_ref, final_meta_ref = final_task.options(
+            **merge_label_selector(
+                {"num_gpus": 1},
+                data_context.execution_options.label_selector,
+            ),
+            num_returns=2,
+        ).remote(
+            aggregation_plan,
+            *partial_blocks,
+        )
+
+        sub_progress_bar_dict = ctx.sub_progress_bar_dict or {}
+        final_bar = sub_progress_bar_dict.get(_GLOBAL_AGGREGATE_PROGRESS_BAR_NAME)
+        if final_bar is not None:
+            final_metadata = final_bar.fetch_until_complete([final_meta_ref])[0]
+        else:
+            final_metadata = ray.get(final_meta_ref)
+
+        output = [
+            RefBundle(
+                [BlockEntry(final_block_ref, final_metadata.metadata)],
+                owns_blocks=input_owned,
+                schema=final_metadata.schema,
+            )
+        ]
+        return output, {"final_aggregate": to_stats([final_metadata])}

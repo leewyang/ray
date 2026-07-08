@@ -19,6 +19,7 @@ from ray.data._internal.execution.interfaces import ExecutionResources, Physical
 from ray.data._internal.gpu_shuffle.hash_aggregate import (
     GPUAggregateFn,
     GPUAggregationPlan,
+    GPUGlobalAggregateOperator,
     GPUHashAggregateActor,
     GPUHashAggregateOperator,
     build_gpu_aggregation_plan,
@@ -289,6 +290,26 @@ class TestGPUHashAggregatePlanning:
         mock_build_plan.assert_called_once()
         assert op._aggregation_plan is built_plans[0]
 
+    def test_gpu_shuffle_routes_global_aggregate_to_global_operator(self):
+        ctx = DataContext()
+        ctx.gpu_shuffle_num_actors = 4
+        ctx._shuffle_strategy = ShuffleStrategy.GPU_SHUFFLE
+
+        logical_op = self._make_aggregate_op(
+            [Count(), Sum("value")],
+            key=None,
+            input_schema=pa.schema([("value", pa.int64())]),
+        )
+        input_physical_op = _make_input_op_mock()
+
+        op = plan_all_to_all_op(logical_op, [input_physical_op], ctx)
+
+        assert isinstance(op, GPUGlobalAggregateOperator)
+        assert "GPUGlobalAggregate" in op.name
+        partial_op = op.input_dependencies[0]
+        assert isinstance(partial_op, PhysicalOperator)
+        assert "GPUGlobalAggregate" in partial_op.name
+
     def test_gpu_hash_aggregate_operator_uses_prebuilt_plan(self):
         ctx = DataContext()
         ctx.gpu_shuffle_num_actors = 4
@@ -314,6 +335,23 @@ class TestGPUHashAggregatePlanning:
         mock_default_pool.assert_not_called()
         assert op._aggregation_plan is aggregation_plan
         assert op._rank_pool.nranks == 4
+
+    def test_gpu_hash_aggregate_operator_rejects_global_plan(self):
+        ctx = DataContext()
+        ctx.gpu_shuffle_num_actors = 4
+        ctx._shuffle_strategy = ShuffleStrategy.GPU_SHUFFLE
+        input_physical_op = _make_input_op_mock()
+        aggregation_plan = build_gpu_aggregation_plan(tuple(), (Count(), Sum("value")))
+        assert isinstance(aggregation_plan, GPUAggregationPlan), aggregation_plan
+
+        with pytest.raises(ValueError, match="only supports grouped"):
+            GPUHashAggregateOperator(
+                ctx,
+                input_physical_op,
+                key_columns=tuple(),
+                aggregation_plan=aggregation_plan,
+                num_partitions=None,
+            )
 
     def test_gpu_shuffle_unsupported_aggregate_falls_back_to_cpu_hash_aggregate(self):
         from ray.data._internal.execution.operators.hash_aggregate import (
