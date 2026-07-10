@@ -95,6 +95,10 @@ def eval_random(
         return pd.Series(random_values, dtype=np.float64)
     elif block_type == BlockType.ARROW:
         return pa.array(random_values, type=pa.float64())
+    elif block_type == BlockType.CUDF:
+        import cudf
+
+        return cudf.Series(random_values)
 
     raise TypeError(f"Unsupported block type: {block_type}")
 
@@ -120,5 +124,9 @@ def eval_uuid(
         return pd.Series(arr, dtype=pd.StringDtype())
     elif block_type == BlockType.ARROW:
         return pa.array(arr, type=pa.string())
+    elif block_type == BlockType.CUDF:
+        import cudf
+
+        return cudf.Series(arr, dtype="str")
 
     raise TypeError(f"Unsupported block type: {block_type}")

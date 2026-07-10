@@ -13,6 +13,7 @@ import pytest
 
 import ray
 from ray.data._internal.block_batching.block_batching import batch_blocks
+from ray.data.block import BlockAccessor, BlockType
 from ray.data.expressions import col
 from ray.data.tests.conftest import *  # noqa
 
@@ -104,6 +105,13 @@ class TestCudfTakeBatch:
 class TestCudfBatchBlocks:
     """Tests for batch_blocks with batch_format='cudf'."""
 
+    def test_batch_to_block_preserves_cudf(self):
+        df = cudf.DataFrame({"foo": [1, 2, 3]})
+        block = BlockAccessor.batch_to_block(df)
+
+        assert isinstance(block, cudf.DataFrame)
+        assert BlockAccessor.for_block(block).block_type() == BlockType.CUDF
+
     def test_batch_blocks_cudf(self):
         blocks = block_generator(num_rows=3, num_blocks=2)
         batches = list(batch_blocks(blocks, batch_format="cudf"))
@@ -122,6 +130,31 @@ class TestCudfBatchBlocks:
 )
 class TestCudfMapBatches:
     """Tests for map_batches with various batch formats (cuDF in/out)."""
+
+    def test_map_batches_cudf_output_not_converted_to_arrow(
+        self, ray_start_regular_shared, monkeypatch, batch_format
+    ):
+        if batch_format != "cudf":
+            pytest.skip("This regression is specific to cuDF block preservation.")
+
+        original_to_arrow = cudf.DataFrame.to_arrow
+
+        def fail_nonempty_to_arrow(self, *args, **kwargs):
+            if len(self) > 0:
+                raise AssertionError("nonempty cudf.DataFrame.to_arrow() called")
+            return original_to_arrow(self, *args, **kwargs)
+
+        monkeypatch.setattr(cudf.DataFrame, "to_arrow", fail_nonempty_to_arrow)
+        ds = ray.data.range(5, override_num_blocks=1)
+
+        result = ds.map_batches(
+            lambda batch: batch,
+            batch_format="cudf",
+            batch_size=5,
+            num_gpus=0.001,
+        ).take()
+
+        assert result == [{"id": i} for i in range(5)]
 
     def test_map_batches_cudf_receive_and_return(
         self, ray_start_regular_shared, batch_format

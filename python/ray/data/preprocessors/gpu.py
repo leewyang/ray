@@ -76,6 +76,19 @@ def _hash_string_series(series: Any):
     raise AttributeError("cuDF Series does not expose hash_values.")
 
 
+def _is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    try:
+        return bool(missing)
+    except (TypeError, ValueError):
+        return False
+
+
 def _copy_for_gpu_transform(batch: Any):
     return batch.copy(deep=False) if hasattr(batch, "copy") else batch
 
@@ -158,13 +171,17 @@ class _GPUValueCountsUDF:
 
     def __call__(self, batch: Any) -> pd.DataFrame:
         df = _apply_gpu_ops(batch, self._prefix)
-        result: Dict[str, List[Dict[Any, int]]] = {}
+        rows: List[Dict[str, Any]] = []
         for column in self._columns:
             counts = df[column].value_counts(dropna=False)
             keys = counts.index.to_pandas().tolist()
             vals = counts.to_pandas().tolist()
-            result[column] = [dict(zip(keys, (int(v) for v in vals)))]
-        return pd.DataFrame(result)
+            rows.extend(
+                {"column": column, "value": key, "count": int(value)}
+                for key, value in zip(keys, vals)
+                if not _is_missing_value(key) and not _is_missing_value(value)
+            )
+        return pd.DataFrame(rows, columns=["column", "value", "count"])
 
 
 @DeveloperAPI
@@ -306,7 +323,13 @@ class GPUChain(SerializablePreprocessorBase):
                     f"{type(preprocessor)!r}."
                 )
             if preprocessor.fit_status() != Preprocessor.FitStatus.NOT_FITTABLE:
-                preprocessor._fit_gpu(ds, _required_prefix(preprocessor, prefix))
+                original_concurrency = preprocessor._concurrency
+                if original_concurrency is None and self._concurrency is not None:
+                    preprocessor._concurrency = self._concurrency
+                try:
+                    preprocessor._fit_gpu(ds, _required_prefix(preprocessor, prefix))
+                finally:
+                    preprocessor._concurrency = original_concurrency
                 preprocessor._fitted = True
             prefix.append(preprocessor)
         return self
@@ -341,8 +364,11 @@ class GPUChain(SerializablePreprocessorBase):
             **kwargs,
         )
 
-    def _transform_batch(self, df: Any) -> Any:
+    def transform_cudf(self, df: Any) -> Any:
         return _apply_gpu_ops(df, self._preprocessors)
+
+    def _transform_batch(self, df: Any) -> Any:
+        return self.transform_cudf(df)
 
     def __repr__(self) -> str:
         arguments = ", ".join(repr(p) for p in self._preprocessors)
@@ -366,9 +392,7 @@ class GPUChain(SerializablePreprocessorBase):
 
 
 @PublicAPI(stability="alpha")
-@SerializablePreprocessor(
-    version=1, identifier="io.ray.preprocessors.gpu_text_stats"
-)
+@SerializablePreprocessor(version=1, identifier="io.ray.preprocessors.gpu_text_stats")
 class GPUTextStatsPreprocessor(GPUPreprocessor):
     """Append GPU-computed text count features for string columns."""
 
@@ -397,15 +421,15 @@ class GPUTextStatsPreprocessor(GPUPreprocessor):
         text = df[self._text_column].fillna("").astype("str")
         text_lower = text.str.lower()
 
-        df["word_count"] = _str_count(text, self._word_pattern).fillna(0).astype(
-            "int64"
+        df["word_count"] = (
+            _str_count(text, self._word_pattern).fillna(0).astype("int64")
         )
         newline_count = _str_count(text, r"\n").fillna(0).astype("int64")
         non_empty = text.str.len().fillna(0) > 0
         df["line_count"] = (newline_count + 1).where(non_empty, 0).astype("int64")
-        df["tokenizer_token_count"] = _str_count(
-            text_lower, self._token_pattern
-        ).fillna(0).astype("int64")
+        df["tokenizer_token_count"] = (
+            _str_count(text_lower, self._token_pattern).fillna(0).astype("int64")
+        )
         return df
 
     def get_input_columns(self) -> List[str]:
@@ -471,6 +495,10 @@ class GPUStandardScaler(GPUPreprocessor):
     def _fit_gpu(
         self, dataset: "Dataset", prefix: Sequence[GPUPreprocessor]
     ) -> "GPUStandardScaler":
+        kwargs: Dict[str, Any] = {}
+        if self._concurrency is not None:
+            kwargs["concurrency"] = self._concurrency
+
         partials = dataset.map_batches(
             _GPUStandardScalerStatsUDF,
             fn_constructor_args=(self._columns, tuple(prefix)),
@@ -479,6 +507,7 @@ class GPUStandardScaler(GPUPreprocessor):
             num_gpus=self._num_gpus_per_worker,
             zero_copy_batch=True,
             udf_modifying_row_count=True,
+            **kwargs,
         )
         counts = {column: 0 for column in self._columns}
         sums = {column: 0.0 for column in self._columns}
@@ -597,6 +626,10 @@ class GPUOneHotEncoder(GPUPreprocessor):
     def _fit_gpu(
         self, dataset: "Dataset", prefix: Sequence[GPUPreprocessor]
     ) -> "GPUOneHotEncoder":
+        kwargs: Dict[str, Any] = {}
+        if self._concurrency is not None:
+            kwargs["concurrency"] = self._concurrency
+
         counts_ds = dataset.map_batches(
             _GPUValueCountsUDF,
             fn_constructor_args=(self._columns, tuple(prefix)),
@@ -605,14 +638,20 @@ class GPUOneHotEncoder(GPUPreprocessor):
             num_gpus=self._num_gpus_per_worker,
             zero_copy_batch=True,
             udf_modifying_row_count=True,
+            **kwargs,
         )
         counters: Dict[str, Counter] = {column: Counter() for column in self._columns}
         for batch in counts_ds.iter_batches(batch_size=None, batch_format="pandas"):
-            for column in self._columns:
-                for value_counts in batch[column]:
-                    counters[column].update(
-                        {k: int(v) for k, v in value_counts.items() if k is not None}
-                    )
+            if batch.empty:
+                continue
+            for column, value, count in batch[["column", "value", "count"]].itertuples(
+                index=False, name=None
+            ):
+                if column not in counters:
+                    continue
+                if _is_missing_value(value) or _is_missing_value(count):
+                    continue
+                counters[column][value] += int(count)
 
         self.stats_ = {}
         for column in self._columns:
@@ -642,9 +681,10 @@ class GPUOneHotEncoder(GPUPreprocessor):
                     f"Unable to transform column {input_col!r} because it contains "
                     "null values. Consider imputing missing values first."
                 )
-            mapping = self._gpu_maps.get(input_col) or self.stats_[
-                f"unique_values({input_col})"
-            ]
+            mapping = (
+                self._gpu_maps.get(input_col)
+                or self.stats_[f"unique_values({input_col})"]
+            )
             num_categories = len(mapping)
             codes = df[input_col].map(mapping).fillna(-1).astype("int32")
             codes_gpu = codes.to_cupy()
@@ -654,9 +694,7 @@ class GPUOneHotEncoder(GPUPreprocessor):
                 valid = codes_gpu >= 0
                 one_hot[rows[valid], codes_gpu[valid]] = 1
             for idx in range(num_categories):
-                df[f"{output_col}_{idx}"] = cudf.Series(
-                    one_hot[:, idx], index=df.index
-                )
+                df[f"{output_col}_{idx}"] = cudf.Series(one_hot[:, idx], index=df.index)
             if output_col == input_col and input_col in df.columns:
                 df = df.drop(columns=[input_col])
         return df
