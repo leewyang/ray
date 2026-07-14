@@ -1,6 +1,7 @@
 import math
+import pickle
 from collections import Counter
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -21,7 +22,8 @@ if TYPE_CHECKING:
 _DEFAULT_GPU_BATCH_SIZE = 4096
 _DEFAULT_WORD_PATTERN = r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?"
 _DEFAULT_TOKEN_PATTERN = r"[A-Za-z]+|[0-9]+|[^A-Za-z0-9\s]"
-_COMBINED_FIT_COLUMNS = ["kind", "column", "value", "count", "sum", "sum_sq"]
+_COMBINED_FIT_INDEX_COLUMN = "__preprocessor_index"
+_COMBINED_FIT_STATS_COLUMN = "__fit_stats"
 
 
 def _import_cudf():
@@ -94,6 +96,80 @@ def _copy_for_gpu_transform(batch: Any):
     return batch.copy(deep=False) if hasattr(batch, "copy") else batch
 
 
+def _serialize_pandas_fit_stats(stats: pd.DataFrame) -> bytes:
+    return pickle.dumps(stats, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _deserialize_pandas_fit_stats(payload: Any) -> pd.DataFrame:
+    if isinstance(payload, memoryview):
+        payload = payload.tobytes()
+    return pickle.loads(payload)
+
+
+class _GPUTransformContext:
+    """Cache derived cuDF columns within a fused GPU transform batch.
+
+    GPU preprocessors in a fused chain often reuse intermediate string and token
+    representations. This context memoizes those intermediates for one batch and
+    invalidates cache entries when a preprocessor modifies their source columns.
+    """
+
+    def __init__(self) -> None:
+        self._cache: Dict[Tuple[Any, ...], Any] = {}
+        self._dependencies: Dict[Tuple[Any, ...], set[str]] = {}
+
+    def get_or_compute(
+        self,
+        key: Tuple[Any, ...],
+        dependencies: Sequence[str],
+        compute: Callable[[], Any],
+    ) -> Any:
+        if key not in self._cache:
+            self._cache[key] = compute()
+            self._dependencies[key] = set(dependencies)
+        return self._cache[key]
+
+    def invalidate_columns(self, columns: Sequence[str]) -> None:
+        modified = set(columns)
+        if not modified:
+            return
+        stale_keys = [
+            key
+            for key, dependencies in self._dependencies.items()
+            if dependencies.intersection(modified)
+        ]
+        for key in stale_keys:
+            self._cache.pop(key, None)
+            self._dependencies.pop(key, None)
+
+    def string_column(self, df: Any, column: str) -> Any:
+        return self.get_or_compute(
+            ("string_column", column),
+            (column,),
+            lambda: df[column].fillna("").astype("str"),
+        )
+
+    def lowercase_string_column(self, df: Any, column: str) -> Any:
+        return self.get_or_compute(
+            ("lowercase_string_column", column),
+            (column,),
+            lambda: self.string_column(df, column).str.lower(),
+        )
+
+    def tokenized_text(self, df: Any, column: str, pattern: str) -> Tuple[Any, Any]:
+        def compute() -> Tuple[Any, Any]:
+            text_lower = self.lowercase_string_column(df, column)
+            tokens = text_lower.str.findall(pattern)
+            lengths = _list_lengths(tokens).fillna(0).astype("int32")
+            return tokens, lengths
+
+        return self.get_or_compute(
+            ("tokenized_text", column, pattern),
+            (column,),
+            compute,
+        )
+
+
 def _append_hashing_columns_from_tokens(
     df: Any,
     tokens: Any,
@@ -122,102 +198,15 @@ def _append_hashing_columns_from_tokens(
     return df
 
 
-def _transform_text_stats_and_hashing_cudf(
-    df: Any,
-    text_stats: "GPUTextStatsPreprocessor",
-    hashing: "GPUHashingVectorizer",
-) -> Any:
-    text = df[text_stats._text_column].fillna("").astype("str")
-    text_lower = text.str.lower()
-    tokens = text_lower.str.findall(text_stats._token_pattern)
-    lengths = _list_lengths(tokens).fillna(0).astype("int32")
-
-    df["word_count"] = (
-        _str_count(text, text_stats._word_pattern).fillna(0).astype("int64")
-    )
-    newline_count = _str_count(text, r"\n").fillna(0).astype("int64")
-    non_empty = text.str.len().fillna(0) > 0
-    df["line_count"] = (newline_count + 1).where(non_empty, 0).astype("int64")
-    df["tokenizer_token_count"] = lengths.astype("int64")
-    return _append_hashing_columns_from_tokens(
-        df,
-        tokens,
-        lengths,
-        hashing._output_columns[0],
-        hashing._num_features,
-    )
-
-
-def _find_fusible_hashing_vectorizer(
-    preprocessors: Sequence["GPUPreprocessor"],
-    start_index: int,
-    text_stats: "GPUTextStatsPreprocessor",
-) -> Tuple[Optional[int], Optional["GPUHashingVectorizer"]]:
-    text_column = text_stats._text_column
-    for idx in range(start_index + 1, len(preprocessors)):
-        candidate = preprocessors[idx]
-        if not isinstance(candidate, GPUHashingVectorizer):
-            continue
-        if len(candidate._columns) != 1 or len(candidate._output_columns) != 1:
-            continue
-        input_col = candidate._columns[0]
-        output_col = candidate._output_columns[0]
-        if input_col != text_column:
-            continue
-        if output_col == input_col:
-            continue
-        if candidate._token_pattern != text_stats._token_pattern:
-            continue
-
-        hash_outputs = {
-            f"{output_col}_{feature_idx}"
-            for feature_idx in range(candidate._num_features)
-        }
-        safe_to_move = True
-        for intermediate in preprocessors[start_index + 1 : idx]:
-            if text_column in intermediate.get_output_columns():
-                safe_to_move = False
-                break
-            if isinstance(intermediate, GPUColumnDropper) and (
-                text_column in intermediate._columns
-            ):
-                safe_to_move = False
-                break
-            if hash_outputs.intersection(intermediate.get_input_columns()):
-                safe_to_move = False
-                break
-            if hash_outputs.intersection(intermediate.get_output_columns()):
-                safe_to_move = False
-                break
-        if safe_to_move:
-            return idx, candidate
-    return None, None
-
-
 def _apply_gpu_ops(batch: Any, preprocessors: Sequence["GPUPreprocessor"]):
     df = _copy_for_gpu_transform(batch)
-    skipped: set[int] = set()
-    for idx, preprocessor in enumerate(preprocessors):
-        if idx in skipped:
-            continue
+    context = _GPUTransformContext()
+    for preprocessor in preprocessors:
         preprocessor._prepare_gpu_state()
-        used_fusion = False
-        result = None
-        if isinstance(preprocessor, GPUTextStatsPreprocessor):
-            hash_idx, hashing = _find_fusible_hashing_vectorizer(
-                preprocessors, idx, preprocessor
-            )
-            if hashing is not None and hash_idx is not None:
-                hashing._prepare_gpu_state()
-                result = _transform_text_stats_and_hashing_cudf(
-                    df, preprocessor, hashing
-                )
-                skipped.add(hash_idx)
-                used_fusion = True
-        if not used_fusion:
-            result = preprocessor._transform_cudf(df)
+        result = preprocessor._transform_cudf_with_context(df, context)
         if result is not None:
             df = result
+        context.invalidate_columns(preprocessor._gpu_modified_columns())
     return df
 
 
@@ -250,122 +239,78 @@ class _SingleGPUPreprocessorUDF(_FusedGPUChainUDF):
         super().__init__((preprocessor,))
 
 
-class _GPUStandardScalerStatsUDF:
-    def __init__(
-        self, columns: Sequence[str], prefix: Sequence["GPUPreprocessor"]
-    ) -> None:
-        self._columns = tuple(columns)
-        self._prefix = tuple(prefix)
-        for preprocessor in self._prefix:
-            preprocessor._prepare_gpu_state()
-
-    def __call__(self, batch: Any) -> pd.DataFrame:
-        df = _apply_gpu_ops(batch, self._prefix)
-        values: Dict[str, List[float]] = {}
-        for column in self._columns:
-            col = df[column].astype("float64")
-            valid = col.dropna()
-            count = int(valid.count())
-            if count:
-                col_sum = float(valid.sum())
-                col_sum_sq = float((valid * valid).sum())
-            else:
-                col_sum = 0.0
-                col_sum_sq = 0.0
-            values[f"count({column})"] = [count]
-            values[f"sum({column})"] = [col_sum]
-            values[f"sum_sq({column})"] = [col_sum_sq]
-        return pd.DataFrame(values)
-
-
-class _GPUValueCountsUDF:
-    def __init__(
-        self, columns: Sequence[str], prefix: Sequence["GPUPreprocessor"]
-    ) -> None:
-        self._columns = tuple(columns)
-        self._prefix = tuple(prefix)
-        for preprocessor in self._prefix:
-            preprocessor._prepare_gpu_state()
-
-    def __call__(self, batch: Any) -> pd.DataFrame:
-        df = _apply_gpu_ops(batch, self._prefix)
-        rows: List[Dict[str, Any]] = []
-        for column in self._columns:
-            counts = df[column].value_counts(dropna=False)
-            keys = counts.index.to_pandas().tolist()
-            vals = counts.to_pandas().tolist()
-            rows.extend(
-                {"column": column, "value": key, "count": int(value)}
-                for key, value in zip(keys, vals)
-                if not _is_missing_value(key) and not _is_missing_value(value)
-            )
-        return pd.DataFrame(rows, columns=["column", "value", "count"])
-
-
-class _GPUCombinedFitStatsUDF:
+class _GPUFitStatsUDF:
     def __init__(
         self,
-        scaler_columns: Sequence[str],
-        scaler_prefix: Sequence["GPUPreprocessor"],
-        encoder_columns: Sequence[str],
-        encoder_prefix: Sequence["GPUPreprocessor"],
+        fit_entries: Sequence[
+            Tuple[int, "GPUPreprocessor", Sequence["GPUPreprocessor"]]
+        ],
     ) -> None:
-        self._scaler_columns = tuple(scaler_columns)
-        self._scaler_prefix = tuple(scaler_prefix)
-        self._encoder_columns = tuple(encoder_columns)
-        self._encoder_prefix = tuple(encoder_prefix)
-        for preprocessor in self._scaler_prefix + self._encoder_prefix:
-            preprocessor._prepare_gpu_state()
+        self._fit_entries = tuple(
+            (index, preprocessor, tuple(prefix))
+            for index, preprocessor, prefix in fit_entries
+        )
+        for _, _, prefix in self._fit_entries:
+            for prefix_preprocessor in prefix:
+                prefix_preprocessor._prepare_gpu_state()
 
     def __call__(self, batch: Any) -> pd.DataFrame:
+        prefix_cache: Dict[Tuple["GPUPreprocessor", ...], Any] = {}
         rows: List[Dict[str, Any]] = []
-        scaler_df = None
-        if self._scaler_columns:
-            scaler_df = _apply_gpu_ops(batch, self._scaler_prefix)
-            for column in self._scaler_columns:
-                col = scaler_df[column].astype("float64")
-                valid = col.dropna()
-                count = int(valid.count())
-                if count:
-                    col_sum = float(valid.sum())
-                    col_sum_sq = float((valid * valid).sum())
-                else:
-                    col_sum = 0.0
-                    col_sum_sq = 0.0
-                rows.append(
-                    {
-                        "kind": "numeric",
-                        "column": column,
-                        "value": None,
-                        "count": count,
-                        "sum": col_sum,
-                        "sum_sq": col_sum_sq,
-                    }
-                )
+        for index, preprocessor, prefix in self._fit_entries:
+            if prefix not in prefix_cache:
+                prefix_cache[prefix] = _apply_gpu_ops(batch, prefix)
+            stats = preprocessor._gpu_fit_stats_cudf(prefix_cache[prefix])
+            if stats.empty:
+                continue
+            rows.append(
+                {
+                    _COMBINED_FIT_INDEX_COLUMN: index,
+                    _COMBINED_FIT_STATS_COLUMN: _serialize_pandas_fit_stats(stats),
+                }
+            )
 
-        if self._encoder_columns:
-            if scaler_df is not None and self._encoder_prefix == self._scaler_prefix:
-                encoder_df = scaler_df
-            else:
-                encoder_df = _apply_gpu_ops(batch, self._encoder_prefix)
-            for column in self._encoder_columns:
-                counts = encoder_df[column].value_counts(dropna=False)
-                keys = counts.index.to_pandas().tolist()
-                vals = counts.to_pandas().tolist()
-                rows.extend(
-                    {
-                        "kind": "categorical",
-                        "column": column,
-                        "value": key,
-                        "count": int(value),
-                        "sum": 0.0,
-                        "sum_sq": 0.0,
-                    }
-                    for key, value in zip(keys, vals)
-                    if not _is_missing_value(key) and not _is_missing_value(value)
-                )
+        return pd.DataFrame(
+            rows, columns=[_COMBINED_FIT_INDEX_COLUMN, _COMBINED_FIT_STATS_COLUMN]
+        )
 
-        return pd.DataFrame(rows, columns=_COMBINED_FIT_COLUMNS)
+
+def _fit_gpu_with_stats_udf(
+    preprocessor: "GPUPreprocessor",
+    dataset: "Dataset",
+    prefix: Sequence["GPUPreprocessor"],
+) -> "GPUPreprocessor":
+    kwargs: Dict[str, Any] = {}
+    if preprocessor._concurrency is not None:
+        kwargs["concurrency"] = preprocessor._concurrency
+
+    partials = dataset.map_batches(
+        _GPUFitStatsUDF,
+        fn_constructor_args=(((0, preprocessor, tuple(prefix)),),),
+        batch_format="cudf",
+        batch_size=preprocessor._batch_size,
+        num_gpus=preprocessor._num_gpus_per_worker,
+        zero_copy_batch=True,
+        udf_modifying_row_count=True,
+        **kwargs,
+    )
+
+    partial_batches: List[pd.DataFrame] = []
+    for batch in partials.iter_batches(batch_size=None, batch_format="pandas"):
+        if batch.empty or _COMBINED_FIT_STATS_COLUMN not in batch:
+            continue
+        for index, payload in batch[
+            [_COMBINED_FIT_INDEX_COLUMN, _COMBINED_FIT_STATS_COLUMN]
+        ].itertuples(index=False, name=None):
+            if int(index) != 0:
+                continue
+            partial_batches.append(_deserialize_pandas_fit_stats(payload))
+    if partial_batches:
+        stats = pd.concat(partial_batches, ignore_index=True, sort=False)
+    else:
+        stats = pd.DataFrame()
+    preprocessor._finalize_gpu_fit_stats(stats)
+    return preprocessor
 
 
 @DeveloperAPI
@@ -398,6 +343,23 @@ class GPUPreprocessor(SerializablePreprocessorBase):
         pass
 
     def _transform_cudf(self, df: Any) -> Any:
+        raise NotImplementedError
+
+    def _transform_cudf_with_context(
+        self, df: Any, context: _GPUTransformContext
+    ) -> Any:
+        return self._transform_cudf(df)
+
+    def _gpu_modified_columns(self) -> List[str]:
+        return self.get_output_columns()
+
+    def _supports_gpu_combined_fit(self) -> bool:
+        return False
+
+    def _gpu_fit_stats_cudf(self, df: Any) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def _finalize_gpu_fit_stats(self, partials: pd.DataFrame) -> None:
         raise NotImplementedError
 
     def _transform(
@@ -500,32 +462,24 @@ class GPUChain(SerializablePreprocessorBase):
 
     def _fit_combined(self, ds: "Dataset") -> bool:
         prefix: List[GPUPreprocessor] = []
-        scaler_entry = None
-        encoder_entry = None
+        fit_entries: List[Tuple[int, GPUPreprocessor, Tuple[GPUPreprocessor, ...]]] = []
 
-        for preprocessor in self._preprocessors:
+        for index, preprocessor in enumerate(self._preprocessors):
             if preprocessor.fit_status() != Preprocessor.FitStatus.NOT_FITTABLE:
-                required_prefix = tuple(_required_prefix(preprocessor, prefix))
-                if isinstance(preprocessor, GPUStandardScaler) and scaler_entry is None:
-                    scaler_entry = (preprocessor, required_prefix)
-                elif (
-                    isinstance(preprocessor, GPUOneHotEncoder) and encoder_entry is None
-                ):
-                    encoder_entry = (preprocessor, required_prefix)
-                else:
+                if not preprocessor._supports_gpu_combined_fit():
                     return False
+                required_prefix = tuple(_required_prefix(preprocessor, prefix))
+                fit_entries.append((index, preprocessor, required_prefix))
             prefix.append(preprocessor)
 
-        if scaler_entry is None or encoder_entry is None:
+        if len(fit_entries) < 2:
             return False
 
-        scaler, scaler_prefix = scaler_entry
-        encoder, encoder_prefix = encoder_entry
-
-        fittable_preprocessors = {scaler, encoder}
+        fittable_preprocessors = {preprocessor for _, preprocessor, _ in fit_entries}
         if any(
             preprocessor in fittable_preprocessors
-            for preprocessor in scaler_prefix + encoder_prefix
+            for _, _, required_prefix in fit_entries
+            for preprocessor in required_prefix
         ):
             return False
 
@@ -534,13 +488,8 @@ class GPUChain(SerializablePreprocessorBase):
             kwargs["concurrency"] = self._concurrency
 
         partials = ds.map_batches(
-            _GPUCombinedFitStatsUDF,
-            fn_constructor_args=(
-                tuple(scaler.columns),
-                scaler_prefix,
-                tuple(encoder.columns),
-                encoder_prefix,
-            ),
+            _GPUFitStatsUDF,
+            fn_constructor_args=(tuple(fit_entries),),
             batch_format="cudf",
             batch_size=self._batch_size,
             num_gpus=self._num_gpus_per_worker,
@@ -549,65 +498,29 @@ class GPUChain(SerializablePreprocessorBase):
             **kwargs,
         )
 
-        counts = {column: 0 for column in scaler.columns}
-        sums = {column: 0.0 for column in scaler.columns}
-        sum_sqs = {column: 0.0 for column in scaler.columns}
-        counters: Dict[str, Counter] = {column: Counter() for column in encoder.columns}
+        partial_batches: Dict[int, List[pd.DataFrame]] = {
+            index: [] for index, _, _ in fit_entries
+        }
 
         for batch in partials.iter_batches(batch_size=None, batch_format="pandas"):
-            if batch.empty:
+            if batch.empty or _COMBINED_FIT_STATS_COLUMN not in batch:
                 continue
-
-            numeric_rows = batch[batch["kind"] == "numeric"]
-            for column, count, col_sum, col_sum_sq in numeric_rows[
-                ["column", "count", "sum", "sum_sq"]
+            for index, payload in batch[
+                [_COMBINED_FIT_INDEX_COLUMN, _COMBINED_FIT_STATS_COLUMN]
             ].itertuples(index=False, name=None):
-                if column not in counts:
+                index = int(index)
+                if index not in partial_batches:
                     continue
-                if _is_missing_value(count):
-                    continue
-                counts[column] += int(count)
-                sums[column] += float(col_sum)
-                sum_sqs[column] += float(col_sum_sq)
+                partial_batches[index].append(_deserialize_pandas_fit_stats(payload))
 
-            categorical_rows = batch[batch["kind"] == "categorical"]
-            for column, value, count in categorical_rows[
-                ["column", "value", "count"]
-            ].itertuples(index=False, name=None):
-                if column not in counters:
-                    continue
-                if _is_missing_value(value) or _is_missing_value(count):
-                    continue
-                counters[column][value] += int(count)
-
-        scaler.stats_ = {}
-        for column in scaler.columns:
-            count = counts[column]
-            if count == 0:
-                scaler.stats_[f"mean({column})"] = None
-                scaler.stats_[f"std({column})"] = None
-                continue
-            mean = sums[column] / count
-            variance = max((sum_sqs[column] / count) - (mean * mean), 0.0)
-            scaler.stats_[f"mean({column})"] = mean
-            scaler.stats_[f"std({column})"] = math.sqrt(variance)
-
-        encoder.stats_ = {}
-        for column in encoder.columns:
-            counter = counters[column]
-            if column in encoder._max_categories:
-                values = list(
-                    dict(counter.most_common(encoder._max_categories[column]))
-                )
+        for index, preprocessor, _ in fit_entries:
+            preprocessor_partials = partial_batches[index]
+            if preprocessor_partials:
+                stats = pd.concat(preprocessor_partials, ignore_index=True, sort=False)
             else:
-                values = list(counter.keys())
-            encoder.stats_[f"unique_values({column})"] = {
-                value: index for index, value in enumerate(sorted(values))
-            }
-        encoder._gpu_maps = {}
-
-        scaler._fitted = True
-        encoder._fitted = True
+                stats = pd.DataFrame()
+            preprocessor._finalize_gpu_fit_stats(stats)
+            preprocessor._fitted = True
         return True
 
     def _fit(self, ds: "Dataset") -> "GPUChain":
@@ -719,18 +632,22 @@ class GPUTextStatsPreprocessor(GPUPreprocessor):
         self._token_pattern = token_pattern
 
     def _transform_cudf(self, df: Any) -> Any:
-        text = df[self._text_column].fillna("").astype("str")
-        text_lower = text.str.lower()
+        return self._transform_cudf_with_context(df, _GPUTransformContext())
 
+    def _transform_cudf_with_context(
+        self, df: Any, context: _GPUTransformContext
+    ) -> Any:
+        text = context.string_column(df, self._text_column)
+        _, token_lengths = context.tokenized_text(
+            df, self._text_column, self._token_pattern
+        )
         df["word_count"] = (
             _str_count(text, self._word_pattern).fillna(0).astype("int64")
         )
         newline_count = _str_count(text, r"\n").fillna(0).astype("int64")
         non_empty = text.str.len().fillna(0) > 0
         df["line_count"] = (newline_count + 1).where(non_empty, 0).astype("int64")
-        df["tokenizer_token_count"] = (
-            _str_count(text_lower, self._token_pattern).fillna(0).astype("int64")
-        )
+        df["tokenizer_token_count"] = token_lengths.astype("int64")
         return df
 
     def get_input_columns(self) -> List[str]:
@@ -793,31 +710,46 @@ class GPUStandardScaler(GPUPreprocessor):
     def output_columns(self) -> List[str]:
         return self._output_columns
 
-    def _fit_gpu(
-        self, dataset: "Dataset", prefix: Sequence[GPUPreprocessor]
-    ) -> "GPUStandardScaler":
-        kwargs: Dict[str, Any] = {}
-        if self._concurrency is not None:
-            kwargs["concurrency"] = self._concurrency
+    def _supports_gpu_combined_fit(self) -> bool:
+        return True
 
-        partials = dataset.map_batches(
-            _GPUStandardScalerStatsUDF,
-            fn_constructor_args=(self._columns, tuple(prefix)),
-            batch_format="cudf",
-            batch_size=self._batch_size,
-            num_gpus=self._num_gpus_per_worker,
-            zero_copy_batch=True,
-            udf_modifying_row_count=True,
-            **kwargs,
-        )
+    def _gpu_fit_stats_cudf(self, df: Any) -> pd.DataFrame:
+        rows: List[Dict[str, Any]] = []
+        for column in self._columns:
+            col = df[column].astype("float64")
+            valid = col.dropna()
+            count = int(valid.count())
+            if count:
+                col_sum = float(valid.sum())
+                col_sum_sq = float((valid * valid).sum())
+            else:
+                col_sum = 0.0
+                col_sum_sq = 0.0
+            rows.append(
+                {
+                    "column": column,
+                    "count": count,
+                    "sum": col_sum,
+                    "sum_sq": col_sum_sq,
+                }
+            )
+        return pd.DataFrame(rows, columns=["column", "count", "sum", "sum_sq"])
+
+    def _finalize_gpu_fit_stats(self, partials: pd.DataFrame) -> None:
         counts = {column: 0 for column in self._columns}
         sums = {column: 0.0 for column in self._columns}
         sum_sqs = {column: 0.0 for column in self._columns}
-        for batch in partials.iter_batches(batch_size=None, batch_format="pandas"):
-            for column in self._columns:
-                counts[column] += int(batch[f"count({column})"].sum())
-                sums[column] += float(batch[f"sum({column})"].sum())
-                sum_sqs[column] += float(batch[f"sum_sq({column})"].sum())
+        if not partials.empty:
+            for column, count, col_sum, col_sum_sq in partials[
+                ["column", "count", "sum", "sum_sq"]
+            ].itertuples(index=False, name=None):
+                if column not in counts:
+                    continue
+                if _is_missing_value(count):
+                    continue
+                counts[column] += int(count)
+                sums[column] += float(col_sum)
+                sum_sqs[column] += float(col_sum_sq)
 
         self.stats_ = {}
         for column in self._columns:
@@ -830,7 +762,11 @@ class GPUStandardScaler(GPUPreprocessor):
             variance = max((sum_sqs[column] / count) - (mean * mean), 0.0)
             self.stats_[f"mean({column})"] = mean
             self.stats_[f"std({column})"] = math.sqrt(variance)
-        return self
+
+    def _fit_gpu(
+        self, dataset: "Dataset", prefix: Sequence[GPUPreprocessor]
+    ) -> "GPUStandardScaler":
+        return _fit_gpu_with_stats_udf(self, dataset, prefix)
 
     def _transform_cudf(self, df: Any) -> Any:
         cudf = _import_cudf()
@@ -924,30 +860,28 @@ class GPUOneHotEncoder(GPUPreprocessor):
     def output_columns(self) -> List[str]:
         return self._output_columns
 
-    def _fit_gpu(
-        self, dataset: "Dataset", prefix: Sequence[GPUPreprocessor]
-    ) -> "GPUOneHotEncoder":
-        kwargs: Dict[str, Any] = {}
-        if self._concurrency is not None:
-            kwargs["concurrency"] = self._concurrency
+    def _supports_gpu_combined_fit(self) -> bool:
+        return True
 
-        counts_ds = dataset.map_batches(
-            _GPUValueCountsUDF,
-            fn_constructor_args=(self._columns, tuple(prefix)),
-            batch_format="cudf",
-            batch_size=self._batch_size,
-            num_gpus=self._num_gpus_per_worker,
-            zero_copy_batch=True,
-            udf_modifying_row_count=True,
-            **kwargs,
-        )
+    def _gpu_fit_stats_cudf(self, df: Any) -> pd.DataFrame:
+        rows: List[Dict[str, Any]] = []
+        for column in self._columns:
+            counts = df[column].value_counts(dropna=False)
+            keys = counts.index.to_pandas().tolist()
+            vals = counts.to_pandas().tolist()
+            rows.extend(
+                {"column": column, "value": key, "count": int(value)}
+                for key, value in zip(keys, vals)
+                if not _is_missing_value(key) and not _is_missing_value(value)
+            )
+        return pd.DataFrame(rows, columns=["column", "value", "count"])
+
+    def _finalize_gpu_fit_stats(self, partials: pd.DataFrame) -> None:
         counters: Dict[str, Counter] = {column: Counter() for column in self._columns}
-        for batch in counts_ds.iter_batches(batch_size=None, batch_format="pandas"):
-            if batch.empty:
-                continue
-            for column, value, count in batch[["column", "value", "count"]].itertuples(
-                index=False, name=None
-            ):
+        if not partials.empty:
+            for column, value, count in partials[
+                ["column", "value", "count"]
+            ].itertuples(index=False, name=None):
                 if column not in counters:
                     continue
                 if _is_missing_value(value) or _is_missing_value(count):
@@ -965,7 +899,11 @@ class GPUOneHotEncoder(GPUPreprocessor):
                 value: index for index, value in enumerate(sorted(values))
             }
         self._gpu_maps = {}
-        return self
+
+    def _fit_gpu(
+        self, dataset: "Dataset", prefix: Sequence[GPUPreprocessor]
+    ) -> "GPUOneHotEncoder":
+        return _fit_gpu_with_stats_udf(self, dataset, prefix)
 
     def _prepare_gpu_state(self) -> None:
         self._gpu_maps = {
@@ -1012,6 +950,15 @@ class GPUOneHotEncoder(GPUPreprocessor):
             else:
                 outputs.extend(f"{output_col}_{idx}" for idx in range(len(mapping)))
         return outputs
+
+    def _gpu_modified_columns(self) -> List[str]:
+        modified = self.get_output_columns()
+        modified.extend(
+            input_col
+            for input_col, output_col in zip(self._columns, self._output_columns)
+            if input_col == output_col
+        )
+        return modified
 
     def _get_serializable_fields(self) -> Dict[str, Any]:
         return {
@@ -1070,16 +1017,28 @@ class GPUHashingVectorizer(GPUPreprocessor):
         )
 
     def _transform_cudf(self, df: Any) -> Any:
+        return self._transform_cudf_with_context(df, _GPUTransformContext())
+
+    def _transform_cudf_with_context(
+        self, df: Any, context: _GPUTransformContext
+    ) -> Any:
         for input_col, output_col in zip(self._columns, self._output_columns):
-            text = df[input_col].fillna("").astype("str").str.lower()
-            tokens = text.str.findall(self._token_pattern)
-            lengths = _list_lengths(tokens).fillna(0).astype("int32")
+            tokens, lengths = context.tokenized_text(df, input_col, self._token_pattern)
             df = _append_hashing_columns_from_tokens(
                 df, tokens, lengths, output_col, self._num_features
             )
             if output_col == input_col and input_col in df.columns:
                 df = df.drop(columns=[input_col])
         return df
+
+    def _gpu_modified_columns(self) -> List[str]:
+        modified = self.get_output_columns()
+        modified.extend(
+            input_col
+            for input_col, output_col in zip(self._columns, self._output_columns)
+            if input_col == output_col
+        )
+        return modified
 
     def get_input_columns(self) -> List[str]:
         return list(self._columns)
@@ -1150,6 +1109,9 @@ class GPUColumnDropper(GPUPreprocessor):
 
     def get_output_columns(self) -> List[str]:
         return []
+
+    def _gpu_modified_columns(self) -> List[str]:
+        return list(self._columns)
 
     def _get_serializable_fields(self) -> Dict[str, Any]:
         return {**self._base_serializable_fields(), "columns": self._columns}
