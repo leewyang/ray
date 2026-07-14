@@ -107,10 +107,10 @@ def _deserialize_pandas_fit_stats(payload: Any) -> pd.DataFrame:
 
 
 class _GPUTransformContext:
-    """Cache derived cuDF columns within a fused GPU transform batch.
+    """Shared state for a fused GPU transform batch.
 
     GPU preprocessors in a fused chain often reuse intermediate string and token
-    representations. This context memoizes those intermediates for one batch and
+    representations. The context memoizes those intermediates for one batch and
     invalidates cache entries when a preprocessor modifies their source columns.
     """
 
@@ -203,7 +203,7 @@ def _apply_gpu_ops(batch: Any, preprocessors: Sequence["GPUPreprocessor"]):
     context = _GPUTransformContext()
     for preprocessor in preprocessors:
         preprocessor._prepare_gpu_state()
-        result = preprocessor._transform_cudf_with_context(df, context)
+        result = preprocessor._transform_cudf(df, context)
         if result is not None:
             df = result
         context.invalidate_columns(preprocessor._gpu_modified_columns())
@@ -315,7 +315,14 @@ def _fit_gpu_with_stats_udf(
 
 @DeveloperAPI
 class GPUPreprocessor(SerializablePreprocessorBase):
-    """Base class for preprocessors that transform cuDF batches on GPU."""
+    """Base class for preprocessors that transform cuDF batches on GPU.
+
+    Args:
+        batch_size: Number of rows per cuDF batch during fit and transform.
+        num_gpus_per_worker: GPUs allocated to each ``map_batches`` worker.
+        concurrency: Maximum number of concurrent GPU workers. If ``None``,
+            Ray Data chooses concurrency automatically.
+    """
 
     _is_fittable = False
 
@@ -332,34 +339,97 @@ class GPUPreprocessor(SerializablePreprocessorBase):
         self._concurrency = concurrency
 
     def _fit(self, dataset: "Dataset") -> "GPUPreprocessor":
+        """Fit this preprocessor on a dataset.
+
+        Subclasses should override :meth:`_fit_gpu` instead of this method.
+        """
         return self._fit_gpu(dataset, ())
 
     def _fit_gpu(
         self, dataset: "Dataset", prefix: Sequence["GPUPreprocessor"]
     ) -> "GPUPreprocessor":
+        """Fit this preprocessor on GPU, optionally after a prefix chain.
+
+        When fitting inside a :class:`GPUChain`, ``prefix`` contains the
+        preprocessors that must run on each batch before this one computes fit
+        statistics.
+
+        Args:
+            dataset: The dataset to fit on.
+            prefix: Preprocessors that transform each batch before fitting.
+
+        Returns:
+            This fitted preprocessor.
+        """
         return self
 
     def _prepare_gpu_state(self) -> None:
+        """Prepare per-worker GPU state before fit or transform.
+
+        Called once when a ``map_batches`` worker is constructed. Subclasses
+        can override this to load fit statistics or other state onto the GPU.
+        """
         pass
 
-    def _transform_cudf(self, df: Any) -> Any:
+    def _transform_cudf(
+        self, df: Any, context: Optional[_GPUTransformContext] = None
+    ) -> Any:
+        """Transform a single cuDF batch.
+
+        Args:
+            df: Input cuDF DataFrame batch.
+            context: Shared cache for the current fused transform batch. When
+                this preprocessor runs inside a :class:`GPUChain`, the chain
+                passes a shared context so intermediate representations (such
+                as tokenized text) can be reused across preprocessors. It is
+                ``None`` when the preprocessor is applied standalone.
+
+        Returns:
+            Transformed cuDF DataFrame batch.
+        """
         raise NotImplementedError
 
-    def _transform_cudf_with_context(
-        self, df: Any, context: _GPUTransformContext
-    ) -> Any:
-        return self._transform_cudf(df)
-
     def _gpu_modified_columns(self) -> List[str]:
+        """Return columns modified by :meth:`_transform_cudf`.
+
+        Used by fused GPU chains to invalidate cached intermediates when a
+        preprocessor changes its source columns.
+
+        Returns:
+            Column names written or updated by this preprocessor.
+        """
         return self.get_output_columns()
 
     def _supports_gpu_combined_fit(self) -> bool:
+        """Return whether this preprocessor supports combined GPU fitting.
+
+        When ``True``, a :class:`GPUChain` may fuse fit-statistics collection
+        for this preprocessor with other fittable preprocessors in a single
+        GPU ``map_batches`` pass.
+
+        Returns:
+            ``True`` if combined GPU fitting is supported, else ``False``.
+        """
         return False
 
     def _gpu_fit_stats_cudf(self, df: Any) -> pd.DataFrame:
+        """Compute partial fit statistics for one cuDF batch.
+
+        Args:
+            df: Input cuDF DataFrame batch, after any required prefix
+                preprocessors have been applied.
+
+        Returns:
+            Pandas DataFrame of partial statistics for this batch.
+        """
         raise NotImplementedError
 
     def _finalize_gpu_fit_stats(self, partials: pd.DataFrame) -> None:
+        """Aggregate partial fit statistics into ``stats_``.
+
+        Args:
+            partials: Concatenated partial statistics from all batches.
+        """
         raise NotImplementedError
 
     def _transform(
@@ -370,6 +440,23 @@ class GPUPreprocessor(SerializablePreprocessorBase):
         memory: Optional[float] = None,
         concurrency: Optional[int] = None,
     ) -> "Dataset":
+        """Transform a dataset by applying this preprocessor on GPU.
+
+        Args:
+            ds: The dataset to transform.
+            batch_size: Rows per cuDF batch. Defaults to this preprocessor's
+                configured batch size.
+            num_cpus: Not supported for GPU preprocessors.
+            memory: Not supported for GPU preprocessors.
+            concurrency: Maximum number of concurrent GPU workers. Defaults to
+                this preprocessor's configured concurrency.
+
+        Returns:
+            The transformed dataset.
+
+        Raises:
+            ValueError: If ``num_cpus`` or ``memory`` is provided.
+        """
         if num_cpus is not None:
             raise ValueError("GPUPreprocessor does not support transform num_cpus.")
         if memory is not None:
@@ -393,6 +480,11 @@ class GPUPreprocessor(SerializablePreprocessorBase):
         )
 
     def _base_serializable_fields(self) -> Dict[str, Any]:
+        """Return GPU execution settings shared by all GPU preprocessors.
+
+        Returns:
+            Dictionary of base GPU preprocessor configuration fields.
+        """
         return {
             "batch_size": self._batch_size,
             "num_gpus_per_worker": self._num_gpus_per_worker,
@@ -401,15 +493,31 @@ class GPUPreprocessor(SerializablePreprocessorBase):
         }
 
     def _set_base_serializable_fields(self, fields: Dict[str, Any]) -> None:
+        """Restore GPU execution settings from serialized data.
+
+        Args:
+            fields: Dictionary containing base GPU preprocessor fields.
+        """
         self._batch_size = fields.get("batch_size", _DEFAULT_GPU_BATCH_SIZE)
         self._num_gpus_per_worker = fields.get("num_gpus_per_worker", 1)
         self._concurrency = fields.get("concurrency")
         self._fitted = fields.get("_fitted")
 
     def _get_serializable_fields(self) -> Dict[str, Any]:
+        """Return instance fields that should be serialized.
+
+        Returns:
+            Dictionary mapping field names to their values.
+        """
         return self._base_serializable_fields()
 
     def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
+        """Restore instance fields from deserialized data.
+
+        Args:
+            fields: Dictionary of field names to values.
+            version: Version of the serialized data.
+        """
         self._set_base_serializable_fields(fields)
 
 
@@ -426,6 +534,12 @@ class GPUChain(SerializablePreprocessorBase):
         concurrency: Optional[int] = None,
     ):
         super().__init__()
+        for preprocessor in preprocessors:
+            if not isinstance(preprocessor, GPUPreprocessor):
+                raise TypeError(
+                    "GPUChain only supports GPUPreprocessor instances; got "
+                    f"{type(preprocessor)!r}."
+                )
         self._preprocessors = tuple(preprocessors)
         self._batch_size = batch_size
         self._num_gpus_per_worker = num_gpus_per_worker
@@ -524,13 +638,6 @@ class GPUChain(SerializablePreprocessorBase):
         return True
 
     def _fit(self, ds: "Dataset") -> "GPUChain":
-        for preprocessor in self._preprocessors:
-            if not isinstance(preprocessor, GPUPreprocessor):
-                raise TypeError(
-                    "GPUChain only supports GPUPreprocessor instances; got "
-                    f"{type(preprocessor)!r}."
-                )
-
         if self._fit_combined(ds):
             return self
 
@@ -631,12 +738,10 @@ class GPUTextStatsPreprocessor(GPUPreprocessor):
         self._word_pattern = word_pattern
         self._token_pattern = token_pattern
 
-    def _transform_cudf(self, df: Any) -> Any:
-        return self._transform_cudf_with_context(df, _GPUTransformContext())
-
-    def _transform_cudf_with_context(
-        self, df: Any, context: _GPUTransformContext
+    def _transform_cudf(
+        self, df: Any, context: Optional[_GPUTransformContext] = None
     ) -> Any:
+        context = context or _GPUTransformContext()
         text = context.string_column(df, self._text_column)
         _, token_lengths = context.tokenized_text(
             df, self._text_column, self._token_pattern
@@ -768,7 +873,9 @@ class GPUStandardScaler(GPUPreprocessor):
     ) -> "GPUStandardScaler":
         return _fit_gpu_with_stats_udf(self, dataset, prefix)
 
-    def _transform_cudf(self, df: Any) -> Any:
+    def _transform_cudf(
+        self, df: Any, context: Optional[_GPUTransformContext] = None
+    ) -> Any:
         cudf = _import_cudf()
         for input_col, output_col in zip(self._columns, self._output_columns):
             mean = self.stats_.get(f"mean({input_col})")
@@ -911,7 +1018,9 @@ class GPUOneHotEncoder(GPUPreprocessor):
             for column in self._columns
         }
 
-    def _transform_cudf(self, df: Any) -> Any:
+    def _transform_cudf(
+        self, df: Any, context: Optional[_GPUTransformContext] = None
+    ) -> Any:
         cudf = _import_cudf()
         cp = _import_cupy()
         for input_col, output_col in zip(self._columns, self._output_columns):
@@ -1016,12 +1125,10 @@ class GPUHashingVectorizer(GPUPreprocessor):
             columns, output_columns
         )
 
-    def _transform_cudf(self, df: Any) -> Any:
-        return self._transform_cudf_with_context(df, _GPUTransformContext())
-
-    def _transform_cudf_with_context(
-        self, df: Any, context: _GPUTransformContext
+    def _transform_cudf(
+        self, df: Any, context: Optional[_GPUTransformContext] = None
     ) -> Any:
+        context = context or _GPUTransformContext()
         for input_col, output_col in zip(self._columns, self._output_columns):
             tokens, lengths = context.tokenized_text(df, input_col, self._token_pattern)
             df = _append_hashing_columns_from_tokens(
@@ -1098,7 +1205,9 @@ class GPUColumnDropper(GPUPreprocessor):
         )
         self._columns = columns
 
-    def _transform_cudf(self, df: Any) -> Any:
+    def _transform_cudf(
+        self, df: Any, context: Optional[_GPUTransformContext] = None
+    ) -> Any:
         existing = [column for column in self._columns if column in df.columns]
         if not existing:
             return df
