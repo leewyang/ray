@@ -169,6 +169,17 @@ from ray.data.expressions import Expr, StarExpr, col
 
 logger = logging.getLogger(__name__)
 
+
+def _apply_output_batch_format(given_batch_format: Optional[str]) -> Optional[str]:
+    batch_format = _apply_batch_format(given_batch_format)
+    if batch_format == "numpy":
+        raise ValueError(
+            "`output_batch_format='numpy'` isn't supported. Use 'pyarrow', "
+            "'pandas', 'cudf', or None."
+        )
+    return batch_format
+
+
 # Special column name for train/test split to avoid collision with user columns
 _TRAIN_TEST_SPLIT_COLUMN = "__ray_train_test_split_is_train__"
 
@@ -535,6 +546,7 @@ class Dataset:
         batch_size: Union[int, None, Literal["auto"]] = None,
         compute: Optional[ComputeStrategy] = None,
         batch_format: Optional[str] = "default",
+        output_batch_format: Optional[str] = None,
         zero_copy_batch: bool = True,
         fn_args: Optional[Iterable[Any]] = None,
         fn_kwargs: Optional[Dict[str, Any]] = None,
@@ -700,6 +712,12 @@ class Dataset:
                 ``cudf.DataFrame`` (requires cudf to be installed).
                 If ``batch_format`` is set to ``None`` input block format
                 will be used.
+            output_batch_format: If set, convert batches returned by ``fn`` to
+                this block format before storing them downstream. Supported values
+                are ``"pyarrow"``, ``"pandas"``, and ``"cudf"``. For example,
+                use ``output_batch_format="pyarrow"`` to convert GPU cuDF
+                outputs back to CPU Arrow blocks before CPU-only sinks like
+                Parquet writes.
             zero_copy_batch: Whether ``fn`` should be provided zero-copy, read-only
                 batches. If this is ``True`` and no copy is required for the
                 ``batch_format`` conversion, the batch is a zero-copy, read-only
@@ -789,6 +807,7 @@ class Dataset:
             batch_size=batch_size,
             compute=compute,
             batch_format=batch_format,
+            output_batch_format=output_batch_format,
             zero_copy_batch=zero_copy_batch,
             fn_args=fn_args,
             fn_kwargs=fn_kwargs,
@@ -810,6 +829,7 @@ class Dataset:
         batch_size: Union[int, None, Literal["auto"]],
         compute: Optional[ComputeStrategy],
         batch_format: Optional[str],
+        output_batch_format: Optional[str],
         zero_copy_batch: bool,
         fn_args: Optional[Iterable[Any]],
         fn_kwargs: Optional[Dict[str, Any]],
@@ -850,6 +870,7 @@ class Dataset:
             ray_remote_args["memory"] = memory
 
         batch_format = _apply_batch_format(batch_format)
+        output_batch_format = _apply_output_batch_format(output_batch_format)
 
         map_batches_op = MapBatches(
             fn,
@@ -857,6 +878,7 @@ class Dataset:
             batch_size=batch_size,
             can_modify_num_rows=udf_modifying_row_count,
             batch_format=batch_format,
+            output_batch_format=output_batch_format,
             zero_copy_batch=zero_copy_batch,
             min_rows_per_bundled_input=min_rows_per_bundled_input,
             fn_args=fn_args,

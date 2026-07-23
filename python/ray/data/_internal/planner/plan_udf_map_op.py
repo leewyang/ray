@@ -312,6 +312,7 @@ def plan_udf_map_op(
             _generate_transform_fn_for_map_batches(fn),
             batch_size=op.batch_size,
             batch_format=op.batch_format,
+            output_batch_format=op.output_batch_format,
             zero_copy_batch=op.zero_copy_batch,
             is_udf=True,
             output_block_size_option=output_block_size_option,

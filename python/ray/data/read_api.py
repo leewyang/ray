@@ -590,6 +590,19 @@ def _read_datasource_v2(
     )
 
 
+def _validate_parquet_batch_format(
+    batch_format: Optional[str],
+) -> Literal["pyarrow", "cudf"]:
+    if batch_format is None or batch_format == "default":
+        return "pyarrow"
+    if batch_format in ("pyarrow", "cudf"):
+        return batch_format
+    raise ValueError(
+        "`read_parquet(batch_format=...)` must be 'pyarrow', 'cudf', "
+        f"'default', or None; got {batch_format!r}."
+    )
+
+
 @PublicAPI
 @wrap_auto_init
 def read_datasource(
@@ -1269,6 +1282,7 @@ def read_parquet(
     *,
     filesystem: Optional["pyarrow.fs.FileSystem"] = None,
     columns: Optional[List[str]] = None,
+    batch_format: Optional[Literal["pyarrow", "cudf"]] = "pyarrow",
     parallelism: int = -1,
     num_cpus: Optional[float] = None,
     num_gpus: Optional[float] = None,
@@ -1376,6 +1390,10 @@ def read_parquet(
             ``include_row_hash`` are ``True``, list the synthetic ``'path'``
             / ``'row_hash'`` columns explicitly in your
             ``select_columns([...])`` call to retain them.
+        batch_format: Output block format to produce from the Parquet reader.
+            ``"pyarrow"`` preserves the existing CPU Arrow reader behavior.
+            ``"cudf"`` [Experimental] reads supported Parquet fragments with
+            cuDF and yields GPU-backed cuDF blocks.
         parallelism: This argument is deprecated. Use ``override_num_blocks`` argument.
         num_cpus: The number of CPUs to reserve for each parallel read worker.
         num_gpus: The number of GPUs to reserve for each parallel read worker. For
@@ -1444,6 +1462,7 @@ def read_parquet(
         restart more workers.
     """
     _validate_shuffle_arg(shuffle)
+    batch_format = _validate_parquet_batch_format(batch_format)
 
     # Check for deprecated filter parameter
     if "filter" in arrow_parquet_args:
@@ -1465,6 +1484,13 @@ def read_parquet(
 
     ctx = DataContext.get_current()
     if ctx.use_datasource_v2:
+        if batch_format == "cudf":
+            raise ValueError(
+                "read_parquet(batch_format='cudf') is only supported by the "
+                "v1 Parquet datasource. Set "
+                "`DataContext.get_current().use_datasource_v2 = False` or use "
+                "the default batch_format='pyarrow'."
+            )
         # ``tensor_column_schema`` is folded into ``_block_udf`` by
         # ``_resolve_parquet_args`` above; passing that transform through
         # ``ReadFiles.block_udf`` covers both features.
@@ -1575,6 +1601,7 @@ def read_parquet(
         include_paths=include_paths,
         include_row_hash=include_row_hash,
         file_extensions=file_extensions,
+        batch_format=batch_format,
     )
     return read_datasource(
         datasource,

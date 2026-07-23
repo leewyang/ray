@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator, Optional
 
 from ray.data._internal.delegating_block_builder import DelegatingBlockBuilder
-from ray.data.block import Block, BlockAccessor, DataBatch
+from ray.data.block import Block, BlockAccessor, BlockType, DataBatch
 from ray.data.context import MAX_SAFE_BLOCK_SIZE_FACTOR
 
 
@@ -79,14 +79,22 @@ class BlockOutputBuffer:
         ...     yield output.next() # doctest: +SKIP
     """
 
-    def __init__(self, output_block_size_option: Optional[OutputBlockSizeOption]):
+    def __init__(
+        self,
+        output_block_size_option: Optional[OutputBlockSizeOption],
+        *,
+        output_block_type: Optional[BlockType] = None,
+    ):
         """Initialize the output buffer.
 
         Args:
             output_block_size_option: Options controlling the target output block size,
                 or ``None`` to disable output block size enforcement.
+            output_block_type: If set, convert user-facing batches added with
+                :meth:`add_batch` to this block type before buffering.
         """
         self._output_block_size_option = output_block_size_option
+        self._output_block_type = output_block_type
         self._buffer = DelegatingBlockBuilder()
         self._finalized = False
         self._has_yielded_blocks = False
@@ -99,7 +107,11 @@ class BlockOutputBuffer:
     def add_batch(self, batch: DataBatch) -> None:
         """Add a data batch to this output buffer."""
         assert not self._finalized
-        self._buffer.add_batch(batch)
+        if self._output_block_type is None:
+            self._buffer.add_batch(batch)
+        else:
+            block = BlockAccessor.batch_to_block(batch, self._output_block_type)
+            self._buffer.add_block(block)
 
     def add_block(self, block: Block) -> None:
         """Add a data block to this output buffer."""

@@ -28,6 +28,8 @@ from ray.data.expressions import Expr
 
 if TYPE_CHECKING:
     import cudf
+    import pandas
+    import pyarrow
 
     from ray.data._internal.planner.exchange.sort_task_spec import SortKey
 

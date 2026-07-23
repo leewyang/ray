@@ -9,11 +9,16 @@ https://docs.rapids.ai/api/cudf/latest/developer_guide/testing/).
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import ray
 from ray.data._internal.block_batching.block_batching import batch_blocks
+from ray.data._internal.execution.interfaces.ref_bundle import (
+    _ref_bundles_iterator_to_block_refs_list,
+)
 from ray.data.block import BlockAccessor, BlockType
+from ray.data.context import DataContext
 from ray.data.expressions import col
 from ray.data.tests.conftest import *  # noqa
 
@@ -123,6 +128,40 @@ class TestCudfBatchBlocks:
         cudf.testing.assert_eq(batches[1], cudf.DataFrame({"foo": [3, 4, 5]}))
 
 
+class TestCudfParquetRead:
+    """Tests for reading Parquet directly into cuDF blocks."""
+
+    def test_read_parquet_cudf_blocks(self, ray_start_regular_shared, tmp_path):
+        pq.write_table(
+            pa.table({"id": [0, 1, 2], "value": ["a", "b", "c"]}),
+            tmp_path / "part.parquet",
+            row_group_size=2,
+        )
+
+        ctx = DataContext.get_current()
+        original_use_datasource_v2 = ctx.use_datasource_v2
+        ctx.use_datasource_v2 = False
+        try:
+            ds = ray.data.read_parquet(
+                str(tmp_path),
+                batch_format="cudf",
+                num_gpus=0.001,
+            ).materialize()
+        finally:
+            ctx.use_datasource_v2 = original_use_datasource_v2
+
+        blocks = ray.get(
+            _ref_bundles_iterator_to_block_refs_list(ds.iter_internal_ref_bundles())
+        )
+        assert blocks
+        assert all(isinstance(block, cudf.DataFrame) for block in blocks)
+        assert ds.take_all() == [
+            {"id": 0, "value": "a"},
+            {"id": 1, "value": "b"},
+            {"id": 2, "value": "c"},
+        ]
+
+
 @pytest.mark.parametrize(
     "batch_format",
     ["cudf", "pandas", "pyarrow"],
@@ -130,6 +169,28 @@ class TestCudfBatchBlocks:
 )
 class TestCudfMapBatches:
     """Tests for map_batches with various batch formats (cuDF in/out)."""
+
+    def test_map_batches_cudf_output_batch_format_pyarrow(
+        self, ray_start_regular_shared, batch_format
+    ):
+        if batch_format != "cudf":
+            pytest.skip("This regression is specific to cuDF block conversion.")
+
+        ds = ray.data.range(5, override_num_blocks=1)
+        result = ds.map_batches(
+            lambda batch: batch,
+            batch_format="cudf",
+            output_batch_format="pyarrow",
+            batch_size=5,
+            num_gpus=0.001,
+        ).materialize()
+
+        blocks = ray.get(
+            _ref_bundles_iterator_to_block_refs_list(result.iter_internal_ref_bundles())
+        )
+        assert blocks
+        assert all(isinstance(block, pa.Table) for block in blocks)
+        assert result.take_all() == [{"id": i} for i in range(5)]
 
     def test_map_batches_cudf_output_not_converted_to_arrow(
         self, ray_start_regular_shared, monkeypatch, batch_format

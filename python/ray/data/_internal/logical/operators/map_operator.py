@@ -236,6 +236,7 @@ class MapBatches(AbstractUDFMap):
     can_modify_num_rows: bool = False
     batch_size: Union[Optional[int], Literal["auto"]] = None
     batch_format: Optional[str] = "default"
+    output_batch_format: Optional[str] = None
     zero_copy_batch: bool = True
     fn_args: Optional[Iterable[Any]] = None
     fn_kwargs: Optional[Dict[str, Any]] = None

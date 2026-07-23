@@ -642,6 +642,14 @@ class BlockAccessor:
                 assert block_type == BlockType.PANDAS
                 return cls.batch_to_pandas_block(batch)
 
+        elif isinstance(batch, (pa.Table, pa.RecordBatch)):
+            if block_type == BlockType.CUDF:
+                return cls.for_block(batch).to_cudf()
+            elif block_type == BlockType.PANDAS:
+                return cls.for_block(batch).to_pandas()
+            else:
+                return cls.for_block(batch).to_arrow()
+
         return batch
 
     @classmethod

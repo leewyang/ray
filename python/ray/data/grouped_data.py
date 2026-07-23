@@ -294,6 +294,7 @@ class GroupedData:
             #       back-n-forth between batch and block formats (instead we convert
             #       once per group inside the method applying the UDF itself)
             batch_format=None,
+            output_batch_format=None,
             zero_copy_batch=zero_copy_batch,
             fn_args=fn_args,
             fn_kwargs=fn_kwargs,
