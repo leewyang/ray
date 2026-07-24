@@ -758,7 +758,6 @@ class TestReservationOpResourceAllocator:
         """
         DataContext.get_current().op_resource_reservation_enabled = True
         DataContext.get_current().op_resource_reservation_ratio = 0.5
-
         # Build pipeline: Input -> Read -> Preprocess -> Infer(GPU) -> Write
         # This mirrors the production pipeline structure
         o1 = InputDataBuffer(DataContext.get_current(), [])
@@ -1009,7 +1008,7 @@ class TestReservationOpResourceAllocator:
         resource_manager.get_global_limits = MagicMock(return_value=global_limits)
 
         # Update allocated budgets
-        resource_manager._update_allocated_budgets()
+        resource_manager._update_resource_allocations()
 
         # Check that o2's usage was subtracted from remaining resources
         # global_limits (10 CPU, 250 mem) - o1 usage (0) - o2 usage (2 CPU, 50 mem) = remaining (8 CPU, 200 mem)
@@ -1110,7 +1109,7 @@ class TestReservationOpResourceAllocator:
 
         global_limits = ExecutionResources(cpu=20, object_store_memory=2000)
 
-        resource_manager._update_allocated_budgets()
+        resource_manager._update_resource_allocations()
 
         """
         global_limits (20 CPU, 2000 mem) - o2 usage (2 CPU, 150 mem) - o3 usage (2 CPU, 50 mem) - o5 usage (3 CPU, 100 mem) - o7 usage (1 CPU, 100 mem) = remaining (12 CPU, 1600 mem)
@@ -1167,7 +1166,7 @@ class TestReservationOpResourceAllocator:
         +-----+------------------+------------------+--------------+
         """
 
-        resource_manager._update_allocated_budgets()
+        resource_manager._update_resource_allocations()
 
         assert allocator._op_budgets[o6] == ExecutionResources(
             cpu=4, object_store_memory=350
@@ -1181,7 +1180,7 @@ class TestReservationOpResourceAllocator:
         # Test when completed ops update the usage.
         op_usages[o5] = ExecutionResources.zero()
 
-        resource_manager._update_allocated_budgets()
+        resource_manager._update_resource_allocations()
 
         """
         global_limits (20 CPU, 2000 mem) - o2 usage (2 CPU, 150 mem) - o3 usage (2 CPU, 50 mem) - o5 usage (0 CPU, 0 mem) - o7 usage (1 CPU, 100 mem) = remaining (15 CPU, 1700 mem)

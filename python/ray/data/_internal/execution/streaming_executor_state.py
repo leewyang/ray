@@ -177,33 +177,23 @@ class OutputBackpressureGuard:
                 #
                 # In this case by relaxing output backpressure we allow upstream
                 # operator's task to complete sooner to free up resources.
-                if not self._can_submit_new_task(downstream_op):
+                if not self._resource_manager.can_submit_new_task(downstream_op):
                     return True
 
                 # Case 2: Downstream operator
                 #   - Does *not* have running tasks and
                 #   - *Can* schedule new tasks
-                #   - Does *not* have any input blocks in the queue
+                #   - Does *not* have any externally dispatchable input
                 #
                 # In this case we relax output backpressure to produce at least
-                # 1 block for downstream operator.
-                elif downstream_op_state.total_enqueued_input_blocks() == 0:
+                # 1 block for downstream operator. Internally buffered blocks
+                # may still be insufficient to form a batch.
+                elif not downstream_op_state.has_pending_bundles():
                     return True
 
         # As a last resort we check whether operator has been idling (ie not
         # producing any outputs) for a while, and unblock in that case.
         return self._idle_detector.detect_idle(op)
-
-    def _can_submit_new_task(self, op: PhysicalOperator) -> bool:
-        """Whether ``op`` can submit a new task under current resource budgets.
-
-        Falls back to True when no op-level resource allocator is enabled —
-        in that case there is no budget-based throttling to wait on, so the
-        liveness check shouldn't claim downstream is blocked on resources.
-        """
-        if not self._resource_manager.op_resource_allocator_enabled():
-            return True
-        return self._resource_manager.op_resource_allocator.can_submit_new_task(op)
 
 
 class OpBufferQueue:
@@ -550,6 +540,8 @@ def build_streaming_topology(
     dag: PhysicalOperator,
     options: ExecutionOptions,
     block_ref_counter: BlockRefCounter,
+    *,
+    start_operators: bool = True,
 ) -> Topology:
     """Instantiate the streaming operator state topology for the given DAG.
 
@@ -562,6 +554,9 @@ def build_streaming_topology(
         options: The execution options to use to start operators.
         block_ref_counter: The executor-wide shared counter for tracking
             object-store memory.
+        start_operators: Whether to start operators while building the topology.
+            The streaming executor disables this so resource admission can apply
+            initial zero-unit grants before any resource-owning workers start.
 
     Returns:
         The topology dict holding the streaming execution state.
@@ -583,11 +578,32 @@ def build_streaming_topology(
         # Create state.
         op_state = OpState(op, inqueues)
         topology[op] = op_state
-        op.start(options, block_ref_counter)
+        if start_operators:
+            op.start(options, block_ref_counter)
         return op_state
 
     setup_state(dag)
     return topology
+
+
+def start_streaming_topology(
+    topology: Topology,
+    options: ExecutionOptions,
+    block_ref_counter: BlockRefCounter,
+) -> None:
+    """Start an already-built topology in deterministic topological order."""
+    started = []
+    try:
+        for op in topology:
+            started.append(op)
+            op.start(options, block_ref_counter)
+    except BaseException:
+        for op in reversed(started):
+            try:
+                op._do_shutdown(force=True)
+            except Exception:
+                logger.exception("Failed to roll back operator %s", op)
+        raise
 
 
 def process_completed_tasks(
@@ -781,7 +797,6 @@ def update_operator_states(topology: Topology) -> None:
     Should be called after `process_completed_tasks()`."""
 
     for op, op_state in topology.items():
-
         # Call inputs_done() on ops where no more inputs are coming.
         if op_state.inputs_done_called:
             continue
@@ -828,6 +843,7 @@ def get_eligible_operators(
     backpressure_policies: List[BackpressurePolicy],
     *,
     ensure_liveness: bool,
+    resource_manager: ResourceManager,
 ) -> List[PhysicalOperator]:
     """This method returns all operators that are eligible for execution in the current state
     of the pipeline.
@@ -848,6 +864,16 @@ def get_eligible_operators(
     eligible_ops: List[PhysicalOperator] = []
 
     for op, state in topology.items():
+        admission_grant = resource_manager.get_resource_admission_grant(op)
+        if admission_grant is not None and not admission_grant.may_submit:
+            # Admission is a hard lifecycle constraint; the liveness fallback
+            # must never let a later pool leapfrog and consume input.
+            state._scheduling_status = OpSchedulingStatus(
+                runnable=False, under_resource_limits=False
+            )
+            op.notify_in_task_submission_backpressure(True, "ResourceAdmissionControl")
+            continue
+
         # Operator is considered being in task-submission back-pressure if any
         # back-pressure policy is violated. Track the first triggered policy.
         triggered_policy = None
@@ -919,6 +945,7 @@ def select_operator_to_run(
         topology,
         backpressure_policies,
         ensure_liveness=ensure_liveness,
+        resource_manager=resource_manager,
     )
 
     if not eligible_ops:

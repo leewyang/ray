@@ -47,6 +47,7 @@ from ray.data._internal.execution.operators.map_transformer import (
     MapTransformer,
 )
 from ray.data._internal.execution.ranker import DefaultRanker
+from ray.data._internal.execution.resource_admission import ResourceAdmissionGrant
 from ray.data._internal.execution.resource_manager import ResourceManager
 from ray.data._internal.execution.streaming_executor import (
     StreamingExecutor,
@@ -61,6 +62,7 @@ from ray.data._internal.execution.streaming_executor_state import (
     get_eligible_operators,
     process_completed_tasks,
     select_operator_to_run,
+    start_streaming_topology,
     update_operator_states,
 )
 from ray.data._internal.execution.util import make_ref_bundles
@@ -90,6 +92,7 @@ def mock_resource_manager(
     return MagicMock(
         get_global_limits=MagicMock(return_value=global_limits),
         get_global_usage=MagicMock(return_value=global_usage),
+        get_resource_admission_grant=MagicMock(return_value=None),
         op_resource_allocator_enabled=MagicMock(return_value=True),
     )
 
@@ -141,6 +144,49 @@ def test_build_streaming_topology(verbose_progress, ray_start_regular_shared):
     assert topo[o1].output_queue == topo[o2].input_queues[0], topo
     assert topo[o2].output_queue == topo[o3].input_queues[0], topo
     assert list(topo) == [o1, o2, o3]
+
+
+def test_build_then_start_streaming_topology_in_two_phases():
+    data_context = DataContext.get_current()
+    o1 = InputDataBuffer(data_context, input_data=[])
+    o2 = MapOperator.create(
+        make_map_transformer(lambda block: block),
+        o1,
+        data_context,
+    )
+    o1.start = MagicMock()
+    o2.start = MagicMock()
+    options = ExecutionOptions()
+    block_ref_counter = noop_counter()
+
+    topology = build_streaming_topology(
+        o2,
+        options,
+        block_ref_counter,
+        start_operators=False,
+    )
+
+    o1.start.assert_not_called()
+    o2.start.assert_not_called()
+    start_streaming_topology(topology, options, block_ref_counter)
+    o1.start.assert_called_once_with(options, block_ref_counter)
+    o2.start.assert_called_once_with(options, block_ref_counter)
+
+
+def test_start_streaming_topology_rolls_back_partial_start():
+    operators = [MagicMock(spec=PhysicalOperator) for _ in range(3)]
+    operators[1].start.side_effect = RuntimeError("start failed")
+    operators[1]._do_shutdown.side_effect = RuntimeError("cleanup failed")
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        start_streaming_topology(
+            dict.fromkeys(operators), ExecutionOptions(), noop_counter()
+        )
+
+    operators[0]._do_shutdown.assert_called_once_with(force=True)
+    operators[1]._do_shutdown.assert_called_once_with(force=True)
+    operators[2].start.assert_not_called()
+    operators[2]._do_shutdown.assert_not_called()
 
 
 def test_disallow_non_unique_operators(ray_start_regular_shared):
@@ -427,7 +473,12 @@ def test_get_eligible_operators_to_run(ray_start_regular_shared):
     )
 
     def _get_eligible_ops_to_run(ensure_liveness: bool):
-        return get_eligible_operators(topo, [], ensure_liveness=ensure_liveness)
+        return get_eligible_operators(
+            topo,
+            [],
+            ensure_liveness=ensure_liveness,
+            resource_manager=resource_manager,
+        )
 
     # Test empty.
     assert _get_eligible_ops_to_run(ensure_liveness=False) == []
@@ -465,7 +516,10 @@ def test_get_eligible_operators_to_run(ray_start_regular_shared):
 
         def _get_eligible_ops_to_run_with_policy(ensure_liveness: bool):
             return get_eligible_operators(
-                topo, [test_policy], ensure_liveness=ensure_liveness
+                topo,
+                [test_policy],
+                ensure_liveness=ensure_liveness,
+                resource_manager=resource_manager,
             )
 
         assert _get_eligible_ops_to_run_with_policy(ensure_liveness=False) == [o3]
@@ -478,6 +532,26 @@ def test_get_eligible_operators_to_run(ray_start_regular_shared):
 
             # To ensure liveness back-pressure limits will be ignored
             assert _get_eligible_ops_to_run_with_policy(ensure_liveness=True) == [o2]
+
+    # Admission is a hard constraint: the idle-pipeline liveness fallback must
+    # not dispatch new input to a frontier pool and let it leapfrog upstream.
+    resource_manager.get_resource_admission_grant.side_effect = lambda op: (
+        ResourceAdmissionGrant(0, False) if op is o2 else None
+    )
+    with patch.object(
+        o2,
+        "can_add_input",
+        side_effect=AssertionError("hard admission gate must not probe readiness"),
+    ):
+        assert (
+            get_eligible_operators(
+                topo,
+                [],
+                ensure_liveness=True,
+                resource_manager=resource_manager,
+            )
+            == []
+        )
 
 
 def test_backpressure_policy_tracking(ray_start_regular_shared):
@@ -492,6 +566,7 @@ def test_backpressure_policy_tracking(ray_start_regular_shared):
         name="O2",
     )
     topo = build_streaming_topology(o2, opts, noop_counter())
+    resource_manager = mock_resource_manager()
 
     # Add input to o2's input queue so it becomes eligible
     topo[o1].output_queue.append(make_ref_bundle("dummy1"))
@@ -533,7 +608,12 @@ def test_backpressure_policy_tracking(ray_start_regular_shared):
     policies = [MockPolicy1(), MockPolicy2(), MockPolicy3()]
 
     # Call get_eligible_operators which should track triggered policies
-    get_eligible_operators(topo, policies, ensure_liveness=False)
+    get_eligible_operators(
+        topo,
+        policies,
+        ensure_liveness=False,
+        resource_manager=resource_manager,
+    )
 
     # Check that o2 has the first triggered policy tracked
     assert o2._in_task_submission_backpressure is True
@@ -551,7 +631,12 @@ def test_backpressure_policy_tracking(ray_start_regular_shared):
         def max_task_output_bytes_to_read(self, op):
             return None
 
-    get_eligible_operators(topo, [AllowAllPolicy()], ensure_liveness=False)
+    get_eligible_operators(
+        topo,
+        [AllowAllPolicy()],
+        ensure_liveness=False,
+        resource_manager=resource_manager,
+    )
 
     # Check that o2 is no longer in backpressure
     assert o2._in_task_submission_backpressure is False

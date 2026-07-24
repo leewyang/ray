@@ -39,6 +39,7 @@ from ray.data._internal.execution.streaming_executor_state import (
     format_op_state_summary,
     process_completed_tasks,
     select_operator_to_run,
+    start_streaming_topology,
     update_operator_states,
 )
 from ray.data._internal.logging import (
@@ -227,10 +228,14 @@ class StreamingExecutor(Executor, threading.Thread):
                     ),
                 )
 
-        # Setup the streaming DAG topology and start the runner thread.
+        # Build operator state before starting resource owners so admission can apply
+        # initial grants first.
         self._block_ref_counter = BlockRefCounter()
         self._topology = build_streaming_topology(
-            dag, self._options, self._block_ref_counter
+            dag,
+            self._options,
+            self._block_ref_counter,
+            start_operators=False,
         )
 
         self._resource_manager = ResourceManager(
@@ -240,6 +245,7 @@ class StreamingExecutor(Executor, threading.Thread):
             self._data_context,
             self._block_ref_counter,
         )
+        start_streaming_topology(self._topology, self._options, self._block_ref_counter)
 
         # Constructed once per executor (not per scheduling iteration) so the
         # guard's idle-detection state accumulates across scheduling iterations.
