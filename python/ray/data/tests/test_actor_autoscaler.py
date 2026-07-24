@@ -1,6 +1,7 @@
+import asyncio
 import time
 from contextlib import contextmanager
-from types import MethodType
+from types import MethodType, SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -15,15 +16,460 @@ from ray.data._internal.actor_autoscaler import (
 from ray.data._internal.actor_autoscaler.default_actor_autoscaler import (
     _get_max_scale_up,
 )
-from ray.data._internal.execution.operators.actor_pool_map_operator import _ActorPool
+from ray.data._internal.compute import ActorPoolStrategy
+from ray.data._internal.execution.interfaces import ExecutionOptions
+from ray.data._internal.execution.operators.actor_pool_map_operator import (
+    ActorPoolMapOperator,
+    _ActorPool,
+)
 from ray.data._internal.execution.operators.base_physical_operator import (
     InternalQueueOperatorMixin,
+)
+from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
+from ray.data._internal.execution.operators.map_operator import MapOperator
+from ray.data._internal.execution.resource_admission import (
+    ResourceAdmissionGrant,
+    ResourceAdmissionSpec,
+    _ResourceAdmissionController,
 )
 from ray.data._internal.execution.resource_manager import ResourceManager
 from ray.data._internal.execution.streaming_executor_state import OpState
 from ray.data.context import (
     AutoscalingConfig,
+    DataContext,
 )
+
+
+def _elastic_spec(max_units=4, min_units=1):
+    unit = ExecutionResources(gpu=1)
+    return ResourceAdmissionSpec(
+        minimum_resources=unit.scale(min_units),
+        unit_resources=unit,
+        min_units=min_units,
+        max_units=max_units,
+    )
+
+
+def test_resource_admission_scaling_grants():
+    resource_manager = MagicMock(spec=ResourceManager)
+    resource_manager.get_allocation.return_value = ExecutionResources(gpu=2)
+    resource_manager.get_allocation_target.return_value = ExecutionResources(gpu=2)
+    resource_manager.get_op_usage.return_value = ExecutionResources(gpu=1)
+    resource_manager.get_budget.return_value = ExecutionResources(gpu=1)
+    autoscaler = DefaultActorAutoscaler(
+        topology={},
+        resource_manager=resource_manager,
+        config=AutoscalingConfig(
+            actor_pool_util_upscaling_threshold=1.0,
+            actor_pool_util_downscaling_threshold=0.5,
+            actor_pool_max_upscaling_delta=1,
+        ),
+    )
+    op = MagicMock()
+    op.resource_admission_spec.return_value = _elastic_spec(min_units=2)
+    op.has_completed.return_value = False
+    op.has_execution_finished.return_value = False
+    op.internal_input_queue_num_blocks.return_value = 0
+    op._inputs_complete = False
+    op.metrics.num_inputs_received = 1
+    op_state = MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1))
+    pool = MagicMock(spec=_ActorPool)
+    pool.min_size.return_value = 2
+    pool.max_size.return_value = 4
+    pool.initial_size.return_value = 2
+    pool.per_actor_resource_usage.return_value = ExecutionResources(gpu=1)
+    pool.get_pool_util.return_value = 1.0
+
+    def actor_info(*, running=0, pending=0, active=0, idle=0):
+        pool.current_size.return_value = running + pending
+        pool.num_running_actors.return_value = running
+        pool.get_actor_info.return_value = SimpleNamespace(
+            running=running,
+            pending=pending,
+            restarting=0,
+            active=active,
+            idle=idle,
+        )
+
+    resource_manager.get_resource_admission_grant.return_value = ResourceAdmissionGrant(
+        max_units=4, may_submit=True
+    )
+    pool.min_size.return_value = pool.initial_size.return_value = 4
+    actor_info()
+    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
+        ActorPoolScalingRequest.upscale(delta=4, reason="pool below min size")
+    )
+    pool.min_size.return_value = pool.initial_size.return_value = 2
+
+    # A final internally rebundled input remains live after the executor queue
+    # empties. Readmission must start an actor instead of taking the completion
+    # shortcut and leaving the bundle stranded forever.
+    resource_manager.get_resource_admission_grant.return_value = ResourceAdmissionGrant(
+        max_units=2, may_submit=True
+    )
+    op._inputs_complete = True
+    op_state.total_enqueued_input_blocks.return_value = 1
+    actor_info()
+    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
+        ActorPoolScalingRequest.upscale(delta=2, reason="pool below min size")
+    )
+    op._inputs_complete = False
+    op.internal_input_queue_num_blocks.return_value = 0
+    op_state.total_enqueued_input_blocks.return_value = 1
+
+    # A positive frontier grant starts the configured floor to expose pending
+    # cluster-autoscaler demand, even though it cannot submit input.
+    resource_manager.get_resource_admission_grant.return_value = ResourceAdmissionGrant(
+        max_units=2, may_submit=False
+    )
+    actor_info()
+    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
+        ActorPoolScalingRequest.upscale(delta=2, reason="pool below min size")
+    )
+
+    # A claimant waiting behind an owner receives no lifecycle capacity.
+    resource_manager.get_resource_admission_grant.return_value = ResourceAdmissionGrant(
+        max_units=0, may_submit=False
+    )
+    actor_info()
+    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
+        ActorPoolScalingRequest.no_op(reason="reached max size")
+    )
+
+    # Pending and idle actors are promptly released after lifecycle capacity is
+    # revoked. Active calls are allowed to drain by the pool implementation.
+    actor_info(pending=1)
+    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
+        ActorPoolScalingRequest.downscale(
+            delta=-1,
+            force=True,
+            reason="pool exceeding max size",
+        )
+    )
+    actor_info(running=1, idle=1)
+    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
+        ActorPoolScalingRequest.downscale(
+            delta=-1,
+            force=True,
+            reason="pool exceeding max size",
+        )
+    )
+
+    # One request covers the whole visible pool; scale() removes only pending or
+    # idle actors, so an active call is never preempted.
+    actor_info(running=1, pending=1, idle=1)
+    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
+        ActorPoolScalingRequest.downscale(
+            delta=-2,
+            force=True,
+            reason="pool exceeding max size",
+        )
+    )
+
+    # Admitted pools restore their configured minimum floor.
+    resource_manager.get_resource_admission_grant.return_value = ResourceAdmissionGrant(
+        max_units=2, may_submit=True
+    )
+    actor_info(running=1, active=1)
+    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
+        ActorPoolScalingRequest.upscale(delta=1, reason="pool below min size")
+    )
+
+    # Restoring the required floor is immediate, while optional elastic growth
+    # above it still respects the configured per-tick delta.
+    resource_manager.get_resource_admission_grant.return_value = ResourceAdmissionGrant(
+        max_units=4, may_submit=True
+    )
+    actor_info(running=2, active=2)
+    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
+        ActorPoolScalingRequest.upscale(delta=1, reason="utilization of 1.0 >= 1.0")
+    )
+
+    # Allocation may shrink actors above the floor. Only inactive actors are
+    # actually removed; active excess actors are reclaimed after they drain.
+    resource_manager.get_resource_admission_grant.return_value = ResourceAdmissionGrant(
+        max_units=2, may_submit=True
+    )
+    actor_info(running=3, active=1, idle=2)
+    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
+        ActorPoolScalingRequest.downscale(
+            delta=-1,
+            force=True,
+            reason="pool exceeding max size",
+        )
+    )
+    actor_info(running=3, active=3)
+    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
+        ActorPoolScalingRequest.downscale(
+            delta=-1,
+            force=True,
+            reason="pool exceeding max size",
+        )
+    )
+
+    # Completion takes precedence over admission state and releases the whole pool.
+    op.has_execution_finished.return_value = True
+    actor_info(running=3, idle=3)
+    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
+        ActorPoolScalingRequest.downscale(
+            delta=-3, force=True, reason="consumed all inputs"
+        )
+    )
+
+
+def _mock_admission_stage(*, inputs=()):
+    op = MagicMock()
+    op.input_dependencies = list(inputs)
+    op.resource_admission_spec.return_value = _elastic_spec(max_units=1)
+    op.resource_admission_incompatible.return_value = False
+    op.has_completed.return_value = False
+    op.has_execution_finished.return_value = False
+    op.internal_input_queue_num_blocks.return_value = 0
+    op.num_active_tasks.return_value = 0
+    op.current_logical_usage.return_value = ExecutionResources.zero()
+    op.pending_logical_usage.return_value = ExecutionResources.zero()
+    op.can_release_resource_admission.return_value = True
+    op._inputs_complete = False
+    op.metrics.num_inputs_received = 1
+
+    actor_info = SimpleNamespace(
+        running=0,
+        pending=0,
+        restarting=0,
+        active=0,
+        idle=0,
+    )
+    op.get_actor_info.return_value = actor_info
+
+    pool = MagicMock(spec=_ActorPool)
+    pool.current_size.return_value = 0
+    pool.num_running_actors.return_value = 0
+    pool.min_size.return_value = 1
+    pool.max_size.return_value = 1
+    pool.initial_size.return_value = 1
+    pool.per_actor_resource_usage.return_value = ExecutionResources(gpu=1)
+    pool.get_actor_info.return_value = actor_info
+    pool.get_pool_util.return_value = float("inf")
+    op.get_autoscaling_actor_pools.return_value = [pool]
+
+    state = MagicMock(spec=OpState)
+    state.total_enqueued_input_blocks.return_value = 1
+    return op, pool, state
+
+
+def _make_admission_autoscaler(topology, resource_manager):
+    return DefaultActorAutoscaler(
+        topology=topology,
+        resource_manager=resource_manager,
+        config=AutoscalingConfig(
+            actor_pool_util_upscaling_threshold=1.0,
+            actor_pool_util_downscaling_threshold=0.5,
+            actor_pool_max_upscaling_delta=None,
+        ),
+    )
+
+
+def test_resource_admission_sufficient_capacity_scales_all_stages_together():
+    """One autoscaler pass starts every admitted stage when all claims fit."""
+    upstream, upstream_pool, upstream_state = _mock_admission_stage()
+    downstream, downstream_pool, downstream_state = _mock_admission_stage(
+        inputs=[upstream]
+    )
+    topology = {
+        upstream: upstream_state,
+        downstream: downstream_state,
+    }
+    resource_manager = MagicMock(spec=ResourceManager)
+    resource_manager._options = ExecutionOptions()
+    resource_manager.get_global_limits.return_value = ExecutionResources(gpu=2)
+
+    controller = _ResourceAdmissionController(topology, resource_manager)
+    limits = resource_manager.get_global_limits()
+    controller.update_admission(limits)
+    resource_manager.get_allocation_target.return_value = None
+    controller.update_allocation_grants(limits)
+    resource_manager.get_resource_admission_grant.side_effect = controller.get_grant
+
+    assert controller.get_grant(upstream) == ResourceAdmissionGrant(
+        max_units=1, may_submit=True
+    )
+    assert controller.get_grant(downstream) == ResourceAdmissionGrant(
+        max_units=1, may_submit=True
+    )
+
+    _make_admission_autoscaler(topology, resource_manager).try_trigger_scaling()
+
+    expected = ActorPoolScalingRequest.upscale(delta=1, reason="pool below min size")
+    upstream_pool.scale.assert_called_once_with(expected)
+    downstream_pool.scale.assert_called_once_with(expected)
+
+
+def test_resource_admission_zero_capacity_seeds_only_autoscaling_frontier():
+    frontier, frontier_pool, frontier_state = _mock_admission_stage()
+    blocked, blocked_pool, blocked_state = _mock_admission_stage(inputs=[frontier])
+    topology = {
+        frontier: frontier_state,
+        blocked: blocked_state,
+    }
+    resource_manager = MagicMock(spec=ResourceManager)
+    resource_manager._options = ExecutionOptions()
+    resource_manager.get_global_limits.return_value = ExecutionResources.zero()
+
+    controller = _ResourceAdmissionController(topology, resource_manager)
+    limits = resource_manager.get_global_limits()
+    controller.update_admission(limits)
+    resource_manager.get_allocation_target.return_value = None
+    controller.update_allocation_grants(limits)
+    resource_manager.get_resource_admission_grant.side_effect = controller.get_grant
+    autoscaler = _make_admission_autoscaler(topology, resource_manager)
+
+    assert controller.get_grant(frontier) == ResourceAdmissionGrant(
+        max_units=1, may_submit=False
+    )
+    assert controller.get_grant(blocked) == ResourceAdmissionGrant(
+        max_units=0, may_submit=False
+    )
+
+    autoscaler.try_trigger_scaling()
+    frontier_pool.scale.assert_called_once_with(
+        ActorPoolScalingRequest.upscale(delta=1, reason="pool below min size")
+    )
+    blocked_pool.scale.assert_called_once_with(
+        ActorPoolScalingRequest.no_op(reason="reached max size")
+    )
+
+
+def test_resource_admission_is_independent_of_proportional_reservations():
+    data_context = DataContext()
+    data_context.op_resource_reservation_enabled = False
+    data_context.wait_for_min_actors_s = 10
+    data_context._enable_resource_admission_control = True
+    op = MapOperator.create(
+        map_transformer=MagicMock(),
+        input_op=InputDataBuffer(data_context, input_data=[]),
+        data_context=data_context,
+        compute_strategy=ActorPoolStrategy(size=3),
+        ray_remote_args={"num_gpus": 1},
+    )
+    assert isinstance(op, ActorPoolMapOperator)
+    assert op.resource_admission_spec().minimum_resources == ExecutionResources(
+        cpu=3, gpu=3
+    )
+    op.apply_resource_admission_grant(
+        ResourceAdmissionGrant(max_units=0, may_submit=False)
+    )
+    op._actor_pool.scale = MagicMock()
+
+    with patch(
+        "ray.data._internal.execution.operators.actor_pool_map_operator.ray.remote"
+    ):
+        op.start(ExecutionOptions(), MagicMock())
+
+    op._actor_pool.scale.assert_not_called()
+
+
+@pytest.mark.timeout(60)
+def test_resource_admission_sufficient_gpus_stream_stages_concurrently(monkeypatch):
+    """Two admitted one-GPU stages overlap instead of waiting for handoff."""
+
+    class Signal:
+        def __init__(self):
+            self._event = asyncio.Event()
+
+        async def wait(self):
+            await self._event.wait()
+
+        def send(self):
+            self._event.set()
+
+    class Upstream:
+        def __init__(self, signal):
+            self._signal = signal
+            self._calls = 0
+
+        def __call__(self, batch):
+            self._calls += 1
+            if self._calls == 2:
+                # This can finish only after the downstream stage consumes the
+                # first block, proving both one-GPU pools run concurrently.
+                ray.get(self._signal.wait.remote(), timeout=30)
+            return batch
+
+    class Downstream:
+        def __init__(self, signal):
+            self._signal = signal
+            self._sent = False
+
+        def __call__(self, batch):
+            if not self._sent:
+                ray.get(self._signal.send.remote())
+                self._sent = True
+            return batch
+
+    ray.shutdown()
+    ray.init(num_cpus=2, num_gpus=2, include_dashboard=False)
+    data_context = DataContext.get_current()
+    old_values = (
+        data_context.op_resource_reservation_enabled,
+        data_context.wait_for_min_actors_s,
+        data_context._enable_resource_admission_control,
+    )
+    data_context.op_resource_reservation_enabled = True
+    data_context.wait_for_min_actors_s = 0
+    data_context._enable_resource_admission_control = True
+
+    managed_at_execution_start = []
+    original_start = ActorPoolMapOperator.start
+
+    def record_admission_at_start(self, *args, **kwargs):
+        result = original_start(self, *args, **kwargs)
+        if self._ray_remote_args.get("num_gpus", 0) > 0:
+            managed_at_execution_start.append(
+                self.resource_admission_spec() is not None
+            )
+        return result
+
+    monkeypatch.setattr(ActorPoolMapOperator, "start", record_admission_at_start)
+
+    try:
+        signal = ray.remote(num_cpus=0)(Signal).remote()
+        ds = (
+            ray.data.range(4, override_num_blocks=2)
+            .map_batches(
+                Upstream,
+                batch_size=2,
+                compute=ActorPoolStrategy(size=1, max_tasks_in_flight_per_actor=1),
+                num_cpus=0,
+                num_gpus=1,
+                scheduling_strategy="SPREAD",
+                fn_constructor_args=[signal],
+            )
+            .map_batches(
+                Downstream,
+                batch_size=2,
+                compute=ActorPoolStrategy(size=1, max_tasks_in_flight_per_actor=1),
+                num_cpus=0,
+                num_gpus=1,
+                scheduling_strategy="DEFAULT",
+                fn_constructor_args=[signal],
+            )
+        )
+
+        assert sorted(row["id"] for row in ds.take_all()) == list(range(4))
+        assert managed_at_execution_start == [True, True]
+        deadline = time.monotonic() + 10
+        while (
+            ray.available_resources().get("GPU", 0) != 2 and time.monotonic() < deadline
+        ):
+            time.sleep(0.1)
+        assert ray.available_resources().get("GPU", 0) == 2
+    finally:
+        (
+            data_context.op_resource_reservation_enabled,
+            data_context.wait_for_min_actors_s,
+            data_context._enable_resource_admission_control,
+        ) = old_values
+        ray.shutdown()
 
 
 def test_actor_pool_scaling():
@@ -34,6 +480,7 @@ def test_actor_pool_scaling():
         spec=ResourceManager,
         get_budget=MagicMock(return_value=None),
         get_allocation=MagicMock(return_value=None),
+        get_resource_admission_grant=MagicMock(return_value=None),
     )
     autoscaler = DefaultActorAutoscaler(
         topology=MagicMock(),
@@ -325,6 +772,7 @@ def autoscaler_max_upscaling_delta_setup():
         spec=ResourceManager,
         get_budget=MagicMock(return_value=None),
         get_allocation=MagicMock(return_value=None),
+        get_resource_admission_grant=MagicMock(return_value=None),
     )
 
     actor_pool = MagicMock(

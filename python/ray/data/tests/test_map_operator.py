@@ -381,9 +381,11 @@ def test_map_operator_disable_block_shaping_with_batches(
 
 
 @pytest.mark.parametrize("use_actors", [False, True])
-def test_map_operator_ray_args(shutdown_only, use_actors):
+def test_map_operator_ray_args(shutdown_only, restore_data_context, use_actors):
     ray.shutdown()
     ray.init(num_cpus=0, num_gpus=1)
+    # This directly drives an operator without StreamingExecutor/ResourceManager.
+    DataContext.get_current()._enable_resource_admission_control = False
     # Create with inputs.
     input_op = InputDataBuffer(
         DataContext.get_current(), make_ref_bundles([[i] for i in range(10)])
@@ -425,9 +427,11 @@ def test_map_operator_ray_args(shutdown_only, use_actors):
 
 
 @pytest.mark.parametrize("use_actors", [False, True])
-def test_map_operator_shutdown(shutdown_only, use_actors):
+def test_map_operator_shutdown(shutdown_only, restore_data_context, use_actors):
     ray.shutdown()
     ray.init(num_cpus=0, num_gpus=1)
+    # This directly drives an operator without StreamingExecutor/ResourceManager.
+    DataContext.get_current()._enable_resource_admission_control = False
 
     def _sleep(block_iter: Iterable[Block]) -> Iterable[Block]:
         time.sleep(999)

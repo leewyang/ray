@@ -9,7 +9,7 @@ import pytest
 from freezegun import freeze_time
 
 import ray
-from ray.data._internal.compute import ComputeStrategy
+from ray.data._internal.compute import ActorPoolStrategy, ComputeStrategy
 from ray.data._internal.execution.block_ref_counter import BlockRefCounter
 from ray.data._internal.execution.interfaces import BlockEntry, PhysicalOperator
 from ray.data._internal.execution.interfaces.execution_options import (
@@ -287,6 +287,76 @@ def test_incompatible_gpu_owner_falls_back_whole_topology():
         "disabling resource admission for the whole topology"
         in warning.call_args.args[0]
     )
+
+
+def test_cpu_actor_owner_falls_back_whole_topology():
+    data_context = DataContext.get_current()
+    source = InputDataBuffer(data_context, input_data=[])
+    managed = mock_map_op(
+        source,
+        ray_remote_args={"num_gpus": 1},
+        compute_strategy=ActorPoolStrategy(size=1),
+        name="ManagedGPU",
+    )
+    cpu_owner = mock_map_op(
+        managed,
+        ray_remote_args={"num_cpus": 1},
+        compute_strategy=ActorPoolStrategy(size=1),
+        name="CPUOwner",
+    )
+    states = {
+        source: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
+        managed: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
+        cpu_owner: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
+    }
+
+    with patch(
+        "ray.data._internal.execution.resource_admission.logger.warning"
+    ) as warning:
+        controller = _ResourceAdmissionController(
+            states,
+            _mock_admission_resource_manager(ExecutionResources(cpu=1, gpu=1)),
+        )
+
+    assert managed.resource_admission_spec() is not None
+    assert cpu_owner.resource_admission_spec() is None
+    assert cpu_owner.resource_admission_incompatible()
+    assert not controller.has_participants()
+    assert managed._admission_grant is None
+    assert cpu_owner._admission_grant is None
+    warning.assert_called_once()
+
+
+def test_cpu_hash_shuffle_owner_falls_back_whole_topology():
+    data_context = DataContext.get_current()
+    source = InputDataBuffer(data_context, input_data=[])
+    other_source = InputDataBuffer(data_context, input_data=[])
+    managed = mock_map_op(
+        source,
+        ray_remote_args={"num_gpus": 1},
+        compute_strategy=ActorPoolStrategy(size=1),
+        name="ManagedGPU",
+    )
+    cpu_hash_join = mock_join_op(managed, other_source)
+    states = {
+        source: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
+        other_source: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
+        managed: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
+        cpu_hash_join: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
+    }
+
+    with patch(
+        "ray.data._internal.execution.resource_admission.logger.warning"
+    ) as warning:
+        controller = _ResourceAdmissionController(
+            states,
+            _mock_admission_resource_manager(ExecutionResources(cpu=2, gpu=1)),
+        )
+
+    assert cpu_hash_join.resource_admission_incompatible()
+    assert not controller.has_participants()
+    assert managed._admission_grant is None
+    warning.assert_called_once()
 
 
 def test_allocator_disabled_distributes_capacity_after_all_floors():

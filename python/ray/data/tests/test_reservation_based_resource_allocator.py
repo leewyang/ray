@@ -278,6 +278,9 @@ class TestReservationOpResourceAllocator:
     def test_reserve_min_resources_for_gpu_ops(self, restore_data_context):
         """Test that we'll reserve enough resources for ActorPoolMapOperator
         that uses GPU."""
+        # This test exercises the legacy allocator formula directly, without an
+        # executor demand/admission cycle.
+        DataContext.get_current()._enable_resource_admission_control = False
         global_limits = ExecutionResources(cpu=6, gpu=8, object_store_memory=1600)
 
         o1 = InputDataBuffer(DataContext.get_current(), [])
@@ -286,6 +289,7 @@ class TestReservationOpResourceAllocator:
             ray_remote_args={"num_cpus": 0, "num_gpus": 1},
             compute_strategy=ray.data.ActorPoolStrategy(size=8),
         )
+        o2.start = MagicMock()
         # Mock min_max_resource_requirements to return a minimum of 800 bytes
         # (simulating 8 actors * 100 bytes per pending output)
         o2.min_max_resource_requirements = MagicMock(
@@ -758,6 +762,10 @@ class TestReservationOpResourceAllocator:
         """
         DataContext.get_current().op_resource_reservation_enabled = True
         DataContext.get_current().op_resource_reservation_ratio = 0.5
+        # This is a stock reservation-budget test with mocked usage, not an
+        # admission-controller lifecycle test.
+        DataContext.get_current()._enable_resource_admission_control = False
+
         # Build pipeline: Input -> Read -> Preprocess -> Infer(GPU) -> Write
         # This mirrors the production pipeline structure
         o1 = InputDataBuffer(DataContext.get_current(), [])
@@ -769,6 +777,7 @@ class TestReservationOpResourceAllocator:
             compute_strategy=ray.data.ActorPoolStrategy(min_size=1, max_size=4),
             name="Infer",
         )
+        o4.start = MagicMock()
         o5 = mock_map_op(o4, ray_remote_args={"num_cpus": 1}, name="Write")
 
         topo = build_streaming_topology(o5, ExecutionOptions(), noop_counter())

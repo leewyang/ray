@@ -60,6 +60,10 @@ from ray.data._internal.execution.operators.map_operator import (
     _map_task,
 )
 from ray.data._internal.execution.operators.map_transformer import MapTransformer
+from ray.data._internal.execution.resource_admission import (
+    ResourceAdmissionGrant,
+    ResourceAdmissionSpec,
+)
 from ray.data._internal.execution.util import locality_string, merge_label_selector
 from ray.data._internal.remote_fn import _add_system_error_to_retry_exceptions
 from ray.data._internal.utils.heapdict import heapdict
@@ -170,6 +174,11 @@ class ActorPoolMapOperator(MapOperator):
         )
 
         self._min_rows_per_bundle = min_rows_per_bundle
+        # Record user-provided dynamic options before optimizer rules add estimates.
+        # The output-size optimizer can add memory only after a floor actor has
+        # produced output; Ray Core still gates optional elastic actors on that
+        # dynamically estimated memory.
+        self._uses_user_provided_remote_args_fn = ray_remote_args_fn is not None
         self._ray_remote_args_fn = ray_remote_args_fn
         self._ray_remote_args = self._apply_default_remote_args(
             self._ray_remote_args, self.data_context
@@ -187,6 +196,8 @@ class ActorPoolMapOperator(MapOperator):
         self._map_worker_cls = type(map_worker_cls_name, (_MapWorker,), {})
 
         self._actor_pool = self._create_actor_pool(compute_strategy)
+        self._admission_grant: Optional[ResourceAdmissionGrant] = None
+        self._min_actors_wait_start_time: Optional[float] = None
         # A queue of bundles awaiting dispatch to actors.
         self._bundle_queue = create_bundle_queue()
         # Cached actor class.
@@ -276,17 +287,22 @@ class ActorPoolMapOperator(MapOperator):
         super().start(options, block_ref_counter)
 
         self._actor_cls = ray.remote(**self._ray_remote_args)(self._map_worker_cls)
-        self._actor_pool.scale(
-            ActorPoolScalingRequest(
-                delta=self._actor_pool.initial_size(), reason="scaling to initial size"
+        if self._admission_grant is None:
+            self._actor_pool.scale(
+                ActorPoolScalingRequest(
+                    delta=self._actor_pool.initial_size(),
+                    reason="scaling to initial size",
+                )
             )
-        )
 
         # If `wait_for_min_actors_s` is specified and is positive, then
         # Actor Pool will block until min number of actors is provisioned.
         #
         # Otherwise, all actors will be provisioned asynchronously.
-        if self.data_context.wait_for_min_actors_s > 0:
+        if (
+            self._admission_grant is None
+            and self.data_context.wait_for_min_actors_s > 0
+        ):
             refs = self._actor_pool.get_pending_actor_refs()
 
             logger.debug(
@@ -304,6 +320,114 @@ class ActorPoolMapOperator(MapOperator):
                     "enough resources for the requested actor pool."
                 )
 
+    def resource_admission_spec(self) -> Optional[ResourceAdmissionSpec]:
+        if not self.data_context._enable_resource_admission_control:
+            return None
+
+        per_actor = self._actor_pool.per_actor_resource_usage()
+        if per_actor.gpu <= 0:
+            return None
+
+        # Without an explicit startup wait, Ray's actor pool minimum is a desired
+        # size rather than a progress requirement: one ready actor may consume
+        # input while the rest remain pending. Pools whose initial demand is
+        # larger than this floor use the whole-topology compatibility fallback
+        # below so admission doesn't silently change that behavior.
+        min_units = self._admission_floor_units()
+        max_size = self._actor_pool.max_size()
+        return ResourceAdmissionSpec(
+            minimum_resources=per_actor.scale(min_units),
+            unit_resources=per_actor,
+            min_units=min_units,
+            max_units=None if max_size == float("inf") else int(max_size),
+        )
+
+    def resource_admission_incompatible(self) -> bool:
+        if self._uses_user_provided_remote_args_fn:
+            return True
+
+        per_actor = self._actor_pool.per_actor_resource_usage()
+        remote_args = merge_label_selector(
+            self._ray_remote_args, self.data_context.execution_options.label_selector
+        )
+        strategy = self._ray_remote_args.get("scheduling_strategy")
+        unsupported = (
+            "resources",
+            "accelerator_type",
+            "label_selector",
+            "fallback_strategy",
+            "name",
+            "lifetime",
+            "get_if_exists",
+            "placement_group",
+            "placement_group_bundle_index",
+            "placement_group_capture_child_tasks",
+        )
+        if strategy not in (None, "DEFAULT", "SPREAD") or any(
+            name in remote_args for name in unsupported
+        ):
+            return True
+        if per_actor.gpu <= 0:
+            # A CPU or memory actor pool acquires persistent resources eagerly.
+            # A Core actor with no specified resource instead requires one CPU
+            # per method.
+            # Treat it as incompatible with managed owners so the whole topology
+            # retains legacy acquisition ordering instead of mixing eager and
+            # admission-gated owners.
+            return not per_actor.is_zero() or (
+                self._ray_remote_args.get("num_cpus") is None
+                and self._ray_remote_args.get("num_gpus") is None
+            )
+        return self._actor_pool.initial_size() > self._admission_floor_units()
+
+    def _admission_floor_units(self) -> int:
+        return (
+            self._actor_pool.min_size()
+            if self.data_context.wait_for_min_actors_s > 0
+            else 1
+        )
+
+    def apply_resource_admission_grant(self, grant: ResourceAdmissionGrant) -> None:
+        self._admission_grant = grant
+        if not grant.may_submit:
+            self._min_actors_wait_start_time = None
+
+    def can_release_resource_admission(self) -> bool:
+        stream_finished = self._inputs_complete or self.has_execution_finished()
+        return (
+            self.internal_input_queue_num_blocks() == 0
+            and self._actor_pool.num_active_actors() == 0
+            and (self._metrics.num_inputs_received == 0 or stream_finished)
+        )
+
+    def _min_actors_ready(self) -> bool:
+        return (
+            self.data_context.wait_for_min_actors_s <= 0
+            or self._actor_pool.num_running_actors() >= self._actor_pool.min_size()
+        )
+
+    def _check_min_actors_start_timeout(self) -> None:
+        wait_started = self._min_actors_wait_start_time
+        if self._min_actors_ready():
+            self._min_actors_wait_start_time = None
+        elif wait_started is None:
+            self._min_actors_wait_start_time = time.monotonic()
+        elif time.monotonic() - wait_started >= self.data_context.wait_for_min_actors_s:
+            raise ray.exceptions.GetTimeoutError(
+                "Timed out while starting actors. This may mean that the cluster "
+                "does not have enough resources for the requested actor pool."
+            )
+
+    def _admission_allows_scheduling(self) -> bool:
+        grant = self._admission_grant
+        if grant is None:
+            return True
+        if not grant.may_submit:
+            return False
+        if self._actor_pool.current_size() > grant.max_units:
+            return False
+        return self._min_actors_ready()
+
     def can_add_input(self) -> bool:
         """NOTE: PLEASE READ CAREFULLY
 
@@ -315,7 +439,9 @@ class ActorPoolMapOperator(MapOperator):
             should be able to launch a task.
 
         """
-        return self._actor_pool.can_schedule_task()
+        return (
+            self._admission_allows_scheduling() and self._actor_pool.can_schedule_task()
+        )
 
     def _start_actor(
         self, labels: Dict[str, str], logical_actor_id: LogicalActorId
@@ -391,9 +517,11 @@ class ActorPoolMapOperator(MapOperator):
     def _try_schedule_tasks_internal(self) -> int:
         """Try to dispatch tasks from the internal queue. Returns the # of tasks submitted"""
 
+        if not self._admission_allows_scheduling():
+            return 0
+
         num_submitted_tasks = 0
         while self._bundle_queue.has_next():
-
             bundle = self._bundle_queue.peek_next()
             actor = self._actor_pool.select_actors(
                 bundle=bundle,
@@ -575,6 +703,13 @@ class ActorPoolMapOperator(MapOperator):
     ) -> Dict[str, Any]:
         """Apply defaults to the actor creation remote args."""
         ray_remote_args = ray_remote_args.copy()
+        if (
+            ray_remote_args.get("num_cpus") is None
+            and ray_remote_args.get("num_gpus") is not None
+        ):
+            # Ray Core defaults actors with an explicit GPU option to one
+            # lifetime CPU. Keep accounting consistent with Core's bundle.
+            ray_remote_args["num_cpus"] = 1
         if "scheduling_strategy" not in ray_remote_args:
             ray_remote_args["scheduling_strategy"] = data_context.scheduling_strategy
         # Enable actor fault tolerance by default, with infinite actor recreations and
@@ -616,6 +751,9 @@ class ActorPoolMapOperator(MapOperator):
 
         # Trigger Actor Pool's state refresh
         self._actor_pool.refresh_actor_state()
+        grant = self._admission_grant
+        if grant is not None and grant.max_units > 0:
+            self._check_min_actors_start_timeout()
 
     def get_actor_info(self) -> ActorPoolInfo:
         """Returns Actor counts for Alive, Restarting and Pending Actors."""
