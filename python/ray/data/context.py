@@ -710,8 +710,9 @@ class DataContext:
             ``"auto"`` uses 80% of ``gpu_shuffle_rmm_pool_size``; ``None`` disables
             spilling.
         gpu_shuffle_setup_timeout_s: Maximum time in seconds to wait for UCXX
-            communicator setup (actor creation + root/worker init) before raising
-            a ``TimeoutError``. Defaults to 120 seconds.
+            root/worker initialization after the shuffle placement group is ready.
+            Placement-group provisioning remains governed by Ray's autoscaler.
+            Defaults to 120 seconds.
         isolate_read_workers: If ``True``, other operators' tasks don't get scheduled on
             the same worker processes as the read operators'. This prevents large
             PyArrow memory allocation during reads from inflating the resident memory of

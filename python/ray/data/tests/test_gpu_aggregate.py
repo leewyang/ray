@@ -314,6 +314,11 @@ class TestGPUHashAggregatePlanning:
         mock_default_pool.assert_not_called()
         assert op._aggregation_plan is aggregation_plan
         assert op._rank_pool.nranks == 4
+        spec = op.resource_admission_spec()
+        assert spec is not None
+        assert spec.max_units == 1
+        assert spec.unit_resources is None
+        assert spec.minimum_resources == ExecutionResources(cpu=4, gpu=4)
 
     def test_gpu_shuffle_unsupported_aggregate_falls_back_to_cpu_hash_aggregate(self):
         from ray.data._internal.execution.operators.hash_aggregate import (
@@ -869,6 +874,7 @@ class TestGPUHashAggregateActorReal:
         )
 
         _, root_address = ray.get(actor.setup_root.remote())
+        assert isinstance(root_address, bytes)
         ray.get(actor.setup_worker.remote(root_address))
         return actor
 
