@@ -9,7 +9,6 @@ https://docs.rapids.ai/api/cudf/latest/developer_guide/testing/).
 
 import pandas as pd
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 import ray
@@ -18,7 +17,6 @@ from ray.data._internal.execution.interfaces.ref_bundle import (
     _ref_bundles_iterator_to_block_refs_list,
 )
 from ray.data.block import BlockAccessor, BlockType
-from ray.data.context import DataContext
 from ray.data.expressions import col
 from ray.data.tests.conftest import *  # noqa
 
@@ -126,40 +124,6 @@ class TestCudfBatchBlocks:
         assert isinstance(batches[1], cudf.DataFrame)
         cudf.testing.assert_eq(batches[0], cudf.DataFrame({"foo": [0, 1, 2]}))
         cudf.testing.assert_eq(batches[1], cudf.DataFrame({"foo": [3, 4, 5]}))
-
-
-class TestCudfParquetRead:
-    """Tests for reading Parquet directly into cuDF blocks."""
-
-    def test_read_parquet_cudf_blocks(self, ray_start_regular_shared, tmp_path):
-        pq.write_table(
-            pa.table({"id": [0, 1, 2], "value": ["a", "b", "c"]}),
-            tmp_path / "part.parquet",
-            row_group_size=2,
-        )
-
-        ctx = DataContext.get_current()
-        original_use_datasource_v2 = ctx.use_datasource_v2
-        ctx.use_datasource_v2 = False
-        try:
-            ds = ray.data.read_parquet(
-                str(tmp_path),
-                batch_format="cudf",
-                num_gpus=0.001,
-            ).materialize()
-        finally:
-            ctx.use_datasource_v2 = original_use_datasource_v2
-
-        blocks = ray.get(
-            _ref_bundles_iterator_to_block_refs_list(ds.iter_internal_ref_bundles())
-        )
-        assert blocks
-        assert all(isinstance(block, cudf.DataFrame) for block in blocks)
-        assert ds.take_all() == [
-            {"id": 0, "value": "a"},
-            {"id": 1, "value": "b"},
-            {"id": 2, "value": "c"},
-        ]
 
 
 @pytest.mark.parametrize(

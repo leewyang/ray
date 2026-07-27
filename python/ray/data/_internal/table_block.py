@@ -569,7 +569,7 @@ class TableBlockAccessor(BlockAccessor):
         return results
 
     @classmethod
-    def try_convert_block_type(cls, block: Block, block_type: BlockType):
+    def try_convert_block_type(cls, block: Block, block_type: BlockType) -> Block:
         if block_type == BlockType.ARROW:
             return BlockAccessor.for_block(block).to_arrow()
         elif block_type == BlockType.PANDAS:

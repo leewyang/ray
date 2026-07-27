@@ -69,25 +69,9 @@ _PANDAS_EXPR_OPS_MAP: Dict[Operation, Callable[..., Any]] = {
 
 
 _CUDF_EXPR_OPS_MAP: Dict[Operation, Callable[..., Any]] = {
-    Operation.ADD: operator.add,
-    Operation.SUB: operator.sub,
-    Operation.MUL: operator.mul,
-    Operation.DIV: operator.truediv,
-    Operation.MOD: operator.mod,
-    Operation.FLOORDIV: operator.floordiv,
-    Operation.GT: operator.gt,
-    Operation.LT: operator.lt,
-    Operation.GE: operator.ge,
-    Operation.LE: operator.le,
-    Operation.EQ: operator.eq,
-    Operation.NE: operator.ne,
-    Operation.AND: operator.and_,
-    Operation.OR: operator.or_,
-    Operation.NOT: operator.invert,
+    **_PANDAS_EXPR_OPS_MAP,
     Operation.IS_NULL: lambda operand: operand.isnull(),
     Operation.IS_NOT_NULL: lambda operand: operand.notnull(),
-    Operation.IN: lambda left, right: left.isin(right),
-    Operation.NOT_IN: lambda left, right: ~left.isin(right),
 }
 
 

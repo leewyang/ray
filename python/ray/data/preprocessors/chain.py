@@ -16,6 +16,7 @@ from ray.data.util.data_batch_conversion import BatchFormat
 if TYPE_CHECKING:
     from ray.air.data_batch_type import DataBatchType
     from ray.data.dataset import Dataset
+    from ray.data.preprocessors.gpu import GPUChain
 
 
 @SerializablePreprocessor(version=1, identifier="io.ray.preprocessors.chain")
@@ -52,31 +53,6 @@ class Chain(SerializablePreprocessorBase):
         *preprocessors: The preprocessors to sequentially compose.
     """
 
-    def fit_status(self):
-        fittable_count = 0
-        fitted_count = 0
-
-        for p in self._preprocessors:
-            if p.fit_status() == Preprocessor.FitStatus.FITTED:
-                fittable_count += 1
-                fitted_count += 1
-            elif p.fit_status() in (
-                Preprocessor.FitStatus.NOT_FITTED,
-                Preprocessor.FitStatus.PARTIALLY_FITTED,
-            ):
-                fittable_count += 1
-            else:
-                assert p.fit_status() == Preprocessor.FitStatus.NOT_FITTABLE
-        if fittable_count > 0:
-            if fitted_count == fittable_count:
-                return Preprocessor.FitStatus.FITTED
-            elif fitted_count > 0:
-                return Preprocessor.FitStatus.PARTIALLY_FITTED
-            else:
-                return Preprocessor.FitStatus.NOT_FITTED
-        else:
-            return Preprocessor.FitStatus.NOT_FITTABLE
-
     def __init__(self, *preprocessors: SerializablePreprocessorBase):
         super().__init__()
         self._preprocessors = preprocessors
@@ -84,7 +60,34 @@ class Chain(SerializablePreprocessorBase):
 
     @property
     def preprocessors(self) -> Tuple[SerializablePreprocessorBase, ...]:
+        """Return the preprocessors in execution order."""
         return self._preprocessors
+
+    def fit_status(self) -> Preprocessor.FitStatus:
+        """Return the aggregate fit status of the contained preprocessors."""
+        fittable_count = 0
+        fitted_count = 0
+
+        for preprocessor in self._preprocessors:
+            status = preprocessor.fit_status()
+            if status == Preprocessor.FitStatus.FITTED:
+                fittable_count += 1
+                fitted_count += 1
+            elif status in (
+                Preprocessor.FitStatus.NOT_FITTED,
+                Preprocessor.FitStatus.PARTIALLY_FITTED,
+            ):
+                fittable_count += 1
+            else:
+                assert status == Preprocessor.FitStatus.NOT_FITTABLE
+
+        if fittable_count == 0:
+            return Preprocessor.FitStatus.NOT_FITTABLE
+        if fitted_count == fittable_count:
+            return Preprocessor.FitStatus.FITTED
+        if fitted_count > 0:
+            return Preprocessor.FitStatus.PARTIALLY_FITTED
+        return Preprocessor.FitStatus.NOT_FITTED
 
     def _fit(self, ds: "Dataset") -> SerializablePreprocessorBase:
         for preprocessor in self._preprocessors[:-1]:
@@ -102,6 +105,19 @@ class Chain(SerializablePreprocessorBase):
         num_gpus_per_worker: float = 1,
         concurrency: Optional[int] = None,
     ) -> "Chain":
+        """Fit the chain using either its standard or GPU implementation.
+
+        Args:
+            ds: Dataset used to fit each fittable preprocessor.
+            accelerator: Set to ``"gpu"`` to use equivalent GPU preprocessors.
+            batch_size: Rows per cuDF batch when using the GPU implementation.
+            num_gpus: Maximum number of concurrent GPU workers.
+            num_gpus_per_worker: GPUs reserved for each worker.
+            concurrency: Maximum number of concurrent workers.
+
+        Returns:
+            This fitted chain.
+        """
         if not self._use_gpu_accelerator(accelerator):
             self._gpu_chain = None
             return super().fit(ds)
@@ -146,6 +162,12 @@ class Chain(SerializablePreprocessorBase):
         num_gpus: Optional[int] = None,
         num_gpus_per_worker: float = 1,
     ) -> "Dataset":
+        """Fit the chain and transform ``ds`` in one pass.
+
+        GPU execution converts supported CPU preprocessors to a fused
+        :class:`GPUChain`; the default path retains the standard sequential
+        behavior.
+        """
         if not self._use_gpu_accelerator(accelerator):
             for preprocessor in self._preprocessors:
                 ds = preprocessor.fit_transform(
@@ -213,7 +235,23 @@ class Chain(SerializablePreprocessorBase):
         num_gpus_per_worker: float,
         concurrency: Optional[int],
         copy_fitted_state: bool,
-    ) -> SerializablePreprocessorBase:
+    ) -> "GPUChain":
+        """Build the GPU equivalent of this chain.
+
+        Args:
+            batch_size: Rows per cuDF batch, or ``None`` for the GPU default.
+            num_gpus_per_worker: GPUs reserved for each worker.
+            concurrency: Maximum number of concurrent GPU workers.
+            copy_fitted_state: Whether to copy fitted statistics into the GPU
+                preprocessors.
+
+        Returns:
+            A fused GPU chain with equivalent supported preprocessors.
+
+        Raises:
+            TypeError: If the chain contains a preprocessor without a GPU
+                equivalent.
+        """
         from ray.data.preprocessors.encoder import OrdinalEncoder
         from ray.data.preprocessors.gpu import (
             _DEFAULT_GPU_BATCH_SIZE,
@@ -290,9 +328,8 @@ class Chain(SerializablePreprocessorBase):
             concurrency=concurrency,
         )
 
-    def _sync_fitted_state_from_gpu_chain(
-        self, gpu_chain: SerializablePreprocessorBase
-    ) -> None:
+    def _sync_fitted_state_from_gpu_chain(self, gpu_chain: "GPUChain") -> None:
+        """Copy fitted statistics from a GPU chain to the CPU preprocessors."""
         for preprocessor, gpu_preprocessor in zip(
             self._preprocessors, gpu_chain.preprocessors
         ):
@@ -333,6 +370,21 @@ class Chain(SerializablePreprocessorBase):
         num_gpus: Optional[int] = None,
         num_gpus_per_worker: float = 1,
     ) -> "Dataset":
+        """Transform a dataset using the standard or fused GPU chain.
+
+        Args:
+            ds: Dataset to transform.
+            batch_size: Rows per transform batch.
+            num_cpus: CPUs reserved per standard transform worker.
+            memory: Heap memory reserved per standard transform worker.
+            concurrency: Maximum number of concurrent workers.
+            accelerator: Set to ``"gpu"`` to use the fused GPU implementation.
+            num_gpus: Maximum number of concurrent GPU workers.
+            num_gpus_per_worker: GPUs reserved for each GPU worker.
+
+        Returns:
+            The lazily transformed dataset.
+        """
         if not self._use_gpu_accelerator(accelerator):
             return super().transform(
                 ds,

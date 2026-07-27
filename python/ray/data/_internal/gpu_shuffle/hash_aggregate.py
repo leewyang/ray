@@ -1058,6 +1058,7 @@ class GPUStd(GPUAggregateFn):
         *,
         input_schema: Optional[Schema] = None,
     ) -> cudf.DataFrame:
+        """Compute count, mean, M2, and null-count partials for each group."""
         assert self.target_column is not None
 
         m2_col, mean_col, count_col, null_count_col = accumulator_columns
@@ -1118,6 +1119,7 @@ class GPUStd(GPUAggregateFn):
         accumulator_columns: Tuple[str, ...],
         output_name: str,
     ) -> cudf.DataFrame:
+        """Combine group partials into standard deviations using parallel M2."""
         m2_col, mean_col, count_col, null_count_col = accumulator_columns
         final_m2_col = f"{m2_col}_final_M2"
         final_mean_col = f"{mean_col}_final_mean"
@@ -1207,20 +1209,6 @@ class GPUStd(GPUAggregateFn):
         input_schema: Optional[Schema] = None,
     ) -> Dict[str, Optional[DataType]]:
         return {output_name: DataType.from_numpy("float64")}
-
-
-def _empty_dataframe(
-    cudf_module: types.ModuleType,
-    columns: Sequence[str],
-    dtypes: Optional[Dict[str, Optional[DataType]]] = None,
-) -> cudf.DataFrame:
-    """Create an empty ``cudf.DataFrame`` with specified columns and dtypes."""
-    dtypes = dtypes or {}
-    df = cudf_module.DataFrame()
-    for column in columns:
-        df[column] = []
-        _cast_cudf_column_dtype(df, column, dtypes.get(column))
-    return df
 
 
 class GPUAggregationPlan:
@@ -1364,7 +1352,7 @@ class GPUAggregationPlan:
                 ).items():
                     _cast_cudf_column_dtype(result, column, dtype)
                 return result
-            return _empty_dataframe(
+            return self._empty_dataframe(
                 cudf_module,
                 list(key_columns) + list(self.accumulator_columns),
                 dtypes=self._partial_accumulator_dtypes(
@@ -1409,7 +1397,7 @@ class GPUAggregationPlan:
         )
 
         if len(df) == 0:
-            return _empty_dataframe(
+            return self._empty_dataframe(
                 cudf_module,
                 output_columns,
                 dtypes=self._final_cudf_dtypes(
@@ -1603,6 +1591,20 @@ class GPUAggregationPlan:
                 }
             )
         return dtypes
+
+    @staticmethod
+    def _empty_dataframe(
+        cudf_module: types.ModuleType,
+        columns: Sequence[str],
+        dtypes: Optional[Dict[str, Optional[DataType]]] = None,
+    ) -> cudf.DataFrame:
+        """Create an empty cuDF DataFrame with the requested columns and dtypes."""
+        dtypes = dtypes or {}
+        df = cudf_module.DataFrame()
+        for column in columns:
+            df[column] = []
+            _cast_cudf_column_dtype(df, column, dtypes.get(column))
+        return df
 
 
 def build_gpu_aggregation_plan(
@@ -1963,6 +1965,7 @@ class GPUGlobalAggregateOperator(AllToAllOperator):
         blocks: Iterable[Block],
         ctx: TaskContext,
     ) -> Iterator[Block]:
+        """Reduce each input bundle to one GPU partial-aggregate block."""
         import cudf
 
         del ctx
@@ -1975,7 +1978,7 @@ class GPUGlobalAggregateOperator(AllToAllOperator):
             if isinstance(aggregation_plan._input_schema, pa.Schema)
             else None
         )
-        projected_tables = []
+        projected_tables: List[pa.Table] = []
         required_columns = aggregation_plan.required_columns
         total_num_rows = 0
 
@@ -2055,7 +2058,8 @@ class GPUGlobalAggregateOperator(AllToAllOperator):
         refs: List[RefBundle],
         ctx: TaskContext,
     ) -> AllToAllTransformFnResult:
-        partial_blocks: List[Block] = []
+        """Launch and collect the single GPU task that combines all partials."""
+        partial_blocks: List[ray.ObjectRef[Block]] = []
         input_owned = all(ref_bundle.owns_blocks for ref_bundle in refs)
         for ref_bundle in refs:
             partial_blocks.extend(ref_bundle.block_refs)

@@ -1,5 +1,4 @@
 import logging
-import posixpath
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
 
@@ -10,8 +9,7 @@ from ray.data._internal.arrow_ops.transform_pyarrow import (
 from ray.data._internal.execution.interfaces import TaskContext
 from ray.data._internal.planner.plan_write_op import WRITE_UUID_KWARG_NAME
 from ray.data._internal.savemode import SaveMode
-from ray.data._internal.util import _is_local_scheme
-from ray.data.block import Block, BlockAccessor, _is_cudf_dataframe
+from ray.data.block import Block, BlockAccessor
 from ray.data.datasource.file_based_datasource import _resolve_kwargs
 from ray.data.datasource.file_datasink import _FileDatasink
 from ray.data.datasource.filename_provider import FilenameProvider
@@ -31,12 +29,6 @@ UNSUPPORTED_OPEN_STREAM_ARGS = {"path", "buffer", "metadata"}
 ARROW_DEFAULT_MAX_ROWS_PER_GROUP = 1024 * 1024
 
 DEFAULT_PARTITIONING_FLAVOR = "hive"
-CUDF_PARQUET_WRITE_ARGS = {
-    "compression",
-    "index",
-    "row_group_size",
-    "statistics",
-}
 
 logger = logging.getLogger(__name__)
 
@@ -210,15 +202,6 @@ class ParquetDatasink(_FileDatasink):
         )
 
         def write_blocks_to_path():
-            if self._should_write_native_cudf(blocks, user_schema, write_kwargs):
-                self._write_native_cudf_blocks(
-                    blocks,
-                    filename,
-                    ctx.kwargs[WRITE_UUID_KWARG_NAME],
-                    write_kwargs,
-                )
-                return
-
             tables = [BlockAccessor.for_block(block).to_arrow() for block in blocks]
             if user_schema is None:
                 output_schema = pa.unify_schemas([table.schema for table in tables])
@@ -243,50 +226,6 @@ class ParquetDatasink(_FileDatasink):
             max_attempts=WRITE_FILE_MAX_ATTEMPTS,
             max_backoff_s=WRITE_FILE_RETRY_MAX_BACKOFF_SECONDS,
         )
-
-    def _should_write_native_cudf(
-        self,
-        blocks: List[Block],
-        user_schema: Optional["pyarrow.Schema"],
-        write_kwargs: Dict[str, Any],
-    ) -> bool:
-        import ray
-
-        gpu_ids = ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
-        if not gpu_ids:
-            return False
-        if user_schema is not None:
-            return False
-        if self.partition_cols is not None:
-            return False
-        if self.min_rows_per_file is not None or self.max_rows_per_file is not None:
-            return False
-        if not _is_local_scheme(self.unresolved_path):
-            return False
-        if not all(_is_cudf_dataframe(block) for block in blocks):
-            return False
-        return set(write_kwargs).issubset(CUDF_PARQUET_WRITE_ARGS)
-
-    def _write_native_cudf_blocks(
-        self,
-        blocks: List[Block],
-        filename: str,
-        write_uuid: str,
-        write_kwargs: Dict[str, Any],
-    ) -> None:
-        import cudf
-
-        if len(blocks) == 1:
-            df = blocks[0]
-        else:
-            df = cudf.concat(blocks, ignore_index=True)
-
-        basename_template = self._get_basename_template(filename, write_uuid)
-        output_filename = basename_template.format(i=0)
-        output_path = posixpath.join(self.path, output_filename)
-        cudf_write_kwargs = dict(write_kwargs)
-        index = cudf_write_kwargs.pop("index", False)
-        df.to_parquet(output_path, index=index, **cudf_write_kwargs)
 
     def _get_basename_template(self, filename: str, write_uuid: str) -> str:
         # Check if write_uuid is present in filename, add if missing

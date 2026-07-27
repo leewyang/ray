@@ -57,7 +57,7 @@ def _as_py(value: Any) -> Any:
     return value
 
 
-class CudfRow(Mapping):
+class CudfRow(Mapping[str, Any]):
     """Row of a tabular Dataset backed by a cuDF DataFrame block."""
 
     def __init__(self, row: "cudf.DataFrame"):
@@ -68,11 +68,11 @@ class CudfRow(Mapping):
             return _as_py(self._row[key].iloc[0])
         return tuple(_as_py(self._row[column].iloc[0]) for column in key)
 
-    def __iter__(self) -> Iterator:
+    def __iter__(self) -> Iterator[str]:
         for key in self._row.columns:
             yield key
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._row.columns)
 
     def as_pydict(self) -> Dict[str, Any]:
@@ -82,6 +82,8 @@ class CudfRow(Mapping):
 
 
 class CudfBlockBuilder(TableBlockBuilder):
+    """Build Ray Data blocks backed by cuDF DataFrames."""
+
     def __init__(self):
         cudf = _import_cudf()
         super().__init__(cudf.DataFrame)
@@ -112,6 +114,8 @@ class CudfBlockBuilder(TableBlockBuilder):
 
 
 class CudfBlockAccessor(TableBlockAccessor):
+    """Implement Ray's tabular block operations for a cuDF DataFrame."""
+
     ROW_TYPE = CudfRow
 
     def __init__(self, table: "cudf.DataFrame"):
@@ -127,6 +131,7 @@ class CudfBlockAccessor(TableBlockAccessor):
         return self.upsert_column(name, value)
 
     def slice(self, start: int, end: int, copy: bool = False) -> "cudf.DataFrame":
+        """Return a row slice, compacting slices that may retain parent buffers."""
         view = self._table.iloc[start:end]
         if copy or start != 0 or end != len(self._table):
             # cuDF string/list slices can retain parent buffers. Ray Data often
@@ -185,6 +190,7 @@ class CudfBlockAccessor(TableBlockAccessor):
     def to_numpy(
         self, columns: Optional[Union[str, List[str]]] = None
     ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        """Convert one or more cuDF columns to NumPy arrays."""
         if columns is None:
             columns = self.column_names()
             should_be_single_ndarray = False
@@ -234,7 +240,8 @@ class CudfBlockAccessor(TableBlockAccessor):
     def _sample(self, n_samples: int, sort_key: "SortKey") -> "cudf.DataFrame":
         return self._table[sort_key.get_columns()].sample(n=n_samples)
 
-    def sort(self, sort_key: "SortKey"):
+    def sort(self, sort_key: "SortKey") -> "cudf.DataFrame":
+        """Sort the block according to a Ray Data sort key."""
         assert (
             sort_key.get_columns()
         ), f"Sorting columns couldn't be empty (got {sort_key.get_columns()})"
@@ -254,6 +261,7 @@ class CudfBlockAccessor(TableBlockAccessor):
     def merge_sorted_blocks(
         blocks: List[Block], sort_key: "SortKey"
     ) -> Tuple[Block, BlockMetadataWithSchema]:
+        """Merge sorted blocks through Arrow's existing merge implementation."""
         stats = BlockExecStats.builder()
         if not blocks:
             ret = CudfBlockAccessor._empty_table()
@@ -273,7 +281,8 @@ class CudfBlockAccessor(TableBlockAccessor):
 
     def iter_rows(
         self, public_row_format: bool
-    ) -> Iterator[Union[Mapping, np.ndarray]]:
+    ) -> Iterator[Union[Mapping[str, Any], np.ndarray]]:
+        """Iterate over rows in public dictionaries or internal row wrappers."""
         if public_row_format:
             yield from self._table.to_pandas().to_dict("records")
             return
@@ -281,6 +290,7 @@ class CudfBlockAccessor(TableBlockAccessor):
             yield self._get_row(i)
 
     def filter(self, predicate_expr: Expr) -> "cudf.DataFrame":
+        """Filter the block by evaluating a Ray Data expression with cuDF."""
         if len(self._table) == 0:
             return self._table
 
@@ -300,6 +310,8 @@ class CudfBlockAccessor(TableBlockAccessor):
 
 
 class CudfBlockColumnAccessor(BlockColumnAccessor):
+    """Implement scalar column reductions and conversions for a cuDF Series."""
+
     def __init__(self, col: "cudf.Series"):
         super().__init__(col)
 
@@ -332,7 +344,7 @@ class CudfBlockColumnAccessor(BlockColumnAccessor):
     def unique(self) -> BlockColumn:
         return self._column.unique()
 
-    def value_counts(self) -> Optional[Dict[str, List]]:
+    def value_counts(self) -> Optional[Dict[str, List[Any]]]:
         value_counts = self._column.value_counts()
         if len(value_counts) == 0:
             return None

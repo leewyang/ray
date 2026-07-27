@@ -170,16 +170,6 @@ from ray.data.expressions import Expr, StarExpr, col
 logger = logging.getLogger(__name__)
 
 
-def _apply_output_batch_format(given_batch_format: Optional[str]) -> Optional[str]:
-    batch_format = _apply_batch_format(given_batch_format)
-    if batch_format == "numpy":
-        raise ValueError(
-            "`output_batch_format='numpy'` isn't supported. Use 'pyarrow', "
-            "'pandas', 'cudf', or None."
-        )
-    return batch_format
-
-
 # Special column name for train/test split to avoid collision with user columns
 _TRAIN_TEST_SPLIT_COLUMN = "__ray_train_test_split_is_train__"
 
@@ -870,7 +860,12 @@ class Dataset:
             ray_remote_args["memory"] = memory
 
         batch_format = _apply_batch_format(batch_format)
-        output_batch_format = _apply_output_batch_format(output_batch_format)
+        output_batch_format = _apply_batch_format(output_batch_format)
+        if output_batch_format == "numpy":
+            raise ValueError(
+                "`output_batch_format='numpy'` isn't supported. Use 'pyarrow', "
+                "'pandas', 'cudf', or None."
+            )
 
         map_batches_op = MapBatches(
             fn,

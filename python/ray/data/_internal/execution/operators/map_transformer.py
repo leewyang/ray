@@ -347,23 +347,6 @@ def _compute_auto_batch_size(
     return computed_batch_size, blocks
 
 
-def _batch_format_to_block_type(
-    batch_format: Optional[BatchFormat],
-) -> Optional[BlockType]:
-    if batch_format is None:
-        return None
-    if batch_format == BatchFormat.ARROW:
-        return BlockType.ARROW
-    if batch_format == BatchFormat.PANDAS:
-        return BlockType.PANDAS
-    if batch_format == BatchFormat.CUDF:
-        return BlockType.CUDF
-    raise ValueError(
-        "`output_batch_format` must be one of 'pyarrow', 'pandas', 'cudf', "
-        f"or None; got {batch_format!r}."
-    )
-
-
 class BatchMapTransformFn(MapTransformFn):
     """A batch-to-batch MapTransformFn."""
 
@@ -387,7 +370,19 @@ class BatchMapTransformFn(MapTransformFn):
 
         self._batch_size = batch_size
         self._batch_format = batch_format
-        self._output_block_type = _batch_format_to_block_type(output_batch_format)
+        if output_batch_format is None:
+            self._output_block_type = None
+        elif output_batch_format == BatchFormat.ARROW:
+            self._output_block_type = BlockType.ARROW
+        elif output_batch_format == BatchFormat.PANDAS:
+            self._output_block_type = BlockType.PANDAS
+        elif output_batch_format == BatchFormat.CUDF:
+            self._output_block_type = BlockType.CUDF
+        else:
+            raise ValueError(
+                "`output_batch_format` must be one of 'pyarrow', 'pandas', "
+                f"'cudf', or None; got {output_batch_format!r}."
+            )
         self._zero_copy_batch = zero_copy_batch
         self._target_batch_size_bytes = target_batch_size_bytes
 

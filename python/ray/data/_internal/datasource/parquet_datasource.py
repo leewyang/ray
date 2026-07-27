@@ -41,7 +41,7 @@ from ray.data._internal.util import (
     iterate_with_retry,
 )
 from ray.data._internal.utils.arrow_utils import get_pyarrow_version
-from ray.data.block import Block, BlockAccessor, BlockMetadata, BlockType
+from ray.data.block import Block, BlockAccessor, BlockMetadata
 from ray.data.context import DataContext
 from ray.data.datasource import Datasource
 from ray.data.datasource.datasource import ReadTask
@@ -394,7 +394,6 @@ class ParquetDatasource(Datasource):
         include_paths: bool = False,
         include_row_hash: bool = False,
         file_extensions: Optional[List[str]] = None,
-        batch_format: Literal["pyarrow", "cudf"] = "pyarrow",
     ):
         super().__init__()
         _check_pyarrow_version()
@@ -537,7 +536,6 @@ class ParquetDatasource(Datasource):
             shuffle=shuffle,
             include_paths=include_paths,
             include_row_hash=include_row_hash,
-            batch_format=batch_format,
         )
 
     def _init_state(
@@ -561,7 +559,6 @@ class ParquetDatasource(Datasource):
         shuffle: Union["FileShuffleConfig", Literal["files"], None],
         include_paths: bool,
         include_row_hash: bool = False,
-        batch_format: Literal["pyarrow", "cudf"] = "pyarrow",
     ):
         """Shared initialization for all instance state and sampling estimates.
 
@@ -595,7 +592,6 @@ class ParquetDatasource(Datasource):
         self._file_metadata_shuffler = None
         self._include_paths = include_paths
         self._include_row_hash = include_row_hash
-        self._batch_format = batch_format
         self._partitioning = partitioning
         _validate_shuffle_arg(shuffle)
         self._shuffle = shuffle
@@ -723,7 +719,6 @@ class ParquetDatasource(Datasource):
             shuffle=shuffle,
             include_paths=include_paths,
             include_row_hash=include_row_hash,
-            batch_format="pyarrow",
         )
 
     @property
@@ -837,7 +832,6 @@ class ParquetDatasource(Datasource):
                 include_paths,
                 include_row_hash,
                 partitioning,
-                batch_format,
             ) = (
                 self._block_udf,
                 self._scanner_kwargs,
@@ -847,7 +841,6 @@ class ParquetDatasource(Datasource):
                 self._include_paths,
                 self._include_row_hash,
                 self._partitioning,
-                self._batch_format,
             )
 
             allow_pickle = self._allow_pickle_object_columns
@@ -863,7 +856,6 @@ class ParquetDatasource(Datasource):
                         include_paths,
                         include_row_hash,
                         partitioning,
-                        batch_format,
                         filter_expr,
                         filter_columns,
                         allow_pickle,
@@ -1134,12 +1126,10 @@ class ParquetDatasource(Datasource):
 
 
 def _check_for_pickle_object_columns(table: "pyarrow.Table") -> None:
-    _check_for_pickle_object_schema(table.schema)
-
-
-def _check_for_pickle_object_schema(schema: "pyarrow.Schema") -> None:
     pickle_cols = [
-        field.name for field in schema if isinstance(field.type, ArrowPythonObjectType)
+        field.name
+        for field in table.schema
+        if isinstance(field.type, ArrowPythonObjectType)
     ]
     if pickle_cols:
         raise ValueError(
@@ -1154,7 +1144,8 @@ def _check_for_pickle_object_schema(schema: "pyarrow.Schema") -> None:
         )
 
 
-def _iter_arrow_parquet_blocks(
+def read_fragments(
+    block_udf: Callable[[Block], Optional[Block]],
     to_batches_kwargs: Dict[str, Any],
     data_columns: Optional[List[str]],
     partition_columns: Optional[List[str]],
@@ -1165,6 +1156,7 @@ def _iter_arrow_parquet_blocks(
     partitioning: Partitioning,
     filter_expr: Optional["pyarrow.dataset.Expression"] = None,
     filter_columns: Optional[List[str]] = None,
+    allow_pickle: bool = False,
 ) -> Iterator["pyarrow.Table"]:
     """Yield Arrow tables from Parquet fragments via ``to_batches_kwargs``."""
     # This import is necessary to load the tensor extension type.
@@ -1194,187 +1186,14 @@ def _iter_arrow_parquet_blocks(
             "reading batches",
             match=ctx.retried_io_errors,
         ):
-            yield table
-
-
-def _cudf_read_parquet(
-    cudf: Any,
-    path: str,
-    *,
-    columns: Optional[List[str]],
-    row_groups: Optional[List[int]],
-    filesystem: Any,
-) -> Any:
-    kwargs: Dict[str, Any] = {
-        "columns": columns,
-        "row_groups": row_groups,
-    }
-    if filesystem is not None:
-        kwargs["filesystem"] = filesystem
-    try:
-        return cudf.read_parquet(path, **kwargs)
-    except Exception:
-        if "filesystem" not in kwargs:
-            raise
-        kwargs.pop("filesystem")
-        return cudf.read_parquet(path, **kwargs)
-
-
-def _add_partitions_to_cudf(
-    partition_col_values: Dict[str, PartitionDataType],
-    df: Any,
-) -> Any:
-    for partition_col, value in partition_col_values.items():
-        if partition_col not in df.columns:
-            df[partition_col] = value
-        elif log_once(f"duplicate_partition_field_{partition_col}"):
-            logger.warning(
-                f"The partition field '{partition_col}' also exists in the Parquet "
-                f"file. Ray Data will default to using the value in the Parquet file."
-            )
-    return df
-
-
-def _iter_cudf_parquet_blocks(
-    data_columns: Optional[List[str]],
-    partition_columns: Optional[List[str]],
-    schema: Optional[Union[type, "pyarrow.lib.Schema"]],
-    fragments: List[_ParquetFragment],
-    include_paths: bool,
-    include_row_hash: bool,
-    partitioning: Partitioning,
-) -> Iterator[Block]:
-    import pyarrow as pa
-
-    if isinstance(schema, pa.Schema):
-        _check_for_pickle_object_schema(schema)
-
-    import cudf
-
-    assert len(fragments) > 0
-    logger.debug(f"Reading {len(fragments)} parquet fragments with cuDF")
-    for fragment in fragments:
-        partition_col_values = _parse_partition_column_values(
-            fragment.original, partition_columns, partitioning
-        )
-        metadata = fragment.original.metadata
-        if metadata.num_row_groups == 0:
-            continue
-        if fragment.original.row_groups is not None:
-            row_groups = [rg.id for rg in fragment.original.row_groups]
-        else:
-            row_groups = list(range(metadata.num_row_groups))
-
-        row_offset = 0
-        ctx = ray.data.DataContext.get_current()
-        for df in iterate_with_retry(
-            lambda: (
-                _cudf_read_parquet(
-                    cudf,
-                    fragment.original.path,
-                    columns=data_columns,
-                    row_groups=[row_group],
-                    filesystem=fragment.original.filesystem,
-                )
-                for row_group in row_groups
-            ),
-            "reading cudf parquet row groups",
-            match=ctx.retried_io_errors,
-        ):
-            if len(df) == 0:
-                continue
-            if partition_col_values:
-                df = _add_partitions_to_cudf(partition_col_values, df)
-            if include_paths:
-                df["path"] = fragment.original.path
-            if include_row_hash:
-                hashes = _compute_row_hashes(
-                    fragment.original.path, row_offset, len(df)
-                )
-                df["row_hash"] = cudf.Series(hashes, dtype="uint64")
-                row_offset += len(df)
-            yield df
-
-
-def _can_read_directly_with_cudf(
-    block_udf: Optional[Callable[[Block], Block]],
-    data_columns: Optional[List[str]],
-    to_batches_kwargs: Dict[str, Any],
-    filter_expr: Optional["pyarrow.dataset.Expression"],
-) -> bool:
-    if block_udf is not None or filter_expr is not None:
-        return False
-    if data_columns == []:
-        return False
-    if "filter" in to_batches_kwargs:
-        return False
-
-    pyarrow_only_scan_options = set(to_batches_kwargs) - {
-        "batch_size",
-        "batch_readahead",
-        "fragment_readahead",
-        "fragment_scan_options",
-    }
-    return not pyarrow_only_scan_options
-
-
-def read_fragments(
-    block_udf: Optional[Callable[[Block], Optional[Block]]],
-    to_batches_kwargs: Dict[str, Any],
-    data_columns: Optional[List[str]],
-    partition_columns: Optional[List[str]],
-    schema: Optional[Union[type, "pyarrow.lib.Schema"]],
-    fragments: List[_ParquetFragment],
-    include_paths: bool,
-    include_row_hash: bool,
-    partitioning: Partitioning,
-    batch_format: Literal["pyarrow", "cudf"] = "pyarrow",
-    filter_expr: Optional["pyarrow.dataset.Expression"] = None,
-    filter_columns: Optional[List[str]] = None,
-    allow_pickle: bool = False,
-) -> Iterator[Block]:
-    """Yield blocks from Parquet fragments."""
-    if batch_format == "cudf" and _can_read_directly_with_cudf(
-        block_udf, data_columns, to_batches_kwargs, filter_expr
-    ):
-        blocks = _iter_cudf_parquet_blocks(
-            data_columns,
-            partition_columns,
-            schema,
-            fragments,
-            include_paths,
-            include_row_hash,
-            partitioning,
-        )
-    else:
-        blocks = _iter_arrow_parquet_blocks(
-            to_batches_kwargs,
-            data_columns,
-            partition_columns,
-            schema,
-            fragments,
-            include_paths,
-            include_row_hash,
-            partitioning,
-            filter_expr,
-            filter_columns,
-        )
-
-    for block in blocks:
-        if BlockAccessor.for_block(block).num_rows() == 0:
-            continue
-        if not allow_pickle:
-            import pyarrow as pa
-
-            if isinstance(block, pa.Table):
-                _check_for_pickle_object_columns(block)
-        if block_udf is not None:
-            block = block_udf(block)
-            if block is None or BlockAccessor.for_block(block).num_rows() == 0:
-                continue
-        if batch_format == "cudf":
-            block = BlockAccessor.batch_to_block(block, BlockType.CUDF)
-        yield block
+            # If the table is empty, drop it.
+            if table.num_rows > 0:
+                if not allow_pickle:
+                    _check_for_pickle_object_columns(table)
+                if block_udf is not None:
+                    yield block_udf(table)
+                else:
+                    yield table
 
 
 def _coerce_pyarrow_fragment_batch_size(batch_size: int) -> int:
