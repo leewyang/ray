@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -145,6 +146,32 @@ class _ResourceAdmissionController:
                 ancestors.update(dependency.post_order_iter())
         return ancestors & self._specs.keys() & unfinished
 
+    def _transient_progress_floor(self, roots) -> ExecutionResources:
+        """Return one schedulable progress unit for unmanaged ancestors.
+
+        A persistent owner must not become sticky while an upstream task still
+        needs the same processor or heap-memory resource to finish producing
+        its stream. Ancestor task operators can run sequentially, so the
+        component-wise maximum is a sufficient liveness floor and avoids
+        over-reserving an entire transient pipeline.
+        """
+        ancestors = set()
+        for root in roots:
+            for dependency in root.input_dependencies:
+                ancestors.update(dependency.post_order_iter())
+
+        floor = ExecutionResources.zero()
+        for op in ancestors.intersection(self._topology).difference(self._specs):
+            state = self._topology[op]
+            needs_progress = not op.has_execution_finished() and (
+                not op._inputs_complete
+                or state.total_enqueued_input_blocks() > 0
+                or not op.current_logical_usage().is_zero()
+            )
+            if needs_progress:
+                floor = floor.max(op.min_scheduling_resources())
+        return floor
+
     def _should_expose_demand(
         self, op: "PhysicalOperator", current_capacity: ExecutionResources
     ) -> bool:
@@ -192,7 +219,10 @@ class _ResourceAdmissionController:
         claimants = {op for op in unfinished if self._is_claimant(op)}
         claimants.update(self._unfinished_ancestors(claimants, unfinished))
 
-        current_capacity = remaining = limits
+        current_capacity = limits
+        remaining = limits.subtract(self._transient_progress_floor(claimants)).max(
+            ExecutionResources.zero()
+        )
         sticky_ops = {
             op
             for op in claimants
@@ -233,21 +263,18 @@ class _ResourceAdmissionController:
                 )
                 has_frontier = True
 
-    @staticmethod
+    @classmethod
     def _max_units_for_target(
-        target: ExecutionResources, spec: ResourceAdmissionSpec
+        cls, target: ExecutionResources, spec: ResourceAdmissionSpec
     ) -> int:
         if spec.unit_resources is None:
             return 1
-        units = target.floordiv(spec.unit_resources)
-        capacities = (units.cpu, units.gpu, units.memory, units.object_store_memory)
-        max_units = int(min(capacities))
+        max_units = int(cls._unit_capacity(target, spec.unit_resources))
         if spec.max_units is not None:
             max_units = min(max_units, spec.max_units)
         return max_units
 
     def update_allocation_grants(self, limits: ExecutionResources) -> None:
-        remaining = None
         if not self._resource_manager.op_resource_allocator_enabled():
             floors = ExecutionResources.combine_sum(
                 self._specs[op].minimum_resources
@@ -255,20 +282,150 @@ class _ResourceAdmissionController:
                 if grant.may_submit
             )
             remaining = limits.subtract(floors).max(ExecutionResources.zero())
-
-        for op, spec in self._specs.items():
-            if not self._grants[op].may_submit:
-                continue
-            floor_units = spec.min_units
-            target = self._resource_manager.get_allocation_target(op)
-            if target is None and remaining is not None:
+            for op, spec in self._specs.items():
+                if not self._grants[op].may_submit:
+                    continue
+                floor_units = spec.min_units
                 target = spec.minimum_resources.add(remaining)
-            target_units = (
-                floor_units
-                if target is None
-                else max(floor_units, self._max_units_for_target(target, spec))
+                target_units = max(
+                    floor_units, self._max_units_for_target(target, spec)
+                )
+                if spec.unit_resources is not None:
+                    claimed = spec.unit_resources.scale(target_units - floor_units)
+                    remaining = remaining.subtract(claimed).max(
+                        ExecutionResources.zero()
+                    )
+                self._set_grant(op, target_units, may_submit=True)
+            return
+
+        admitted = [
+            (op, spec)
+            for op, spec in self._specs.items()
+            if self._grants[op].may_submit
+        ]
+        remaining = limits.subtract(
+            ExecutionResources.combine_sum(
+                spec.minimum_resources for _, spec in admitted
             )
-            if remaining is not None and spec.unit_resources is not None:
-                claimed = spec.unit_resources.scale(target_units - floor_units)
-                remaining = remaining.subtract(claimed).max(ExecutionResources.zero())
-            self._set_grant(op, target_units, may_submit=True)
+        ).max(ExecutionResources.zero())
+
+        targets = {
+            op: self._resource_manager.get_allocation_target(op) for op, _ in admitted
+        }
+        target_units = {
+            op: (
+                spec.min_units
+                if targets[op] is None
+                else max(
+                    spec.min_units,
+                    self._max_units_for_target(targets[op], spec),
+                )
+            )
+            for op, spec in admitted
+        }
+        granted_units = {op: spec.min_units for op, spec in admitted}
+
+        # First honor every complete unit represented by the allocator targets.
+        # Floors were removed up front so one operator's expansion cannot consume
+        # capacity required by another admitted owner.
+        for op, spec in admitted:
+            if spec.unit_resources is None:
+                continue
+            desired = target_units[op] - granted_units[op]
+            additional = int(
+                min(desired, self._unit_capacity(remaining, spec.unit_resources))
+            )
+            granted_units[op] += additional
+            remaining = remaining.subtract(spec.unit_resources.scale(additional)).max(
+                ExecutionResources.zero()
+            )
+
+        # Allocator targets are continuous, but elastic actor pools grow in whole
+        # units. Pool-local flooring can strand an aggregate complete unit (for
+        # example, two 1.5-GPU targets on three GPUs). Use largest remainders to
+        # coordinate rounding without exceeding either the aggregate targets or
+        # the global execution limits.
+        rounding_budget = ExecutionResources.combine_sum(
+            targets[op]
+            .subtract(spec.unit_resources.scale(target_units[op]))
+            .max(ExecutionResources.zero())
+            for op, spec in admitted
+            if targets[op] is not None and spec.unit_resources is not None
+        )
+        candidates = []
+        for index, (op, spec) in enumerate(admitted):
+            target = targets[op]
+            if target is None or spec.unit_resources is None:
+                continue
+            if spec.max_units is not None and granted_units[op] >= spec.max_units:
+                continue
+            remainder = (
+                self._unit_capacity(target, spec.unit_resources) - target_units[op]
+            )
+            candidates.append((remainder, index, op, spec))
+
+        # Give each owner at most one unit per pass so topology peers get an
+        # opportunity before an owner receives a second pooled unit. Owners with
+        # no local remainder remain candidates: a smaller unit can consume
+        # aggregate capacity stranded by another owner's larger unit shape.
+        candidates.sort(key=lambda candidate: candidate[:2], reverse=True)
+        while candidates:
+            made_progress = False
+            next_candidates = []
+            for remainder, index, op, spec in candidates:
+                unit = spec.unit_resources
+                assert unit is not None
+                if (
+                    self._unit_capacity(rounding_budget, unit) >= 1
+                    and self._unit_capacity(remaining, unit) >= 1
+                ):
+                    granted_units[op] += 1
+                    rounding_budget = rounding_budget.subtract(unit).max(
+                        ExecutionResources.zero()
+                    )
+                    remaining = remaining.subtract(unit).max(ExecutionResources.zero())
+                    made_progress = True
+                if spec.max_units is None or granted_units[op] < spec.max_units:
+                    next_candidates.append((remainder, index, op, spec))
+            if not made_progress:
+                break
+            candidates = next_candidates
+
+        for op, _ in admitted:
+            self._set_grant(op, granted_units[op], may_submit=True)
+
+    @staticmethod
+    def _unit_capacity(
+        resources: ExecutionResources, unit: ExecutionResources
+    ) -> float:
+        capacities = [
+            available / required
+            for available, required in (
+                (resources.cpu, unit.cpu),
+                (resources.gpu, unit.gpu),
+                (resources.memory, unit.memory),
+                (resources.object_store_memory, unit.object_store_memory),
+            )
+            if required > 0
+        ]
+        assert capacities
+        capacity = min(capacities)
+        if not math.isfinite(capacity):
+            return capacity
+
+        # Decimal resource shapes commonly land one ULP below an integer
+        # quotient (for example, 0.3 / 0.1). Snap only machine-roundoff-sized
+        # errors so a complete fractional CPU/GPU unit is not under-granted.
+        nearest_integer = round(capacity)
+        tolerance = 8 * max(
+            math.ulp(capacity),
+            math.ulp(float(nearest_integer)),
+        )
+        if math.isclose(
+            capacity,
+            nearest_integer,
+            rel_tol=0.0,
+            abs_tol=tolerance,
+        ):
+            return float(nearest_integer)
+        return capacity

@@ -28,7 +28,7 @@ from ray.data._internal.actor_autoscaler.autoscaling_actor_pool import (
 from ray.data._internal.actor_autoscaler.default_actor_autoscaler import (
     _estimate_total_available_task_slots,
 )
-from ray.data._internal.compute import ActorPoolStrategy
+from ray.data._internal.compute import ActorPoolStrategy, TaskPoolStrategy
 from ray.data._internal.execution.bundle_queue import HashLinkedQueue
 from ray.data._internal.execution.interfaces import (
     ExecutionOptions,
@@ -41,12 +41,16 @@ from ray.data._internal.execution.operators.actor_pool_map_operator import (
     ActorPoolMapOperator,
     _ActorPool,
     _MapWorker,
+    _actor_lifetime_resources,
 )
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
 from ray.data._internal.execution.operators.map_operator import MapOperator
 from ray.data._internal.execution.operators.map_transformer import (
     BlockMapTransformFn,
     MapTransformer,
+)
+from ray.data._internal.execution.operators.task_pool_map_operator import (
+    TaskPoolMapOperator,
 )
 from ray.data._internal.execution.resource_admission import ResourceAdmissionGrant
 from ray.data._internal.execution.streaming_executor_state import (
@@ -1190,9 +1194,128 @@ def test_resource_admission_spec_materializes_implicit_actor_cpu():
     assert op.min_scheduling_resources() == ExecutionResources(cpu=1, gpu=0.25)
 
 
+def test_dynamic_remote_args_clear_implicit_actor_resources():
+    data_context = DataContext()
+    op = MapOperator.create(
+        map_transformer=MagicMock(),
+        input_op=InputDataBuffer(data_context, input_data=[]),
+        data_context=data_context,
+        compute_strategy=ActorPoolStrategy(size=1),
+        ray_remote_args={"num_gpus": 1},
+        ray_remote_args_fn=lambda: {"num_gpus": None},
+    )
+
+    # Static accounting includes Core's implicit lifetime CPU without mutating
+    # the options that the dynamic callback overrides.
+    assert "num_cpus" not in op._ray_remote_args
+    assert op.min_scheduling_resources() == ExecutionResources(cpu=1, gpu=1)
+    assert op.resource_admission_incompatible()
+
+    final_remote_args = op._merge_ray_remote_args()
+    assert final_remote_args["num_gpus"] is None
+    assert "num_cpus" not in final_remote_args
+    assert _actor_lifetime_resources(final_remote_args).is_zero()
+
+
+def test_actor_task_remote_args_include_configured_retry_errors():
+    data_context = DataContext()
+    data_context.actor_task_retry_on_errors = [ValueError]
+    data_context._max_num_blocks_in_streaming_gen_buffer = 2
+
+    remote_args = ActorPoolMapOperator._apply_default_actor_task_remote_args(
+        {}, data_context
+    )
+
+    assert ValueError in remote_args["retry_exceptions"]
+    assert remote_args["_generator_backpressure_num_objects"] == 4
+
+    remote_args = ActorPoolMapOperator._apply_default_actor_task_remote_args(
+        {"_generator_backpressure_num_objects": 7}, data_context
+    )
+    assert remote_args["_generator_backpressure_num_objects"] == 7
+
+
+def test_start_actor_reports_lifetime_resources_from_final_remote_args():
+    data_context = DataContext()
+    op = MapOperator.create(
+        map_transformer=MagicMock(),
+        input_op=InputDataBuffer(data_context, input_data=[]),
+        data_context=data_context,
+        compute_strategy=ActorPoolStrategy(size=1),
+        ray_remote_args={"num_gpus": 1},
+        ray_remote_args_fn=lambda: {
+            "num_gpus": None,
+            "_labels": {"dynamic": "label"},
+        },
+    )
+    actor_cls = MagicMock()
+    actor = actor_cls.options.return_value.remote.return_value
+    location_ref = actor.get_location.options.return_value.remote.return_value
+    op._actor_cls = actor_cls
+    op._submit_metadata_task = MagicMock()
+    op.__dict__["_data_context_ref"] = MagicMock()
+    op.__dict__["_map_transformer_ref"] = MagicMock()
+
+    with patch(
+        "ray.data._internal.execution.operators.actor_pool_map_operator."
+        "get_or_create_actor_location_tracker",
+        return_value=MagicMock(),
+    ):
+        actual_actor, actual_location_ref, resources = op._start_actor(
+            labels={"static": "label"},
+            logical_actor_id=MagicMock(),
+        )
+
+    assert actual_actor is actor
+    assert actual_location_ref is location_ref
+    assert resources.is_zero()
+    options = actor_cls.options.call_args.kwargs
+    assert options["_labels"] == {
+        op._OPERATOR_ID_LABEL_KEY: op.id,
+        "static": "label",
+        "dynamic": "label",
+    }
+    assert options["num_gpus"] is None
+    assert "num_cpus" not in options
+
+
+def test_try_schedule_task_queues_input_before_dispatch():
+    op = _make_gpu_actor_op(DataContext(), ActorPoolStrategy(size=1))
+    bundle = MagicMock(spec=RefBundle)
+    op._notify_first_input = MagicMock()
+    op._bundle_queue = MagicMock()
+    op._metrics = MagicMock()
+    op._try_schedule_tasks_internal = MagicMock(return_value=0)
+
+    op._try_schedule_task(bundle, strict=False)
+
+    op._notify_first_input.assert_called_once_with(bundle)
+    op._bundle_queue.add.assert_called_once_with(bundle)
+    op._metrics.on_input_queued.assert_called_once_with(bundle, input_index=0)
+    op._try_schedule_tasks_internal.assert_called_once_with()
+    assert op.incremental_resource_usage() == ExecutionResources.zero()
+
+
+@pytest.mark.parametrize(
+    "remote_args,expected",
+    [
+        ({}, ExecutionResources.zero()),
+        ({"num_cpus": 0.5}, ExecutionResources(cpu=0.5)),
+        ({"resources": {"custom": 0.25}}, ExecutionResources(cpu=1)),
+        ({"accelerator_type": "L4"}, ExecutionResources(cpu=1)),
+        ({"memory": 1024}, ExecutionResources(memory=1024)),
+        ({"num_gpus": 1}, ExecutionResources(cpu=1, gpu=1)),
+        ({"num_gpus": None}, ExecutionResources.zero()),
+    ],
+)
+def test_actor_lifetime_resources_match_core_cpu_defaults(remote_args, expected):
+    assert _actor_lifetime_resources(remote_args) == expected
+
+
 @pytest.mark.parametrize(
     "scheduling_strategy",
     [
+        None,
         NodeAffinitySchedulingStrategy("01" * ID_SIZE, soft=False),
         PlacementGroupSchedulingStrategy(MagicMock(), 0),
     ],
@@ -1311,6 +1434,32 @@ def test_resource_admission_control_defers_actor_start(
     op.shutdown(Timer())
 
 
+def test_legacy_start_waits_for_min_actors_and_preserves_timeout():
+    data_context = DataContext()
+    data_context.wait_for_min_actors_s = 1
+    op = _make_gpu_actor_op(data_context, ActorPoolStrategy(size=2))
+    pending_refs = [MagicMock(name="pending_actor")]
+    op._actor_pool.scale = MagicMock()
+    op._actor_pool.get_pending_actor_refs = MagicMock(return_value=pending_refs)
+
+    with (
+        patch(
+            "ray.data._internal.execution.operators.actor_pool_map_operator.ray.remote"
+        ),
+        patch(
+            "ray.data._internal.execution.operators.actor_pool_map_operator.ray.get",
+            side_effect=ray.exceptions.GetTimeoutError("not ready"),
+        ) as ray_get,
+        pytest.raises(
+            ray.exceptions.GetTimeoutError,
+            match="Timed out while starting actors",
+        ),
+    ):
+        op.start(ExecutionOptions(), noop_counter())
+
+    ray_get.assert_called_once_with(pending_refs, timeout=1)
+
+
 def test_resource_admission_wait_is_async_and_starts_after_grant():
     data_context = DataContext()
     data_context.wait_for_min_actors_s = 10
@@ -1346,6 +1495,40 @@ def test_resource_admission_wait_is_async_and_starts_after_grant():
     assert op._min_actors_wait_start_time is None
     op.refresh_state()
     assert op._min_actors_wait_start_time is not None
+
+
+def test_resource_admission_wait_clears_when_minimum_actors_are_ready():
+    data_context = DataContext()
+    data_context.wait_for_min_actors_s = 10
+    op = _make_gpu_actor_op(data_context, ActorPoolStrategy(min_size=2, max_size=4))
+    op._min_actors_wait_start_time = 100
+    op._actor_pool.num_running_actors = MagicMock(return_value=2)
+
+    op._check_min_actors_start_timeout()
+
+    assert op._min_actors_wait_start_time is None
+
+
+def test_unmanaged_actor_dispatch_reaches_empty_queue():
+    op = _make_gpu_actor_op(DataContext(), ActorPoolStrategy(size=1))
+    op._bundle_queue = MagicMock()
+    op._bundle_queue.has_next.return_value = False
+
+    assert op._admission_grant is None
+    assert op._try_schedule_tasks_internal() == 0
+    op._bundle_queue.has_next.assert_called_once_with()
+
+
+def test_resource_admission_rejects_pool_above_granted_units():
+    op = _make_gpu_actor_op(DataContext(), ActorPoolStrategy(size=2))
+    op.apply_resource_admission_grant(
+        ResourceAdmissionGrant(max_units=1, may_submit=True)
+    )
+    op._actor_pool.current_size = MagicMock(return_value=2)
+    op._actor_pool.num_running_actors = MagicMock()
+
+    assert not op._admission_allows_scheduling()
+    op._actor_pool.num_running_actors.assert_not_called()
 
 
 def test_resource_admission_wait_respects_granted_floor_and_times_out():
@@ -1520,6 +1703,89 @@ def test_resource_admission_handoff_one_logical_gpu(
     # wrapper. It must not make a stock callable-class GPU map look like a
     # user-supplied dynamic-resource operator at execution time.
     assert managed_at_execution_start == [True] * num_gpu_stages
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize(
+    ("task_cpus", "task_gpus"),
+    [
+        (1, 0),
+        (0, 1),
+    ],
+)
+def test_transient_task_finishes_before_overlapping_sticky_gpu_actor(
+    shutdown_only,
+    restore_data_context,
+    task_cpus,
+    task_gpus,
+):
+    ray.init(num_cpus=1, num_gpus=1, include_dashboard=False)
+    data_context = DataContext.get_current()
+    data_context.op_resource_reservation_enabled = True
+    data_context.wait_for_min_actors_s = 0
+    data_context._enable_resource_admission_control = True
+
+    ds = (
+        ray.data.range(4, override_num_blocks=4)
+        .map_batches(
+            _admission_cpu_stage,
+            batch_size=1,
+            batch_format="pyarrow",
+            compute=TaskPoolStrategy(),
+            num_cpus=task_cpus,
+            num_gpus=task_gpus,
+        )
+        .map_batches(
+            _AdmissionGPUStageOne,
+            batch_size=1,
+            batch_format="pyarrow",
+            compute=ActorPoolStrategy(size=1),
+            num_gpus=1,
+        )
+    )
+
+    physical_plan, _ = get_execution_plan(ds._logical_plan)
+    task_ops = [
+        op
+        for op in physical_plan.dag.post_order_iter()
+        if isinstance(op, TaskPoolMapOperator)
+        and op.name == "MapBatches(_admission_cpu_stage)"
+    ]
+    actor_ops = [
+        op
+        for op in physical_plan.dag.post_order_iter()
+        if isinstance(op, ActorPoolMapOperator)
+    ]
+    assert len(task_ops) == len(actor_ops) == 1, physical_plan.dag.dag_str
+    assert not task_ops[0].resource_admission_incompatible()
+    assert actor_ops[0].resource_admission_spec() is not None
+
+    assert sorted(row["id"] for row in ds.take_all()) == [1, 3, 5, 7]
+
+
+@pytest.mark.timeout(60)
+def test_dynamic_remote_args_clear_gpu_without_cpu_deadlock(
+    shutdown_only, restore_data_context
+):
+    ray.init(num_cpus=1, num_gpus=0, include_dashboard=False)
+    data_context = DataContext.get_current()
+    data_context.op_resource_reservation_enabled = True
+    data_context._enable_resource_admission_control = True
+
+    rows = (
+        ray.data.range(4, override_num_blocks=1)
+        .map_batches(
+            _AdmissionGPUStageOne,
+            batch_size=4,
+            batch_format="pyarrow",
+            compute=ActorPoolStrategy(size=1),
+            num_gpus=1,
+            ray_remote_args_fn=lambda: {"num_gpus": None},
+        )
+        .take_all()
+    )
+
+    assert rows == [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
 
 
 @pytest.mark.timeout(90)

@@ -99,6 +99,17 @@ def test_resource_admission_scaling_grants():
     assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
         ActorPoolScalingRequest.upscale(delta=4, reason="pool below min size")
     )
+
+    # Before the first input arrives, preserve the configured initial demand so
+    # the cluster autoscaler can see the whole startup request.
+    pool.min_size.return_value = 2
+    pool.initial_size.return_value = 4
+    op.metrics.num_inputs_received = 0
+    actor_info()
+    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
+        ActorPoolScalingRequest.upscale(delta=4, reason="pool below min size")
+    )
+    op.metrics.num_inputs_received = 1
     pool.min_size.return_value = pool.initial_size.return_value = 2
 
     # A final internally rebundled input remains live after the executor queue
@@ -214,6 +225,10 @@ def test_resource_admission_scaling_grants():
         ActorPoolScalingRequest.downscale(
             delta=-3, force=True, reason="consumed all inputs"
         )
+    )
+    actor_info()
+    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
+        ActorPoolScalingRequest.no_op(reason="consumed all inputs")
     )
 
 

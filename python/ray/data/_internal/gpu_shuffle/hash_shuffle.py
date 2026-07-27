@@ -357,7 +357,6 @@ class GPURankPool:
                 self._setup_start_time = time.perf_counter()
                 self._start_rank_actors()
 
-            self._raise_if_setup_timed_out()
             if self._pending_setup_refs:
                 ready, pending = ray.wait(
                     self._pending_setup_refs,
@@ -368,6 +367,7 @@ class GPURankPool:
                     ray.get(ready)
                 self._pending_setup_refs = list(pending)
                 if self._pending_setup_refs:
+                    self._raise_if_setup_timed_out()
                     return
 
             self._state = GPURankPoolState.READY
@@ -701,11 +701,13 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
 
     def _try_finalize(self) -> None:
         """Schedule extraction once all inserts have completed."""
-        if self._finalization_started or not self._is_inserting_done():
+        if self._finalization_started:
             return
         if self._insert_error is not None:
             self._rank_pool.fail(self._insert_error)
             raise self._insert_error
+        if not self._is_inserting_done():
+            return
         if self._rank_pool.state is not GPURankPoolState.READY:
             return
 
@@ -871,6 +873,14 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         if not self._rank_pool.owns_resources:
             return ExecutionResources.zero()
         return self.base_resource_usage
+
+    def pending_logical_usage(self) -> ExecutionResources:
+        if self._rank_pool.state in (
+            GPURankPoolState.RESERVING,
+            GPURankPoolState.STARTING,
+        ):
+            return self.current_logical_usage()
+        return ExecutionResources.zero()
 
     @property
     def base_resource_usage(self) -> ExecutionResources:

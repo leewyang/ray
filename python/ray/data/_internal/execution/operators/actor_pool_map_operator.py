@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 
     from ray.data._internal.execution.block_ref_counter import BlockRefCounter
 import ray
+from ray._common.utils import resources_from_ray_options
+from ray._private import ray_constants
 from ray.actor import ActorHandle
 from ray.core.generated import gcs_pb2
 from ray.data._internal.actor_autoscaler import (
@@ -82,6 +84,34 @@ _ACTOR_STATE_RESTARTING = gcs_pb2.ActorTableData.ActorState.RESTARTING
 
 # Type alias for the logical identifier of an actor (used in labels and actor-to-id maps).
 LogicalActorId = str
+
+
+def _actor_lifetime_resources(
+    ray_remote_args: Dict[str, Any],
+) -> ExecutionResources:
+    """Return the lifetime resources Ray Core derives for an actor.
+
+    When no processor or custom resources are specified, a Core actor reserves
+    no lifetime CPU and its methods use one CPU. If any such resource is
+    specified, Core instead reserves a default lifetime CPU and actor methods
+    use no CPU. Keep this translation in the actor operator so execution
+    accounting matches Core without materializing implicit defaults in the
+    user-facing remote options.
+    """
+    core_resources = resources_from_ray_options(ray_remote_args)
+    has_specified_resources = bool(
+        set(core_resources).difference({"memory", "object_store_memory"})
+    )
+    default_cpu = (
+        ray_constants.DEFAULT_ACTOR_CREATION_CPU_SPECIFIED
+        if has_specified_resources
+        else ray_constants.DEFAULT_ACTOR_CREATION_CPU_SIMPLE
+    )
+    return ExecutionResources(
+        cpu=core_resources.get("CPU", default_cpu),
+        gpu=core_resources.get("GPU", 0),
+        memory=core_resources.get("memory", 0),
+    )
 
 
 def get_map_worker_cls_name(op_name: str) -> str:
@@ -231,11 +261,7 @@ class ActorPoolMapOperator(MapOperator):
     def _create_actor_pool_config(
         self, compute_strategy: ActorPoolStrategy
     ) -> "AutoscalingActorConfig":
-        per_actor_resource_usage = ExecutionResources(
-            cpu=self._ray_remote_args.get("num_cpus"),
-            gpu=self._ray_remote_args.get("num_gpus"),
-            memory=self._ray_remote_args.get("memory"),
-        )
+        per_actor_resource_usage = _actor_lifetime_resources(self._ray_remote_args)
         max_actor_concurrency = self._ray_remote_args.get("max_concurrency", 1)
         config = AutoscalingActorConfig(
             min_size=compute_strategy.min_size,
@@ -363,7 +389,7 @@ class ActorPoolMapOperator(MapOperator):
             "placement_group_bundle_index",
             "placement_group_capture_child_tasks",
         )
-        if strategy not in (None, "DEFAULT", "SPREAD") or any(
+        if strategy not in ("DEFAULT", "SPREAD") or any(
             name in remote_args for name in unsupported
         ):
             return True
@@ -459,11 +485,7 @@ class ActorPoolMapOperator(MapOperator):
         assert self._actor_cls is not None
         actual_remote_args = dict(self._merge_ray_remote_args())
         extra_labels = actual_remote_args.pop("_labels", {})
-        actor_resource_usage = ExecutionResources(
-            cpu=actual_remote_args.get("num_cpus", 0),
-            gpu=actual_remote_args.get("num_gpus", 0),
-            memory=actual_remote_args.get("memory", 0),
-        )
+        actor_resource_usage = _actor_lifetime_resources(actual_remote_args)
         actor = self._actor_cls.options(
             _labels={self._OPERATOR_ID_LABEL_KEY: self.id, **labels, **extra_labels},
             **actual_remote_args,
@@ -648,9 +670,10 @@ class ActorPoolMapOperator(MapOperator):
         max_actors = self._actor_pool.max_size()
         assert min_actors is not None, min_actors
 
-        num_cpus_per_actor = self._ray_remote_args.get("num_cpus", 0)
-        num_gpus_per_actor = self._ray_remote_args.get("num_gpus", 0)
-        memory_per_actor = self._ray_remote_args.get("memory", 0)
+        per_actor = self._actor_pool.per_actor_resource_usage()
+        num_cpus_per_actor = per_actor.cpu
+        num_gpus_per_actor = per_actor.gpu
+        memory_per_actor = per_actor.memory
 
         min_resource_usage = ExecutionResources(
             cpu=num_cpus_per_actor * min_actors,
@@ -703,13 +726,6 @@ class ActorPoolMapOperator(MapOperator):
     ) -> Dict[str, Any]:
         """Apply defaults to the actor creation remote args."""
         ray_remote_args = ray_remote_args.copy()
-        if (
-            ray_remote_args.get("num_cpus") is None
-            and ray_remote_args.get("num_gpus") is not None
-        ):
-            # Ray Core defaults actors with an explicit GPU option to one
-            # lifetime CPU. Keep accounting consistent with Core's bundle.
-            ray_remote_args["num_cpus"] = 1
         if "scheduling_strategy" not in ray_remote_args:
             ray_remote_args["scheduling_strategy"] = data_context.scheduling_strategy
         # Enable actor fault tolerance by default, with infinite actor recreations and

@@ -83,6 +83,10 @@ class TaskPoolMapOperator(MapOperator):
                 with a default logical ``memory``. The method for choosing the
                 default is an implementation detail.
         """
+        # Optimizer rules can later install an internal remote-args function for
+        # memory estimates. Preserve whether the user supplied dynamic options,
+        # whose resource shape admission cannot know in advance.
+        self._uses_user_provided_remote_args_fn = ray_remote_args_fn is not None
         super().__init__(
             map_transformer,
             input_op,
@@ -213,6 +217,12 @@ class TaskPoolMapOperator(MapOperator):
 
     def pending_logical_usage(self) -> ExecutionResources:
         return ExecutionResources()
+
+    def resource_admission_incompatible(self) -> bool:
+        # Static per-task resources participate in the controller's unmanaged
+        # ancestor progress floor. Dynamic remote args have no stable resource
+        # shape, so retain whole-topology legacy behavior for those pipelines.
+        return self._uses_user_provided_remote_args_fn
 
     def incremental_resource_usage(self) -> ExecutionResources:
         return self.per_task_resource_allocation()

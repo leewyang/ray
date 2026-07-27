@@ -32,8 +32,10 @@ from ray.data._internal.execution.resource_admission import (
     ResourceAdmissionGrant,
     ResourceAdmissionSpec,
     _ResourceAdmissionController,
+    validate_resource_admission_spec,
 )
 from ray.data._internal.execution.resource_manager import (
+    OpResourceAllocator,
     ReservationOpResourceAllocator,
     ResourceManager,
     create_resource_allocator,
@@ -166,6 +168,137 @@ def _mock_allocator_op(minimum, maximum):
     return op
 
 
+def test_physical_operator_resource_admission_defaults():
+    source = InputDataBuffer(DataContext(), input_data=[])
+
+    assert source.resource_admission_spec() is None
+    assert not source.resource_admission_incompatible()
+    source.apply_resource_admission_grant(ResourceAdmissionGrant(1, True))
+    assert source.can_release_resource_admission()
+
+
+@pytest.mark.parametrize(
+    "spec,error",
+    [
+        (
+            ResourceAdmissionSpec(
+                minimum_resources=ExecutionResources.zero(),
+                unit_resources=ExecutionResources(gpu=1),
+                min_units=1,
+                max_units=1,
+            ),
+            "minimum resources must be positive",
+        ),
+        (
+            ResourceAdmissionSpec(
+                minimum_resources=ExecutionResources(gpu=1),
+                unit_resources=ExecutionResources(gpu=1),
+                min_units=0,
+                max_units=1,
+            ),
+            "min_units must be positive",
+        ),
+        (
+            ResourceAdmissionSpec(
+                minimum_resources=ExecutionResources(gpu=1),
+                unit_resources=None,
+                min_units=2,
+                max_units=2,
+            ),
+            "Fixed resource-admission gangs require min_units == 1",
+        ),
+        (
+            ResourceAdmissionSpec(
+                minimum_resources=ExecutionResources(gpu=2),
+                unit_resources=ExecutionResources(gpu=1),
+                min_units=1,
+                max_units=2,
+            ),
+            "Admission floor must equal unit resources times min_units",
+        ),
+        (
+            ResourceAdmissionSpec(
+                minimum_resources=ExecutionResources(gpu=1),
+                unit_resources=ExecutionResources(gpu=-1),
+                min_units=1,
+                max_units=1,
+            ),
+            "Admission floor must equal unit resources times min_units",
+        ),
+        (
+            ResourceAdmissionSpec(
+                minimum_resources=ExecutionResources(gpu=2),
+                unit_resources=ExecutionResources(gpu=1),
+                min_units=2,
+                max_units=1,
+            ),
+            "max_units must be at least min_units",
+        ),
+    ],
+)
+def test_resource_admission_spec_validation_errors(spec, error):
+    with pytest.raises(ValueError, match=error):
+        validate_resource_admission_spec(spec)
+
+
+def test_resource_manager_admission_and_allocation_target_accessors():
+    op = MagicMock(spec=PhysicalOperator)
+    manager = object.__new__(ResourceManager)
+    manager._resource_admission_controller = MagicMock()
+    floor = ExecutionResources(gpu=1)
+    manager._resource_admission_controller.get_floor.return_value = floor
+    manager._op_resource_allocator = None
+
+    assert manager.get_admission_floor(op) == floor
+    assert manager.get_allocation_target(op) is None
+
+    allocator = MagicMock()
+    target = ExecutionResources(gpu=2)
+    allocator.get_allocation_target.return_value = target
+    manager._op_resource_allocator = allocator
+    assert manager.get_allocation_target(op) == target
+    assert OpResourceAllocator.get_allocation_target(MagicMock(), op) is None
+
+    reservation = object.__new__(ReservationOpResourceAllocator)
+    reservation._op_budgets = {}
+    assert reservation.get_allocation(op) is None
+
+
+def test_resource_manager_updates_admission_without_optional_allocator():
+    manager = object.__new__(ResourceManager)
+    manager._resource_admission_controller = MagicMock()
+    manager._resource_admission_controller.has_participants.return_value = True
+    manager._op_resource_allocator = None
+    limits = ExecutionResources(cpu=1, gpu=1)
+    manager.get_global_limits = MagicMock(return_value=limits)
+    manager._get_completed_ops_usage = MagicMock(return_value=ExecutionResources.zero())
+
+    manager._update_resource_allocations()
+
+    manager._resource_admission_controller.update_admission.assert_called_once_with(
+        limits
+    )
+    manager._resource_admission_controller.update_allocation_grants.assert_called_once_with(
+        limits
+    )
+
+
+def test_allocation_target_redistribution_exhausts_finite_capacities():
+    op = MagicMock(spec=PhysicalOperator)
+    op.min_max_resource_requirements.return_value = (
+        ExecutionResources.zero(),
+        ExecutionResources.zero(),
+    )
+    allocator = object.__new__(ReservationOpResourceAllocator)
+    allocator._op_reserved = {op: ExecutionResources.zero()}
+    allocator._reserved_for_op_outputs = {op: 0}
+    allocator._total_shared = ExecutionResources(gpu=1)
+
+    allocator._update_allocation_targets()
+
+    assert allocator.get_allocation_target(op) == ExecutionResources.zero()
+
+
 def test_resource_admission_topological_frontier():
     upstream = _mock_resource_admission_op()
     completed_cpu_middle = MagicMock(
@@ -281,12 +414,187 @@ def test_incompatible_gpu_owner_falls_back_whole_topology():
 
     assert not controller.has_participants()
     assert controller.get_grant(managed) is None
+    assert controller.get_floor(managed) is None
     managed.apply_resource_admission_grant.assert_not_called()
     warning.assert_called_once()
     assert (
         "disabling resource admission for the whole topology"
         in warning.call_args.args[0]
     )
+    controller.update_admission(ExecutionResources(cpu=2, gpu=2))
+
+
+def test_resource_admission_helper_edge_paths():
+    fixed = _mock_resource_admission_op(
+        fixed_gang=True,
+        inputs_complete=True,
+        internal_demand=True,
+    )
+    successor = _mock_resource_admission_op(inputs=[fixed])
+    elastic = _mock_resource_admission_op(max_units=None, internal_demand=True)
+    states = {
+        op: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0))
+        for op in (fixed, successor, elastic)
+    }
+    controller = _ResourceAdmissionController(
+        states,
+        _mock_admission_resource_manager(ExecutionResources(cpu=3, gpu=3)),
+    )
+
+    assert controller._should_prewarm_fixed_gang_successor(successor)
+    assert not controller._should_expose_demand(
+        elastic, ExecutionResources(cpu=3, gpu=3)
+    )
+
+    controller._set_grant(fixed, 1, may_submit=False)
+    assert controller._should_expose_demand(fixed, ExecutionResources(cpu=3, gpu=3))
+
+    controller._set_grant(elastic, 10, may_submit=True)
+    controller._set_grant(elastic, 0, may_submit=False)
+    assert controller.get_grant(elastic) == ResourceAdmissionGrant(10, True)
+
+    assert (
+        controller._max_units_for_target(
+            ExecutionResources(cpu=3, gpu=3),
+            fixed.resource_admission_spec(),
+        )
+        == 1
+    )
+    assert (
+        controller._max_units_for_target(
+            ExecutionResources(cpu=3, gpu=3),
+            elastic.resource_admission_spec(),
+        )
+        == 3
+    )
+    assert controller._unit_capacity(
+        ExecutionResources.inf(),
+        elastic.resource_admission_spec().unit_resources,
+    ) == float("inf")
+
+
+@pytest.mark.parametrize(
+    "ray_remote_args,ray_remote_args_fn,expected",
+    [
+        ({"num_gpus": 1}, None, False),
+        ({"num_cpus": 1}, lambda: {"num_gpus": 1}, True),
+        ({"num_cpus": 1}, None, False),
+    ],
+)
+def test_task_pool_resource_admission_compatibility(
+    ray_remote_args, ray_remote_args_fn, expected
+):
+    data_context = DataContext.get_current()
+    source = InputDataBuffer(data_context, input_data=[])
+    task_pool = MapOperator.create(
+        MagicMock(),
+        source,
+        data_context,
+        ray_remote_args=ray_remote_args,
+        ray_remote_args_fn=ray_remote_args_fn,
+    )
+
+    assert task_pool.resource_admission_incompatible() is expected
+
+
+def test_task_pool_internal_remote_args_fn_remains_admission_compatible():
+    data_context = DataContext.get_current()
+    source = InputDataBuffer(data_context, input_data=[])
+    task_pool = MapOperator.create(
+        MagicMock(),
+        source,
+        data_context,
+        ray_remote_args={"num_cpus": 1},
+    )
+
+    task_pool._ray_remote_args_fn = lambda: {"memory": 1024}
+
+    assert not task_pool.resource_admission_incompatible()
+
+
+def test_gpu_task_ancestor_keeps_progress_floor_before_actor_admission():
+    data_context = DataContext.get_current()
+    source = InputDataBuffer(data_context, input_data=[])
+    gpu_task = mock_map_op(
+        source,
+        ray_remote_args={"num_cpus": 0, "num_gpus": 1},
+        name="GPUTask",
+    )
+    managed = mock_map_op(
+        gpu_task,
+        ray_remote_args={"num_cpus": 0, "num_gpus": 1},
+        compute_strategy=ActorPoolStrategy(size=1),
+        name="ManagedGPU",
+    )
+    states = {
+        source: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
+        gpu_task: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
+        managed: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
+    }
+    limits = ExecutionResources(gpu=1)
+    controller = _ResourceAdmissionController(
+        states,
+        _mock_admission_resource_manager(limits),
+    )
+
+    controller.update_admission(limits)
+    assert not gpu_task.resource_admission_incompatible()
+    assert controller.has_participants()
+    assert controller.get_grant(managed) == ResourceAdmissionGrant(0, False)
+
+    gpu_task._inputs_complete = True
+    states[gpu_task].total_enqueued_input_blocks.return_value = 0
+    controller.update_admission(limits)
+
+    assert controller.get_grant(managed) == ResourceAdmissionGrant(1, True)
+
+
+@pytest.mark.parametrize(
+    "task_remote_args,actor_remote_args,admitted_while_task_needs_progress",
+    [
+        ({"num_cpus": 1}, {"num_gpus": 1}, False),
+        ({"num_cpus": 1}, {"num_cpus": 0, "num_gpus": 1}, True),
+        ({"num_cpus": 0, "num_gpus": 1}, {"num_cpus": 0, "num_gpus": 1}, False),
+    ],
+)
+def test_transient_ancestor_progress_floor_only_blocks_overlapping_actor(
+    task_remote_args,
+    actor_remote_args,
+    admitted_while_task_needs_progress,
+):
+    data_context = DataContext.get_current()
+    source = InputDataBuffer(data_context, input_data=[])
+    task = mock_map_op(
+        source,
+        ray_remote_args=task_remote_args,
+        name="TransientTask",
+    )
+    managed = mock_map_op(
+        task,
+        ray_remote_args=actor_remote_args,
+        compute_strategy=ActorPoolStrategy(size=1),
+        name="ManagedGPU",
+    )
+    states = {
+        source: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
+        task: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
+        managed: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
+    }
+    limits = ExecutionResources(cpu=1, gpu=1)
+    controller = _ResourceAdmissionController(
+        states,
+        _mock_admission_resource_manager(limits),
+    )
+
+    controller.update_admission(limits)
+    assert controller.get_grant(managed).may_submit is (
+        admitted_while_task_needs_progress
+    )
+
+    task._inputs_complete = True
+    states[task].total_enqueued_input_blocks.return_value = 0
+    controller.update_admission(limits)
+    assert controller.get_grant(managed) == ResourceAdmissionGrant(1, True)
 
 
 def test_cpu_actor_owner_falls_back_whole_topology():
@@ -380,6 +688,68 @@ def test_allocator_disabled_distributes_capacity_after_all_floors():
     assert controller.get_grant(gang) == ResourceAdmissionGrant(1, True)
 
 
+def test_allocator_disabled_skips_nonadmitted_owner():
+    admitted = _mock_resource_admission_op(internal_demand=True)
+    blocked = _mock_resource_admission_op(internal_demand=True)
+    states = {
+        op: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1))
+        for op in (admitted, blocked)
+    }
+    limits = ExecutionResources(cpu=1, gpu=1)
+    resource_manager = _mock_admission_resource_manager(limits)
+    resource_manager.op_resource_allocator_enabled.return_value = False
+    controller = _ResourceAdmissionController(states, resource_manager)
+
+    controller.update_admission(limits)
+    controller.update_allocation_grants(limits)
+
+    assert controller.get_grant(admitted) == ResourceAdmissionGrant(1, True)
+    assert controller.get_grant(blocked) == ResourceAdmissionGrant(0, False)
+
+
+def test_allocator_disabled_preserves_complete_fractional_gpu_units():
+    owner = _mock_resource_admission_op(
+        cpu=0,
+        gpu=0.1,
+        max_units=10,
+        internal_demand=True,
+    )
+    states = {owner: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1))}
+    limits = ExecutionResources(gpu=0.3)
+    resource_manager = _mock_admission_resource_manager(limits)
+    resource_manager.op_resource_allocator_enabled.return_value = False
+    controller = _ResourceAdmissionController(states, resource_manager)
+
+    controller.update_admission(limits)
+    controller.update_allocation_grants(limits)
+
+    assert controller.get_grant(owner) == ResourceAdmissionGrant(3, True)
+
+
+@pytest.mark.parametrize(("target_gpu", "expected_units"), [(0.3, 3), (0.4, 4)])
+def test_allocator_target_preserves_complete_fractional_gpu_units(
+    target_gpu, expected_units
+):
+    owner = _mock_resource_admission_op(
+        cpu=0,
+        gpu=0.1,
+        max_units=10,
+        internal_demand=True,
+    )
+    states = {owner: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1))}
+    limits = ExecutionResources(gpu=target_gpu)
+    resource_manager = _mock_admission_resource_manager(limits)
+    resource_manager.get_allocation_target.return_value = ExecutionResources(
+        gpu=target_gpu
+    )
+    controller = _ResourceAdmissionController(states, resource_manager)
+
+    controller.update_admission(limits)
+    controller.update_allocation_grants(limits)
+
+    assert controller.get_grant(owner) == ResourceAdmissionGrant(expected_units, True)
+
+
 def test_elastic_grant_preserves_configured_minimum_units():
     actor_pool = _mock_resource_admission_op(
         cpu=1, gpu=1, minimum_units=2, max_units=4, internal_demand=True
@@ -450,6 +820,40 @@ def test_sticky_elastic_owner_keeps_floor_until_state_can_be_released():
     _update_controller(controller, ExecutionResources.zero())
 
     assert controller.get_grant(owner) == ResourceAdmissionGrant(0, False)
+
+
+def test_sticky_owner_rejects_direct_grant_revocation():
+    owner = _mock_resource_admission_op(internal_demand=True)
+    states = {owner: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0))}
+    controller = _ResourceAdmissionController(
+        states,
+        _mock_admission_resource_manager(ExecutionResources(cpu=1, gpu=1)),
+    )
+    controller._grants[owner] = ResourceAdmissionGrant(1, True)
+    owner.can_release_resource_admission.return_value = False
+    owner.apply_resource_admission_grant.reset_mock()
+
+    controller._set_grant(owner, max_units=0, may_submit=False)
+
+    assert controller.get_grant(owner) == ResourceAdmissionGrant(1, True)
+    owner.apply_resource_admission_grant.assert_not_called()
+
+
+def test_uncapped_owner_accepts_unbounded_unit_grant():
+    owner = _mock_resource_admission_op(max_units=None)
+    states = {owner: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0))}
+    controller = _ResourceAdmissionController(
+        states,
+        _mock_admission_resource_manager(ExecutionResources(cpu=1, gpu=1)),
+    )
+    owner.apply_resource_admission_grant.reset_mock()
+
+    controller._set_grant(owner, max_units=10, may_submit=True)
+
+    assert controller.get_grant(owner) == ResourceAdmissionGrant(10, True)
+    owner.apply_resource_admission_grant.assert_called_once_with(
+        ResourceAdmissionGrant(10, True)
+    )
 
 
 def test_resource_admission_releases_drained_ancestor_with_buffered_output():
@@ -850,6 +1254,250 @@ def mock_all_to_all_op(input_op, name="MockShuffle"):
         name=name,
     )
     return op
+
+
+def _configure_admission_op_for_allocator(op):
+    spec = op.resource_admission_spec()
+    op.throttling_disabled.return_value = False
+    maximum = (
+        spec.unit_resources.scale(spec.max_units).copy(object_store_memory=float("inf"))
+        if spec.max_units is not None
+        else ExecutionResources.inf()
+    )
+    op.min_max_resource_requirements.return_value = (
+        spec.minimum_resources,
+        maximum,
+    )
+    op.min_scheduling_resources.return_value = spec.minimum_resources
+
+
+def _mock_resource_manager_for_admission_allocator(topology, limits):
+    resource_manager = MagicMock()
+    resource_manager._topology = topology
+    resource_manager._options = ExecutionOptions()
+    resource_manager.get_global_limits.return_value = limits
+    resource_manager.get_mem_op_internal.return_value = 0
+    resource_manager.get_mem_op_outputs.return_value = 0
+    resource_manager.get_op_usage.return_value = ExecutionResources.zero()
+    resource_manager._is_blocking_materializing_op.return_value = False
+    resource_manager.op_resource_allocator_enabled.return_value = True
+    return resource_manager
+
+
+def test_admitted_floor_after_pending_materializer_reduces_shared_target():
+    upstream = _mock_resource_admission_op(internal_demand=True)
+    downstream_branch = _mock_resource_admission_op(internal_demand=True)
+    for op in (upstream, downstream_branch):
+        _configure_admission_op_for_allocator(op)
+
+    pending_materializer = mock_all_to_all_op(
+        InputDataBuffer(DataContext.get_current(), [])
+    )
+    pending_materializer.has_completed = MagicMock(return_value=False)
+    pending_materializer.throttling_disabled = MagicMock(return_value=True)
+    topology = {
+        upstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
+        pending_materializer: MagicMock(),
+        downstream_branch: MagicMock(
+            total_enqueued_input_blocks=MagicMock(return_value=1)
+        ),
+    }
+    limits = ExecutionResources(cpu=2, gpu=2, object_store_memory=1_000)
+    resource_manager = _mock_resource_manager_for_admission_allocator(topology, limits)
+    controller = _ResourceAdmissionController(topology, resource_manager)
+    allocator = ReservationOpResourceAllocator(resource_manager, 0.5)
+    resource_manager.get_resource_admission_grant.side_effect = controller.get_grant
+    resource_manager.get_admission_floor.side_effect = controller.get_floor
+    resource_manager.get_allocation_target.side_effect = allocator.get_allocation_target
+
+    controller.update_admission(limits)
+    allocator.update_budgets(limits=limits)
+    controller.update_allocation_grants(limits)
+
+    # Task budgets remain restricted to operators before the pending materializer,
+    # but the independent branch's admitted floor is still globally protected.
+    assert upstream in allocator._op_budgets
+    assert downstream_branch not in allocator._op_budgets
+    assert allocator.get_allocation_target(upstream).gpu == pytest.approx(1)
+    assert controller.get_grant(upstream) == ResourceAdmissionGrant(1, True)
+    assert controller.get_grant(downstream_branch) == ResourceAdmissionGrant(1, True)
+    assert (
+        sum(controller.get_grant(op).max_units for op in (upstream, downstream_branch))
+        == 2
+    )
+
+
+def test_fractional_targets_redistribute_complete_elastic_unit():
+    upstream = _mock_resource_admission_op(internal_demand=True)
+    downstream = _mock_resource_admission_op(internal_demand=True)
+    for op in (upstream, downstream):
+        _configure_admission_op_for_allocator(op)
+
+    topology = {
+        upstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
+        downstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
+    }
+    limits = ExecutionResources(cpu=3, gpu=3, object_store_memory=1_000)
+    resource_manager = _mock_resource_manager_for_admission_allocator(topology, limits)
+    controller = _ResourceAdmissionController(topology, resource_manager)
+    allocator = ReservationOpResourceAllocator(resource_manager, 0.5)
+    resource_manager.get_resource_admission_grant.side_effect = controller.get_grant
+    resource_manager.get_admission_floor.side_effect = controller.get_floor
+    resource_manager.get_allocation_target.side_effect = allocator.get_allocation_target
+
+    controller.update_admission(limits)
+    allocator.update_budgets(limits=limits)
+    assert allocator.get_allocation_target(upstream).gpu == pytest.approx(1.5)
+    assert allocator.get_allocation_target(downstream).gpu == pytest.approx(1.5)
+
+    controller.update_allocation_grants(limits)
+
+    grants = [controller.get_grant(op).max_units for op in (upstream, downstream)]
+    assert grants == [1, 2]
+
+    # Capacity beyond the aggregate participant targets may be reserved for an
+    # unmanaged operator. Do not consume it merely because the global limit grew.
+    controller.update_allocation_grants(
+        ExecutionResources(cpu=4, gpu=4, object_store_memory=1_000)
+    )
+    assert [controller.get_grant(op).max_units for op in (upstream, downstream)] == [
+        1,
+        2,
+    ]
+
+
+def test_whole_unit_redistribution_skips_fixed_and_maxed_owners():
+    fixed_gang = _mock_resource_admission_op(fixed_gang=True, internal_demand=True)
+    capped_pool = _mock_resource_admission_op(max_units=1, internal_demand=True)
+    elastic_pool = _mock_resource_admission_op(internal_demand=True)
+    states = {
+        op: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1))
+        for op in (fixed_gang, capped_pool, elastic_pool)
+    }
+    limits = ExecutionResources(cpu=4, gpu=4)
+    resource_manager = _mock_admission_resource_manager(limits)
+    target = ExecutionResources(cpu=1.5, gpu=1.5)
+    resource_manager.get_allocation_target.side_effect = lambda op: target
+    controller = _ResourceAdmissionController(states, resource_manager)
+
+    controller.update_admission(limits)
+    controller.update_allocation_grants(limits)
+
+    assert controller.get_grant(fixed_gang) == ResourceAdmissionGrant(1, True)
+    assert controller.get_grant(capped_pool) == ResourceAdmissionGrant(1, True)
+    assert controller.get_grant(elastic_pool) == ResourceAdmissionGrant(2, True)
+
+
+def test_whole_unit_redistribution_supports_mixed_unit_shapes():
+    cpu_heavy = _mock_resource_admission_op(cpu=2, gpu=1, internal_demand=True)
+    balanced = _mock_resource_admission_op(cpu=1, gpu=1, internal_demand=True)
+    states = {
+        op: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1))
+        for op in (cpu_heavy, balanced)
+    }
+    limits = ExecutionResources(cpu=5, gpu=3)
+    resource_manager = _mock_admission_resource_manager(limits)
+    targets = {
+        cpu_heavy: ExecutionResources(cpu=3, gpu=1.5),
+        balanced: ExecutionResources(cpu=1.5, gpu=1.5),
+    }
+    resource_manager.get_allocation_target.side_effect = targets.__getitem__
+    controller = _ResourceAdmissionController(states, resource_manager)
+
+    controller.update_admission(limits)
+    controller.update_allocation_grants(limits)
+
+    # The combined fractional remainder is 1.5 CPU / 1 GPU. It cannot form
+    # another CPU-heavy unit, but it does form one complete balanced unit.
+    assert controller.get_grant(cpu_heavy) == ResourceAdmissionGrant(1, True)
+    assert controller.get_grant(balanced) == ResourceAdmissionGrant(2, True)
+
+
+def test_whole_unit_redistribution_uses_smaller_zero_remainder_owner():
+    small_units = _mock_resource_admission_op(
+        cpu=0,
+        gpu=1,
+        max_units=3,
+        internal_demand=True,
+    )
+    large_units = _mock_resource_admission_op(
+        cpu=0,
+        gpu=2,
+        max_units=3,
+        internal_demand=True,
+    )
+    states = {
+        op: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1))
+        for op in (small_units, large_units)
+    }
+    limits = ExecutionResources(gpu=5)
+    resource_manager = _mock_admission_resource_manager(limits)
+    targets = {
+        small_units: ExecutionResources(gpu=2),
+        large_units: ExecutionResources(gpu=3),
+    }
+    resource_manager.get_allocation_target.side_effect = targets.__getitem__
+    controller = _ResourceAdmissionController(states, resource_manager)
+
+    controller.update_admission(limits)
+    controller.update_allocation_grants(limits)
+
+    assert controller.get_grant(small_units) == ResourceAdmissionGrant(3, True)
+    assert controller.get_grant(large_units) == ResourceAdmissionGrant(1, True)
+
+
+def test_whole_unit_redistribution_can_pool_multiple_units_to_one_owner():
+    small_units = _mock_resource_admission_op(
+        cpu=0,
+        gpu=1,
+        max_units=4,
+        internal_demand=True,
+    )
+    large_units = _mock_resource_admission_op(
+        cpu=0,
+        gpu=3,
+        max_units=4,
+        internal_demand=True,
+    )
+    states = {
+        op: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1))
+        for op in (small_units, large_units)
+    }
+    limits = ExecutionResources(gpu=7)
+    resource_manager = _mock_admission_resource_manager(limits)
+    targets = {
+        small_units: ExecutionResources(gpu=2.5),
+        large_units: ExecutionResources(gpu=4.5),
+    }
+    resource_manager.get_allocation_target.side_effect = targets.__getitem__
+    controller = _ResourceAdmissionController(states, resource_manager)
+
+    controller.update_admission(limits)
+    controller.update_allocation_grants(limits)
+
+    assert controller.get_grant(small_units) == ResourceAdmissionGrant(4, True)
+    assert controller.get_grant(large_units) == ResourceAdmissionGrant(1, True)
+
+
+def test_whole_unit_redistribution_skips_globally_constrained_owner():
+    first = _mock_resource_admission_op(internal_demand=True)
+    constrained = _mock_resource_admission_op(internal_demand=True)
+    states = {
+        op: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1))
+        for op in (first, constrained)
+    }
+    limits = ExecutionResources(cpu=3, gpu=3)
+    resource_manager = _mock_admission_resource_manager(limits)
+    resource_manager.get_allocation_target.return_value = ExecutionResources(
+        cpu=2, gpu=2
+    )
+    controller = _ResourceAdmissionController(states, resource_manager)
+
+    controller.update_admission(limits)
+    controller.update_allocation_grants(limits)
+
+    assert controller.get_grant(first) == ResourceAdmissionGrant(2, True)
+    assert controller.get_grant(constrained) == ResourceAdmissionGrant(1, True)
 
 
 def _resource_manager_for_limits_only_test(

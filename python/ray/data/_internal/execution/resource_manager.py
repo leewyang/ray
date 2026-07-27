@@ -750,18 +750,24 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
         if len(eligible_ops) == 0:
             return
 
-        remaining = limits.copy()
-
-        # Protect each admitted operator's complete progress floor before
-        # default reservation or shared-resource distribution.
+        # Admission is topology-wide, while allocator eligibility stops at the
+        # first pending materializing operator. Protect every admitted floor
+        # before sharing resources among the currently eligible operators.
         admission_floors: Dict[PhysicalOperator, ExecutionResources] = {}
-        for op in eligible_ops:
+        for op in self._topology:
+            grant = self._resource_manager.get_resource_admission_grant(op)
+            if grant is None or not grant.may_submit:
+                continue
             admission_floor = self._resource_manager.get_admission_floor(op)
-            if admission_floor is not None:
-                admission_floors[op] = admission_floor
-                remaining = remaining.subtract(admission_floor).max(
-                    ExecutionResources.zero()
-                )
+            assert admission_floor is not None
+            admission_floors[op] = admission_floor
+
+        total_admission_floor = ExecutionResources.combine_sum(
+            admission_floors.values()
+        )
+        remaining = limits.subtract(total_admission_floor).max(
+            ExecutionResources.zero()
+        )
 
         # Distribute the configured default reservation from resources remaining
         # after protected admission floors.
