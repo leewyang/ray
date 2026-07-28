@@ -31,7 +31,7 @@ from ray.data._internal.execution.interfaces.execution_options import (
     ExecutionResources,
 )
 from ray.data._internal.execution.interfaces.op_runtime_metrics import OpRuntimeMetrics
-from ray.data._internal.execution.resource_admission import (
+from ray.data._internal.execution.interfaces.resource_admission import (
     ResourceAdmissionGrant,
     ResourceAdmissionSpec,
 )
@@ -932,9 +932,24 @@ class PhysicalOperator(Operator):
             options: The global options used for the overall execution.
             block_ref_counter: The executor-wide shared counter for tracking
                 object-store memory.
+
+        Overrides that acquire external resources must call ``super().start()``
+        before doing so. This lets the executor roll back a partially started
+        topology if a later operator fails to start.
         """
         self._block_ref_counter = block_ref_counter
         self._started = True
+
+    def rollback_start(self) -> None:
+        """Release resources after topology startup fails.
+
+        This is safe to call for every operator whose ``start()`` was attempted.
+        Operators that failed before calling ``super().start()`` are unchanged;
+        started operators go through the normal forced-shutdown lifecycle.
+        """
+        if not self._started or self._shutdown:
+            return
+        self.shutdown(Timer(), force=True)
 
     def can_add_input(self) -> bool:
         """Return whether it is desirable to add input to this operator right now.
@@ -1038,6 +1053,15 @@ class PhysicalOperator(Operator):
         This should return True for operators that only manipulate bundle metadata
         (e.g., the OutputSplitter operator). This hints to the execution engine that
         these operators should not be throttled based on resource usage.
+        """
+        return False
+
+    def is_blocking_materializing(self) -> bool:
+        """Whether downstream operators must wait for this operator to complete.
+
+        Blocking materializing operators consume all of their inputs before making
+        outputs available. Resource allocation uses this signal to avoid reserving
+        resources for downstream work that cannot start yet.
         """
         return False
 
@@ -1145,15 +1169,28 @@ class PhysicalOperator(Operator):
         return ExecutionResources.zero(), ExecutionResources.inf()
 
     def resource_admission_spec(self) -> Optional[ResourceAdmissionSpec]:
-        """Return this persistent owner's aggregate resource floor, if any."""
+        """Return this persistent owner's aggregate resource floor, if any.
+
+        The executor calls this before ``start()``, so implementations must only
+        inspect constructor-initialized state.
+        """
         return None
 
     def resource_admission_incompatible(self) -> bool:
-        """Whether this owner requires whole-topology compatibility fallback."""
+        """Whether this owner requires whole-topology compatibility fallback.
+
+        The executor calls this before ``start()``, so implementations must only
+        inspect constructor-initialized state.
+        """
         return False
 
     def apply_resource_admission_grant(self, grant: ResourceAdmissionGrant) -> None:
-        """Apply the latest executor-owned resource admission grant."""
+        """Apply the latest executor-owned resource admission grant.
+
+        The initial grant is applied before ``start()``. Implementations must accept
+        that call without creating external resources; ``start()`` and later grants
+        may activate resources allowed by the stored grant.
+        """
         pass
 
     def can_release_resource_admission(self) -> bool:

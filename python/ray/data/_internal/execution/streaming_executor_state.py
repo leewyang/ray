@@ -600,8 +600,8 @@ def start_streaming_topology(
     except BaseException:
         for op in reversed(started):
             try:
-                op._do_shutdown(force=True)
-            except Exception:
+                op.rollback_start()
+            except BaseException:
                 logger.exception("Failed to roll back operator %s", op)
         raise
 

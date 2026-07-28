@@ -16,6 +16,9 @@ from ray.data._internal.execution.interfaces.physical_operator import (
     PhysicalOperator,
     ReportsExtraResourceUsage,
 )
+from ray.data._internal.execution.interfaces.resource_admission import (
+    ResourceAdmissionGrant,
+)
 from ray.data._internal.execution.operators.base_physical_operator import (
     AllToAllOperator,
 )
@@ -27,8 +30,7 @@ from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operat
     ShuffleMapOp,
 )
 from ray.data._internal.execution.operators.zip_operator import ZipOperator
-from ray.data._internal.execution.resource_admission import (
-    ResourceAdmissionGrant,
+from ray.data._internal.execution.resource_admission_controller import (
     _ResourceAdmissionController,
 )
 from ray.data._internal.execution.util import memory_string
@@ -64,6 +66,14 @@ _BLOCKING_MATERIALIZING_OPERATORS = (
     # TODO remove after zip made fully streaming
     ZipOperator,
 )
+
+
+def _is_blocking_materializing_operator(op: PhysicalOperator) -> bool:
+    """Return whether ``op`` blocks downstream execution while materializing."""
+    return (
+        isinstance(op, _BLOCKING_MATERIALIZING_OPERATORS)
+        or op.is_blocking_materializing()
+    )
 
 
 def terminal_operator_from_topology(topology: "Topology") -> PhysicalOperator:
@@ -512,6 +522,19 @@ class ResourceManager:
             return self._op_resource_allocator.max_task_output_bytes_to_read(op)
         return None
 
+    def _get_excluded_completed_op_usage(
+        self, op: PhysicalOperator
+    ) -> ExecutionResources:
+        """Return completed usage not represented by a retained admission floor."""
+        usage = self.get_op_usage(op)
+        grant = self.get_resource_admission_grant(op)
+        if grant is None or grant.max_units == 0 or op.can_release_resource_admission():
+            return usage
+
+        floor = self.get_admission_floor(op)
+        assert floor is not None
+        return usage.subtract(floor).max(ExecutionResources.zero())
+
     def _get_completed_ops_usage(self) -> ExecutionResources:
         """
         Resource reservation is based on the number of eligible operators.
@@ -543,7 +566,7 @@ class ResourceManager:
 
         completed_ops = list(set(ops_to_exclude))
         completed_ops_usage = ExecutionResources.combine_sum(
-            self.get_op_usage(op) for op in completed_ops
+            self._get_excluded_completed_op_usage(op) for op in completed_ops
         )
 
         return completed_ops_usage
@@ -561,7 +584,7 @@ class ResourceManager:
         """
 
         # Check if Op itself is a blocking, materializing operator
-        if isinstance(op, _BLOCKING_MATERIALIZING_OPERATORS):
+        if _is_blocking_materializing_operator(op):
             return True
 
         # Check if any of its direct *ineligible* downstream dependencies are
@@ -570,14 +593,14 @@ class ResourceManager:
         # NOTE: We only check ineligible downstream deps, since eligible downstream
         #       deps will have their own allocation that is adjusted appropriately
         return any(
-            isinstance(op, _BLOCKING_MATERIALIZING_OPERATORS)
+            _is_blocking_materializing_operator(op)
             for op in self._get_downstream_ineligible_ops(op)
         )
 
 
 def _get_first_pending_materializing_op(topology: "Topology") -> int:
     for idx, op in enumerate(topology):
-        if isinstance(op, _BLOCKING_MATERIALIZING_OPERATORS) and not op.has_completed():
+        if _is_blocking_materializing_operator(op) and not op.has_completed():
             return idx
 
     return -1

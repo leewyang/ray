@@ -7,11 +7,18 @@ import pyarrow as pa
 import pytest
 
 import ray
-from ray.data._internal.compute import TaskPoolStrategy
+from ray.data._internal.compute import ActorPoolStrategy, TaskPoolStrategy
 from ray.data._internal.datasource.parquet_datasink import ParquetDatasink
 from ray.data._internal.execution.interfaces.op_runtime_metrics import OpRuntimeMetrics
+from ray.data._internal.execution.interfaces.execution_options import (
+    ExecutionResources,
+)
 from ray.data._internal.execution.operators.base_physical_operator import (
     AllToAllOperator,
+)
+from ray.data._internal.execution.operators.actor_pool_map_operator import (
+    ActorPoolMapOperator,
+    _actor_lifetime_resources,
 )
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
 from ray.data._internal.execution.operators.map_operator import MapOperator
@@ -442,6 +449,62 @@ def test_configure_map_task_memory_rule(
 
     remote_args = new_plan.dag._get_dynamic_ray_remote_args()
     assert remote_args.get("memory") == expected_memory
+
+
+def test_optimizer_memory_updates_task_resource_accounting():
+    data_context = DataContext()
+    map_op = MapOperator.create(
+        MagicMock(),
+        input_op=InputDataBuffer(data_context, []),
+        data_context=data_context,
+        compute_strategy=TaskPoolStrategy(),
+        ray_remote_args={"num_cpus": 0, "num_gpus": 1},
+    )
+    assert isinstance(map_op, TaskPoolMapOperator)
+    map_op._metrics = MagicMock(
+        spec=OpRuntimeMetrics,
+        average_bytes_per_output=1024,
+    )
+    plan = PhysicalPlan(map_op, op_map=MagicMock(), context=data_context)
+
+    ConfigureMapTaskMemoryUsingOutputSize().apply(plan)
+
+    assert map_op.min_scheduling_resources().memory == 1024
+    map_op._metrics.average_bytes_per_output = 2048
+    assert map_op.min_scheduling_resources().memory == 2048
+
+
+def test_optimizer_memory_keeps_static_actor_admission_floor():
+    data_context = DataContext()
+    data_context._enable_resource_admission_control = True
+    map_op = MapOperator.create(
+        MagicMock(),
+        input_op=InputDataBuffer(data_context, []),
+        data_context=data_context,
+        compute_strategy=ActorPoolStrategy(min_size=1, max_size=2),
+        ray_remote_args={"num_cpus": 0, "num_gpus": 1},
+    )
+    assert isinstance(map_op, ActorPoolMapOperator)
+    map_op._metrics = MagicMock(
+        spec=OpRuntimeMetrics,
+        average_bytes_per_output=None,
+    )
+    plan = PhysicalPlan(map_op, op_map=MagicMock(), context=data_context)
+
+    ConfigureMapTaskMemoryUsingOutputSize().apply(plan)
+
+    spec = map_op.resource_admission_spec()
+    assert spec is not None
+    assert spec.unit_resources == ExecutionResources(gpu=1)
+    assert not map_op.resource_admission_incompatible()
+
+    # The estimate can affect only a later optional actor. Core schedules that
+    # actor atomically using the final shape, while the already-running floor
+    # actor retains the static admission shape.
+    map_op._metrics.average_bytes_per_output = 2048
+    next_actor_resources = _actor_lifetime_resources(map_op._merge_ray_remote_args())
+    assert next_actor_resources == ExecutionResources(gpu=1, memory=2048)
+    assert map_op.resource_admission_spec() == spec
 
 
 if __name__ == "__main__":

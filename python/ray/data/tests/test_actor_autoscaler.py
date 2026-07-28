@@ -17,7 +17,11 @@ from ray.data._internal.actor_autoscaler.default_actor_autoscaler import (
     _get_max_scale_up,
 )
 from ray.data._internal.compute import ActorPoolStrategy
-from ray.data._internal.execution.interfaces import ExecutionOptions
+from ray.data._internal.execution.interfaces import (
+    ExecutionOptions,
+    ResourceAdmissionGrant,
+    ResourceAdmissionSpec,
+)
 from ray.data._internal.execution.operators.actor_pool_map_operator import (
     ActorPoolMapOperator,
     _ActorPool,
@@ -27,9 +31,7 @@ from ray.data._internal.execution.operators.base_physical_operator import (
 )
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
 from ray.data._internal.execution.operators.map_operator import MapOperator
-from ray.data._internal.execution.resource_admission import (
-    ResourceAdmissionGrant,
-    ResourceAdmissionSpec,
+from ray.data._internal.execution.resource_admission_controller import (
     _ResourceAdmissionController,
 )
 from ray.data._internal.execution.resource_manager import ResourceManager

@@ -29,6 +29,8 @@ from ray.data._internal.execution.interfaces import (
     ExecutionOptions,
     ExecutionResources,
     PhysicalOperator,
+    ResourceAdmissionGrant,
+    ResourceAdmissionSpec,
 )
 from ray.data._internal.execution.interfaces.physical_operator import (
     DataOpTask,
@@ -47,7 +49,6 @@ from ray.data._internal.execution.operators.map_transformer import (
     MapTransformer,
 )
 from ray.data._internal.execution.ranker import DefaultRanker
-from ray.data._internal.execution.resource_admission import ResourceAdmissionGrant
 from ray.data._internal.execution.resource_manager import ResourceManager
 from ray.data._internal.execution.streaming_executor import (
     StreamingExecutor,
@@ -174,19 +175,97 @@ def test_build_then_start_streaming_topology_in_two_phases():
 
 
 def test_start_streaming_topology_rolls_back_partial_start():
-    operators = [MagicMock(spec=PhysicalOperator) for _ in range(3)]
-    operators[1].start.side_effect = RuntimeError("start failed")
-    operators[1]._do_shutdown.side_effect = RuntimeError("cleanup failed")
+    events = []
 
-    with pytest.raises(RuntimeError, match="start failed"):
+    class CleanupFailure(BaseException):
+        pass
+
+    class StartTrackingOperator(PhysicalOperator):
+        def __init__(self, name, *, fail_start=False, fail_cleanup=False):
+            super().__init__(name, [], DataContext())
+            self._fail_start = fail_start
+            self._fail_cleanup = fail_cleanup
+
+        def start(self, options, block_ref_counter):
+            events.append(f"start:{self.name}")
+            super().start(options, block_ref_counter)
+            if self._fail_start:
+                raise RuntimeError("start failed")
+
+        def _do_shutdown(self, force=False):
+            events.append(f"stop:{self.name}")
+            assert force
+            if self._fail_cleanup:
+                raise CleanupFailure("cleanup failed")
+
+    operators = [
+        StartTrackingOperator("first"),
+        StartTrackingOperator("failing", fail_start=True, fail_cleanup=True),
+        StartTrackingOperator("unreached"),
+    ]
+
+    with pytest.raises(RuntimeError, match="start failed") as exc_info:
         start_streaming_topology(
             dict.fromkeys(operators), ExecutionOptions(), noop_counter()
         )
 
-    operators[0]._do_shutdown.assert_called_once_with(force=True)
-    operators[1]._do_shutdown.assert_called_once_with(force=True)
-    operators[2].start.assert_not_called()
-    operators[2]._do_shutdown.assert_not_called()
+    assert type(exc_info.value) is RuntimeError
+    assert events == [
+        "start:first",
+        "start:failing",
+        "stop:failing",
+        "stop:first",
+    ]
+    assert operators[0]._shutdown
+    assert operators[1]._shutdown
+    assert not operators[2]._started
+    operators[2].rollback_start()
+    assert events[-1] == "stop:first"
+
+
+def test_resource_admission_initial_grant_is_applied_before_start():
+    class AdmissionOperator(PhysicalOperator):
+        def __init__(self, input_op, data_context):
+            super().__init__("AdmissionOperator", [input_op], data_context)
+            self.grant = None
+            self.grant_at_start = None
+
+        def resource_admission_spec(self):
+            return ResourceAdmissionSpec(
+                minimum_resources=ExecutionResources(gpu=1),
+                unit_resources=ExecutionResources(gpu=1),
+                min_units=1,
+                max_units=1,
+            )
+
+        def apply_resource_admission_grant(self, grant):
+            self.grant = grant
+
+        def start(self, options, block_ref_counter):
+            self.grant_at_start = self.grant
+            super().start(options, block_ref_counter)
+
+    data_context = DataContext()
+    source = InputDataBuffer(data_context, input_data=[])
+    owner = AdmissionOperator(source, data_context)
+    options = ExecutionOptions()
+    block_ref_counter = noop_counter()
+    topology = build_streaming_topology(
+        owner, options, block_ref_counter, start_operators=False
+    )
+
+    ResourceManager(
+        topology,
+        options,
+        lambda: ExecutionResources(gpu=1),
+        data_context,
+        block_ref_counter,
+    )
+    start_streaming_topology(topology, options, block_ref_counter)
+
+    assert owner.grant_at_start == ResourceAdmissionGrant(0, False)
+    for op in reversed(topology):
+        op.rollback_start()
 
 
 def test_disallow_non_unique_operators(ray_start_regular_shared):
@@ -535,23 +614,38 @@ def test_get_eligible_operators_to_run(ray_start_regular_shared):
 
     # Admission is a hard constraint: the idle-pipeline liveness fallback must
     # not dispatch new input to a frontier pool and let it leapfrog upstream.
-    resource_manager.get_resource_admission_grant.side_effect = lambda op: (
-        ResourceAdmissionGrant(0, False) if op is o2 else None
-    )
-    with patch.object(
-        o2,
-        "can_add_input",
-        side_effect=AssertionError("hard admission gate must not probe readiness"),
-    ):
-        assert (
-            get_eligible_operators(
-                topo,
-                [],
-                ensure_liveness=True,
-                resource_manager=resource_manager,
-            )
-            == []
+    for max_units in (0, 1):
+        resource_manager.get_resource_admission_grant.side_effect = lambda op: (
+            ResourceAdmissionGrant(max_units, False) if op is o2 else None
         )
+        with patch.object(
+            o2,
+            "can_add_input",
+            side_effect=AssertionError("hard admission gate must not probe readiness"),
+        ):
+            assert (
+                get_eligible_operators(
+                    topo,
+                    [],
+                    ensure_liveness=True,
+                    resource_manager=resource_manager,
+                )
+                == []
+            )
+
+    resource_manager.get_resource_admission_grant.side_effect = lambda op: (
+        ResourceAdmissionGrant(1, True) if op is o2 else None
+    )
+    assert get_eligible_operators(
+        topo,
+        [],
+        ensure_liveness=False,
+        resource_manager=resource_manager,
+    ) == [o2]
+    assert topo[o2]._scheduling_status.runnable
+    assert topo[o2]._scheduling_status.under_resource_limits
+    assert not o2._in_task_submission_backpressure
+    assert o2._task_submission_backpressure_policy is None
 
 
 def test_backpressure_policy_tracking(ray_start_regular_shared):
@@ -752,6 +846,31 @@ def test_process_completed_tasks_unblocks_when_non_resource_budget_policy_zeros_
     # and the policy attribution should be cleared.
     assert o2._in_task_output_backpressure is False
     assert o2._task_output_backpressure_policy is None
+
+
+def test_output_backpressure_ignores_partial_internal_input_bundle():
+    upstream = MagicMock(spec=PhysicalOperator)
+    downstream = MagicMock(spec=PhysicalOperator)
+    downstream.num_active_tasks.return_value = 0
+    downstream_state = MagicMock(spec=OpState)
+    downstream_state.has_pending_bundles.return_value = False
+    downstream_state.total_enqueued_input_blocks.return_value = 1
+    topology = {
+        upstream: MagicMock(spec=OpState),
+        downstream: downstream_state,
+    }
+    resource_manager = MagicMock(spec=ResourceManager)
+    resource_manager.get_downstream_eligible_ops.return_value = [downstream]
+    resource_manager.can_submit_new_task.return_value = True
+    guard = OutputBackpressureGuard(topology, resource_manager)
+
+    # An internally buffered partial rebundler input cannot be dispatched yet,
+    # so upstream must be allowed to produce another block.
+    assert guard.should_unblock(upstream)
+
+    downstream_state.has_pending_bundles.return_value = True
+    guard._idle_detector.detect_idle = MagicMock(return_value=False)
+    assert not guard.should_unblock(upstream)
 
 
 def test_summary_str_backpressure_policies(ray_start_regular_shared):

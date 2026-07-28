@@ -261,7 +261,7 @@ DEFAULT_ENABLE_OP_RESOURCE_RESERVATION = env_bool(
     "RAY_DATA_ENABLE_OP_RESOURCE_RESERVATION", True
 )
 
-# Internal rollback switch for resource-aware admission of GPU actor pools with
+# Internal rollback switch for resource-aware admission of persistent owners with
 # statically declared resources. Keep this private until the policy has had enough
 # production exposure.
 _DEFAULT_ENABLE_RESOURCE_ADMISSION_CONTROL = env_bool(
@@ -709,10 +709,9 @@ class DataContext:
         gpu_shuffle_spill_memory_limit: Device-to-host spill threshold per rank.
             ``"auto"`` uses 80% of ``gpu_shuffle_rmm_pool_size``; ``None`` disables
             spilling.
-        gpu_shuffle_setup_timeout_s: Maximum time in seconds to wait for UCXX
-            root/worker initialization after the shuffle placement group is ready.
-            Placement-group provisioning remains governed by Ray's autoscaler.
-            Defaults to 120 seconds.
+        gpu_shuffle_setup_timeout_s: Maximum time in seconds to wait for the
+            complete GPU shuffle setup, including placement-group provisioning
+            and UCXX root/worker initialization. Defaults to 120 seconds.
         isolate_read_workers: If ``True``, other operators' tasks don't get scheduled on
             the same worker processes as the read operators'. This prevents large
             PyArrow memory allocation during reads from inflating the resident memory of
@@ -812,8 +811,8 @@ class DataContext:
     # "auto" = 80% of rmm_pool_size; None = spilling disabled.
     gpu_shuffle_spill_memory_limit: Union[int, str, None] = "auto"
 
-    # Maximum seconds to wait for UCXX communicator setup before raising
-    # TimeoutError.
+    # Maximum seconds to wait for placement and UCXX communicator setup before
+    # raising TimeoutError.
     gpu_shuffle_setup_timeout_s: float = 120.0
 
     scheduling_strategy: SchedulingStrategyT = DEFAULT_SCHEDULING_STRATEGY

@@ -83,10 +83,6 @@ class TaskPoolMapOperator(MapOperator):
                 with a default logical ``memory``. The method for choosing the
                 default is an implementation detail.
         """
-        # Optimizer rules can later install an internal remote-args function for
-        # memory estimates. Preserve whether the user supplied dynamic options,
-        # whose resource shape admission cannot know in advance.
-        self._uses_user_provided_remote_args_fn = ray_remote_args_fn is not None
         super().__init__(
             map_transformer,
             input_op,
@@ -220,18 +216,31 @@ class TaskPoolMapOperator(MapOperator):
 
     def resource_admission_incompatible(self) -> bool:
         # Static per-task resources participate in the controller's unmanaged
-        # ancestor progress floor. Dynamic remote args have no stable resource
-        # shape, so retain whole-topology legacy behavior for those pipelines.
-        return self._uses_user_provided_remote_args_fn
+        # ancestor progress floor. Dynamic resources and placement constraints
+        # cannot be represented by its scalar CPU/GPU/memory shape, so retain
+        # whole-topology legacy behavior for those pipelines.
+        if "scheduling_strategy" in self._ray_remote_args:
+            scheduling_strategies = (
+                self._ray_remote_args["scheduling_strategy"],
+            )
+        else:
+            scheduling_strategies = (
+                self.data_context.scheduling_strategy,
+                self.data_context.scheduling_strategy_large_args,
+            )
+        return self._resource_admission_remote_args_incompatible(
+            scheduling_strategies
+        )
 
     def incremental_resource_usage(self) -> ExecutionResources:
         return self.per_task_resource_allocation()
 
     def per_task_resource_allocation(self) -> ExecutionResources:
+        remote_args = self._get_resource_accounting_remote_args()
         return ExecutionResources(
-            cpu=self._ray_remote_args.get("num_cpus", 0),
-            gpu=self._ray_remote_args.get("num_gpus", 0),
-            memory=self._ray_remote_args.get("memory", 0),
+            cpu=remote_args.get("num_cpus", 0),
+            gpu=remote_args.get("num_gpus", 0),
+            memory=remote_args.get("memory", 0),
         )
 
     def min_scheduling_resources(

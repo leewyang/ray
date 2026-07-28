@@ -34,6 +34,7 @@ from ray.data._internal.execution.interfaces import (
     ExecutionOptions,
     ExecutionResources,
     PhysicalOperator,
+    ResourceAdmissionGrant,
 )
 from ray.data._internal.execution.interfaces.ref_bundle import BlockEntry, RefBundle
 from ray.data._internal.execution.interfaces.task_context import TaskContext
@@ -52,7 +53,6 @@ from ray.data._internal.execution.operators.map_transformer import (
 from ray.data._internal.execution.operators.task_pool_map_operator import (
     TaskPoolMapOperator,
 )
-from ray.data._internal.execution.resource_admission import ResourceAdmissionGrant
 from ray.data._internal.execution.streaming_executor_state import (
     build_streaming_topology,
     update_operator_states,
@@ -1347,6 +1347,20 @@ def test_resource_admission_rejects_fallback_strategy():
             "num_gpus": 1,
             "fallback_strategy": [{"label_selector": {"zone": "west"}}],
         },
+    )
+
+    assert op.resource_admission_incompatible()
+    assert op.resource_admission_spec() is not None
+
+
+def test_resource_admission_rejects_object_store_memory():
+    data_context = DataContext()
+    op = MapOperator.create(
+        map_transformer=MagicMock(),
+        input_op=InputDataBuffer(data_context, input_data=[]),
+        data_context=data_context,
+        compute_strategy=ActorPoolStrategy(min_size=1, max_size=4),
+        ray_remote_args={"num_gpus": 1, "object_store_memory": 1024},
     )
 
     assert op.resource_admission_incompatible()

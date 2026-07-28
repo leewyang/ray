@@ -19,13 +19,14 @@ from typing import (
     Union,
 )
 
+import ray
 from typing_extensions import override
 
 if TYPE_CHECKING:
     import pyarrow as pa
 
     from ray.data._internal.execution.block_ref_counter import BlockRefCounter
-import ray
+from ray.exceptions import GetTimeoutError
 from ray._common.utils import resources_from_ray_options
 from ray._private import ray_constants
 from ray.actor import ActorHandle
@@ -51,6 +52,8 @@ from ray.data._internal.execution.interfaces import (
     NodeIdStr,
     PhysicalOperator,
     RefBundle,
+    ResourceAdmissionGrant,
+    ResourceAdmissionSpec,
     TaskContext,
 )
 from ray.data._internal.execution.node_trackers.actor_location import (
@@ -62,10 +65,6 @@ from ray.data._internal.execution.operators.map_operator import (
     _map_task,
 )
 from ray.data._internal.execution.operators.map_transformer import MapTransformer
-from ray.data._internal.execution.resource_admission import (
-    ResourceAdmissionGrant,
-    ResourceAdmissionSpec,
-)
 from ray.data._internal.execution.util import locality_string, merge_label_selector
 from ray.data._internal.remote_fn import _add_system_error_to_retry_exceptions
 from ray.data._internal.utils.heapdict import heapdict
@@ -89,14 +88,15 @@ LogicalActorId = str
 def _actor_lifetime_resources(
     ray_remote_args: Dict[str, Any],
 ) -> ExecutionResources:
-    """Return the lifetime resources Ray Core derives for an actor.
+    """Return the CPU, GPU, and heap-memory resources Core assigns to an actor.
 
     When no processor or custom resources are specified, a Core actor reserves
     no lifetime CPU and its methods use one CPU. If any such resource is
     specified, Core instead reserves a default lifetime CPU and actor methods
-    use no CPU. Keep this translation in the actor operator so execution
-    accounting matches Core without materializing implicit defaults in the
-    user-facing remote options.
+    use no CPU. Object-store memory and placement-only resources are deliberately
+    excluded from execution accounting. Keep this translation in the actor
+    operator so accounting matches the supported Core resource shape without
+    materializing implicit defaults in the user-facing remote options.
     """
     core_resources = resources_from_ray_options(ray_remote_args)
     has_specified_resources = bool(
@@ -204,11 +204,6 @@ class ActorPoolMapOperator(MapOperator):
         )
 
         self._min_rows_per_bundle = min_rows_per_bundle
-        # Record user-provided dynamic options before optimizer rules add estimates.
-        # The output-size optimizer can add memory only after a floor actor has
-        # produced output; Ray Core still gates optional elastic actors on that
-        # dynamically estimated memory.
-        self._uses_user_provided_remote_args_fn = ray_remote_args_fn is not None
         self._ray_remote_args_fn = ray_remote_args_fn
         self._ray_remote_args = self._apply_default_remote_args(
             self._ray_remote_args, self.data_context
@@ -339,8 +334,8 @@ class ActorPoolMapOperator(MapOperator):
             try:
                 timeout = self.data_context.wait_for_min_actors_s
                 ray.get(refs, timeout=timeout)
-            except ray.exceptions.GetTimeoutError:
-                raise ray.exceptions.GetTimeoutError(
+            except GetTimeoutError:
+                raise GetTimeoutError(
                     "Timed out while starting actors. "
                     "This may mean that the cluster does not have "
                     "enough resources for the requested actor pool."
@@ -369,28 +364,16 @@ class ActorPoolMapOperator(MapOperator):
         )
 
     def resource_admission_incompatible(self) -> bool:
-        if self._uses_user_provided_remote_args_fn:
-            return True
-
         per_actor = self._actor_pool.per_actor_resource_usage()
-        remote_args = merge_label_selector(
-            self._ray_remote_args, self.data_context.execution_options.label_selector
-        )
         strategy = self._ray_remote_args.get("scheduling_strategy")
-        unsupported = (
-            "resources",
-            "accelerator_type",
-            "label_selector",
-            "fallback_strategy",
-            "name",
-            "lifetime",
-            "get_if_exists",
-            "placement_group",
-            "placement_group_bundle_index",
-            "placement_group_capture_child_tasks",
-        )
-        if strategy not in ("DEFAULT", "SPREAD") or any(
-            name in remote_args for name in unsupported
+        # Optimizer-owned remote arguments may add heap memory only after the
+        # required floor actors have produced output. Keep those functions
+        # compatible: the admission floor remains the static actor shape, while
+        # Core atomically gates any optional elastic actor on its final shape.
+        # Caller-provided functions remain incompatible in the shared check.
+        if self._resource_admission_remote_args_incompatible(
+            (strategy,),
+            additional_unsupported_options=("name", "lifetime", "get_if_exists"),
         ):
             return True
         if per_actor.gpu <= 0:
@@ -439,7 +422,7 @@ class ActorPoolMapOperator(MapOperator):
         elif wait_started is None:
             self._min_actors_wait_start_time = time.monotonic()
         elif time.monotonic() - wait_started >= self.data_context.wait_for_min_actors_s:
-            raise ray.exceptions.GetTimeoutError(
+            raise GetTimeoutError(
                 "Timed out while starting actors. This may mean that the cluster "
                 "does not have enough resources for the requested actor pool."
             )

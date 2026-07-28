@@ -16,6 +16,7 @@ from typing import (
 )
 
 import ray
+from ray.exceptions import GetTimeoutError
 from ray.actor import ActorHandle
 from ray.data import ExecutionOptions
 from ray.data._internal.execution.bundle_queue import ReorderingBundleQueue
@@ -24,6 +25,8 @@ from ray.data._internal.execution.interfaces import (
     ExecutionResources,
     PhysicalOperator,
     RefBundle,
+    ResourceAdmissionGrant,
+    ResourceAdmissionSpec,
 )
 from ray.data._internal.execution.interfaces.physical_operator import (
     DataOpTask,
@@ -35,10 +38,6 @@ from ray.data._internal.execution.operators.hash_shuffle import (
     _get_total_cluster_resources,
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
-from ray.data._internal.execution.resource_admission import (
-    ResourceAdmissionGrant,
-    ResourceAdmissionSpec,
-)
 from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data.block import Block, BlockAccessor, BlockStats, to_stats
 from ray.data.context import DataContext
@@ -46,6 +45,8 @@ from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 if typing.TYPE_CHECKING:
+    import pyarrow as pa
+
     from ray.data._internal.execution.block_ref_counter import BlockRefCounter
     from ray.data._internal.execution.interfaces.physical_operator import ActorPoolInfo
     from ray.data._internal.progress.base_progress import BaseProgressBar
@@ -122,7 +123,7 @@ class GPUShuffleActor:
         """Finish UCXX communicator setup and create the internal shuffler.
 
         Must be called on *every* rank (including rank 0) after
-        :meth:`get_root_address` has been called on rank 0 and its result
+        :meth:`setup_root` has been called on rank 0 and its result
         broadcast to all ranks.
         """
         logger.info(
@@ -225,6 +226,7 @@ class GPURankPoolState(Enum):
     RESERVING = "reserving"
     STARTING = "starting"
     READY = "ready"
+    CLOSING = "closing"
     FAILED = "failed"
     CLOSED = "closed"
 
@@ -294,6 +296,7 @@ class GPURankPool:
             self._nranks,
             self._total_nparts,
         )
+        self._setup_start_time = time.perf_counter()
         try:
             placement_group_options: Dict[str, Any] = {
                 "bundles": [{"CPU": 1.0, "GPU": 1.0} for _ in range(self._nranks)],
@@ -313,18 +316,25 @@ class GPURankPool:
     def activate_and_wait(self) -> None:
         """Activate synchronously when admission is disabled for the topology."""
 
-        # Bound the complete placement and rank-initialization sequence on this
-        # compatibility path. Managed asynchronous placement remains unbounded.
+        # Bound the complete placement and rank-initialization sequence.
         deadline = time.perf_counter() + self._setup_timeout_s
         try:
             self.activate()
             while self._state is not GPURankPoolState.READY:
+                if not self._pending_setup_refs:
+                    self.refresh()
+                    if self._state is GPURankPoolState.READY:
+                        break
+                    raise RuntimeError(
+                        f"{self._log_label} activation stalled in "
+                        f"{self._state.value} without pending setup work."
+                    )
                 try:
                     ray.get(
                         self._pending_setup_refs,
                         timeout=max(0.0, deadline - time.perf_counter()),
                     )
-                except ray.exceptions.GetTimeoutError as exc:
+                except GetTimeoutError as exc:
                     raise TimeoutError(
                         f"{self._log_label} activation timed out after "
                         f"{self._setup_timeout_s}s (state={self._state.value}). "
@@ -342,6 +352,9 @@ class GPURankPool:
         if self._state is GPURankPoolState.FAILED:
             assert self._failure is not None
             raise self._failure
+        if self._state is GPURankPoolState.CLOSING:
+            self.shutdown()
+            return
         if self._state in (
             GPURankPoolState.INACTIVE,
             GPURankPoolState.CLOSED,
@@ -352,9 +365,9 @@ class GPURankPool:
             if self._state is GPURankPoolState.RESERVING:
                 ready, _ = ray.wait(self._pending_setup_refs, timeout=0)
                 if not ready:
+                    self._raise_if_setup_timed_out()
                     return
                 ray.get(ready)
-                self._setup_start_time = time.perf_counter()
                 self._start_rank_actors()
 
             if self._pending_setup_refs:
@@ -405,7 +418,7 @@ class GPURankPool:
         assert self._setup_start_time is not None
         if time.perf_counter() - self._setup_start_time >= self._setup_timeout_s:
             raise TimeoutError(
-                f"{self._log_label} UCXX setup did not "
+                f"{self._log_label} GPU shuffle setup did not "
                 f"complete within {self._setup_timeout_s}s "
                 f"(state={self._state.value}). Check cluster capacity and "
                 "GPU/network health."
@@ -458,6 +471,9 @@ class GPURankPool:
         return self._actors[block_idx % self._nranks]
 
     def deactivate(self) -> None:
+        if self._state is GPURankPoolState.CLOSING:
+            self.shutdown()
+            return
         if self._state not in (GPURankPoolState.FAILED, GPURankPoolState.CLOSED):
             self._state = GPURankPoolState.INACTIVE
         if self.owns_resources:
@@ -466,13 +482,18 @@ class GPURankPool:
     def shutdown(self) -> None:
         if self._state is GPURankPoolState.CLOSED:
             return
-        # Operator shutdown is invoked only once, so retry one transient Core
-        # cleanup failure here instead of relying on a caller that will never
-        # return. Permanently failed handles remain tracked for diagnostics.
+        preserve_failure = self._state is GPURankPoolState.FAILED
+        if not preserve_failure:
+            self._state = GPURankPoolState.CLOSING
+        # Retry one transient Core cleanup failure within each call. During
+        # normal execution CLOSING is refreshed again; final operator shutdown
+        # may only invoke this method once. Permanently failed handles remain
+        # tracked for diagnostics.
         for _ in range(2):
             self._cleanup_resources()
             if not self.owns_resources:
-                self._state = GPURankPoolState.CLOSED
+                if not preserve_failure:
+                    self._state = GPURankPoolState.CLOSED
                 return
 
 
@@ -514,7 +535,7 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
 
     Lifecycle::
 
-        start()                    # local initialization only
+        start()                    # managed: local init; fallback: synchronous activation
         apply_resource_admission_grant() # asynchronously activates the rank gang
         _add_input_inner(bundle)   # routes blocks once every rank is ready
         [inputs_done()]            # called by the executor
@@ -524,6 +545,9 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
     complete; it signals insertion done and streams output partitions in a
     single call.
     """
+
+    def is_blocking_materializing(self) -> bool:
+        return True
 
     def __init__(
         self,
@@ -634,10 +658,16 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
 
     def can_release_resource_admission(self) -> bool:
         if self._rank_pool.state in (
+            GPURankPoolState.CLOSING,
             GPURankPoolState.CLOSED,
             GPURankPoolState.FAILED,
         ):
             return not self._rank_pool.owns_resources
+        if (
+            self._rank_pool.state is GPURankPoolState.INACTIVE
+            and self._rank_pool.owns_resources
+        ):
+            return False
         return self._next_block_idx == 0 and not self._inputs_complete
 
     def can_add_input(self) -> bool:
@@ -646,6 +676,8 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         return self._rank_pool.state is GPURankPoolState.READY
 
     def refresh_state(self) -> None:
+        if self._rank_pool.state is GPURankPoolState.FAILED:
+            self._rank_pool.refresh()
         if self._admission_grant is not None and self._admission_grant.max_units == 0:
             self._rank_pool.deactivate()
         else:
@@ -656,11 +688,18 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
                 self._rank_pool.activate()
             self._rank_pool.refresh()
 
-    def _add_input_inner(self, bundle: RefBundle, input_index: int) -> None:
-        self._shuffle_metrics.on_input_received(bundle)
-        self._shuffled_blocks_stats.extend(to_stats(bundle.metadata))
+    def mark_execution_finished(self) -> None:
+        """Abort this GPU phase when no downstream consumer needs its output."""
 
-        for block_ref, metadata in zip(bundle.block_refs, bundle.metadata):
+        super().mark_execution_finished()
+        self._rank_pool.shutdown()
+        self._clear_task_and_output_state()
+
+    def _add_input_inner(self, refs: RefBundle, input_index: int) -> None:
+        self._shuffle_metrics.on_input_received(refs)
+        self._shuffled_blocks_stats.extend(to_stats(refs.metadata))
+
+        for block_ref, metadata in zip(refs.block_refs, refs.metadata):
             actor = self._rank_pool.get_actor_for_block(self._next_block_idx)
             insert_ref = actor.insert_batch.remote(block_ref)
             task_idx = self._next_block_idx
@@ -686,7 +725,7 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
             self._shuffle_metrics.on_task_submitted(
                 task_idx,
                 RefBundle(
-                    [BlockEntry(block_ref, metadata)],
+                    (BlockEntry(block_ref, metadata),),
                     schema=None,
                     owns_blocks=False,
                 ),
@@ -720,29 +759,31 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         self._num_partitions_reduced = 0
 
         def _on_bundle_ready(bundle: RefBundle) -> None:
+            assert bundle.schema is not None
+            schema = typing.cast("pa.Schema", bundle.schema)
             assert (
-                bundle.schema is not None
-                and _GPU_PARTITION_ID_KEY in bundle.schema.metadata
+                schema.metadata is not None
+                and _GPU_PARTITION_ID_KEY in schema.metadata
             ), (
                 "Bundle is missing _gpu_partition_id in schema metadata. "
                 "Was finish_and_extract modified to skip tagging?"
             )
-            partition_id = int(bundle.schema.metadata[_GPU_PARTITION_ID_KEY].decode())
+            partition_id = int(schema.metadata[_GPU_PARTITION_ID_KEY].decode())
             clean_meta = {
                 k: v
-                for k, v in bundle.schema.metadata.items()
+                for k, v in schema.metadata.items()
                 if k != _GPU_PARTITION_ID_KEY
             }
             bundle = RefBundle(
                 bundle.blocks,
-                schema=bundle.schema.with_metadata(clean_meta or None),
+                schema=schema.with_metadata(clean_meta or None),
                 owns_blocks=bundle.owns_blocks,
             )
             self._num_partitions_reduced += 1
 
             # Register a logical reduce "task" for this partition, mirroring
             # the per-partition task lifecycle in the CPU path.
-            empty_bundle = RefBundle([], schema=None, owns_blocks=False)
+            empty_bundle = RefBundle((), schema=None, owns_blocks=False)
             self._reduce_metrics.on_task_submitted(
                 partition_id, empty_bundle, task_id=None
             )
@@ -778,9 +819,11 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
             self._estimated_output_num_rows = num_rows
 
             # Update Finalize progress bar
-            self._reduce_bar.update(
-                increment=bundle.num_rows() or 0, total=self.num_output_rows_total()
-            )
+            if self._reduce_bar is not None:
+                self._reduce_bar.update(
+                    increment=bundle.num_rows() or 0,
+                    total=self.num_output_rows_total(),
+                )
 
         def _on_extraction_done(
             exc: Optional[Exception],
@@ -819,7 +862,8 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
     # ------------------------------------------------------------------
 
     def has_next(self) -> bool:
-        self._try_finalize()
+        if not self._is_execution_marked_finished:
+            self._try_finalize()
         return self._output_queue.has_next()
 
     def _get_next_inner(self) -> RefBundle:
@@ -834,23 +878,28 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
     # ------------------------------------------------------------------
 
     def get_active_tasks(self) -> List[OpTask]:
-        return (
-            [
-                MetadataOpTask(
-                    task_index=rank,
-                    object_ref=setup_ref,
-                    task_done_callback=self.refresh_state,
-                )
-                for rank, setup_ref in enumerate(self._rank_pool.pending_setup_refs)
-            ]
-            + list(self._insert_tasks.values())
-            + list(self._extraction_tasks.values())
-        )
+        tasks: List[OpTask] = [
+            MetadataOpTask(
+                task_index=rank,
+                object_ref=setup_ref,
+                task_done_callback=self.refresh_state,
+            )
+            for rank, setup_ref in enumerate(self._rank_pool.pending_setup_refs)
+        ]
+        tasks.extend(self._insert_tasks.values())
+        tasks.extend(self._extraction_tasks.values())
+        return tasks
 
     def has_completed(self) -> bool:
+        if self._is_execution_marked_finished:
+            return (
+                self._rank_pool.state is GPURankPoolState.CLOSED
+                and super().has_completed()
+            )
         return (
             self._finalization_started
             and len(self._extraction_tasks) == 0
+            and self._rank_pool.state is GPURankPoolState.CLOSED
             and super().has_completed()
         )
 
@@ -858,12 +907,16 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
     # Shutdown
     # ------------------------------------------------------------------
 
-    def _do_shutdown(self, force: bool = False) -> None:
-        self._rank_pool.shutdown()
-        super()._do_shutdown(force)
+    def _clear_task_and_output_state(self) -> None:
         self._insert_tasks.clear()
         self._insert_error = None
         self._extraction_tasks.clear()
+        self._output_queue.clear()
+
+    def _do_shutdown(self, force: bool = False) -> None:
+        self._rank_pool.shutdown()
+        super()._do_shutdown(force)
+        self._clear_task_and_output_state()
 
     # ------------------------------------------------------------------
     # Resource accounting

@@ -122,6 +122,18 @@ We use this heuristic over more sophisticated alternatives because a constant
 default is easy to reason about.
 """
 
+_RESOURCE_ADMISSION_UNREPRESENTABLE_REMOTE_OPTIONS = (
+    "resources",
+    "accelerator_type",
+    "object_store_memory",
+    "label_selector",
+    "fallback_strategy",
+    "placement_group",
+    "placement_group_bundle_index",
+    "placement_group_capture_child_tasks",
+)
+_RESOURCE_ADMISSION_SUPPORTED_SCHEDULING_STRATEGIES = ("DEFAULT", "SPREAD")
+
 
 def get_safe_default_logical_memory(ray_remote_args: Dict[str, Any]) -> int:
     """Return a safe default logical memory (in bytes) for the given remote args."""
@@ -251,6 +263,9 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         self._supports_fusion = supports_fusion
         self._map_task_kwargs = map_task_kwargs
         self._ray_remote_args = ray_remote_args
+        # Preserve whether dynamic options came from the caller before physical
+        # optimizer rules can install an internal remote-args function.
+        self._uses_user_provided_remote_args_fn = ray_remote_args_fn is not None
         self._ray_remote_args_fn = ray_remote_args_fn
         self._remote_args_for_metrics = copy.deepcopy(self._ray_remote_args)
 
@@ -285,6 +300,44 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         # (e.g., schema evolution for Iceberg writes via on_write_start).
         self._on_start: Optional[Callable[[Optional["pa.Schema"]], None]] = on_start
         self._on_start_called = False
+
+    def _resource_admission_remote_args_incompatible(
+        self,
+        scheduling_strategies: Iterable[Any],
+        *,
+        additional_unsupported_options: Iterable[str] = (),
+    ) -> bool:
+        """Whether placement constraints exceed scalar admission accounting."""
+        if self._uses_user_provided_remote_args_fn:
+            return True
+
+        remote_args = merge_label_selector(
+            self._ray_remote_args,
+            self.data_context.execution_options.label_selector,
+        )
+        unsupported_options = (
+            *_RESOURCE_ADMISSION_UNREPRESENTABLE_REMOTE_OPTIONS,
+            *additional_unsupported_options,
+        )
+        return any(name in remote_args for name in unsupported_options) or any(
+            strategy not in _RESOURCE_ADMISSION_SUPPORTED_SCHEDULING_STRATEGIES
+            for strategy in scheduling_strategies
+        )
+
+    def _get_resource_accounting_remote_args(self) -> Dict[str, Any]:
+        """Return resources from static and optimizer-owned remote arguments.
+
+        Optimizer-owned arguments are safe to refresh from runtime metrics. A
+        caller-provided function is deliberately not invoked here because it may
+        be stateful or return a different placement shape on every call.
+        """
+        remote_args = self._ray_remote_args.copy()
+        if (
+            not self._uses_user_provided_remote_args_fn
+            and self._ray_remote_args_fn is not None
+        ):
+            remote_args.update(self._ray_remote_args_fn())
+        return remote_args
 
     @functools.cached_property
     def _map_transformer_ref(self) -> ObjectRef[MapTransformer]:

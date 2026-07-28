@@ -20,11 +20,16 @@ from ray.data._internal.execution.interfaces import (
     ExecutionResources,
     PhysicalOperator,
     RefBundle,
+    ResourceAdmissionGrant,
 )
 from ray.data._internal.execution.operators.actor_pool_map_operator import (
     ActorPoolMapOperator,
 )
-from ray.data._internal.execution.resource_admission import ResourceAdmissionGrant
+from ray.data._internal.execution.operators.limit_operator import LimitOperator
+from ray.data._internal.execution.streaming_executor_state import (
+    build_streaming_topology,
+    update_operator_states,
+)
 from ray.data._internal.gpu_shuffle.hash_shuffle import (
     GPURankPool,
     GPURankPoolState,
@@ -269,17 +274,11 @@ class TestGPURankPool:
         for actor in actor_handles:
             actor.setup_worker.remote.assert_called_once_with(root_ref)
 
-    def test_setup_timeout_starts_after_placement_group_is_ready(self):
+    def test_setup_timeout_includes_placement_group_reservation(self):
         pool = self._make_pool(nranks=2)
         fake_pg = MagicMock()
         pg_ready_ref = MagicMock(name="pg_ready")
         fake_pg.ready.return_value = pg_ready_ref
-        worker_refs = [MagicMock(name=f"worker_{rank}") for rank in range(2)]
-        actors = [MagicMock(name=f"actor_{rank}") for rank in range(2)]
-        actors[0].setup_root.options.return_value.remote.return_value = (
-            MagicMock(name="rank"),
-            MagicMock(name="root"),
-        )
 
         with (
             patch(
@@ -290,29 +289,15 @@ class TestGPURankPool:
                 "ray.data._internal.gpu_shuffle.hash_shuffle.remove_placement_group"
             ) as mock_remove,
             patch(
-                "ray.data._internal.gpu_shuffle.hash_shuffle.GPUShuffleActor"
-            ) as mock_actor_cls,
-            patch("ray.data._internal.gpu_shuffle.hash_shuffle.ray.wait") as mock_wait,
-            patch("ray.data._internal.gpu_shuffle.hash_shuffle.ray.get"),
+                "ray.data._internal.gpu_shuffle.hash_shuffle.ray.wait",
+                return_value=([], [pg_ready_ref]),
+            ),
+            pytest.raises(TimeoutError, match="GPU shuffle setup"),
         ):
-            mock_actor_cls.options.return_value.remote.side_effect = actors
-            for actor, worker_ref in zip(actors, worker_refs):
-                actor.setup_worker.remote.return_value = worker_ref
             pool.activate()
-            mock_wait.return_value = ([], [pg_ready_ref])
-            pool.refresh()
-            assert pool._setup_start_time is None
-
-            mock_wait.side_effect = [
-                ([pg_ready_ref], []),
-                ([], worker_refs),
-                ([], worker_refs),
-            ]
-            pool.refresh()
             assert pool._setup_start_time is not None
             pool._setup_start_time = hash_shuffle.time.perf_counter() - 61
-            with pytest.raises(TimeoutError, match="UCXX setup"):
-                pool.refresh()
+            pool.refresh()
 
         mock_remove.assert_called_once_with(fake_pg)
         assert pool.state is GPURankPoolState.FAILED
@@ -364,7 +349,7 @@ class TestGPURankPool:
             patch(
                 "ray.data._internal.gpu_shuffle.hash_shuffle.remove_placement_group"
             ) as mock_remove,
-            pytest.raises(TimeoutError, match="UCXX setup"),
+            pytest.raises(TimeoutError, match="GPU shuffle setup"),
         ):
             pool.refresh()
 
@@ -444,6 +429,31 @@ class TestGPURankPool:
             pool.activate_and_wait()
 
         assert pool._failure is failure
+
+    def test_activate_and_wait_rejects_state_without_pending_setup_work(self):
+        pool = self._make_pool(nranks=1)
+        pool.activate = MagicMock()
+
+        with pytest.raises(RuntimeError, match="without pending setup work"):
+            pool.activate_and_wait()
+
+    def test_activate_and_wait_accepts_refresh_to_ready_without_pending_refs(self):
+        pool = self._make_pool(nranks=1)
+        pool.activate = MagicMock(
+            side_effect=lambda: setattr(pool, "_state", GPURankPoolState.STARTING)
+        )
+        pool.refresh = MagicMock(
+            side_effect=lambda: setattr(pool, "_state", GPURankPoolState.READY)
+        )
+
+        with patch(
+            "ray.data._internal.gpu_shuffle.hash_shuffle.ray.get"
+        ) as mock_ray_get:
+            pool.activate_and_wait()
+
+        mock_ray_get.assert_not_called()
+        pool.refresh.assert_called_once_with()
+        assert pool.state is GPURankPoolState.READY
 
     def test_setup_failure_cleans_up_every_rank_and_placement_group(self):
         pool = self._make_pool(nranks=2)
@@ -637,7 +647,59 @@ class TestGPURankPool:
 
         assert pool._cleanup_resources.call_count == 2
         assert pool.actors == [actor]
-        assert pool.state is GPURankPoolState.INACTIVE
+        assert pool.state is GPURankPoolState.CLOSING
+
+    def test_refresh_retries_incomplete_shutdown(self):
+        pool = self._make_pool(nranks=1)
+        actor = MagicMock()
+        pool._actors = [actor]
+        cleanup_attempts = 0
+
+        def cleanup():
+            nonlocal cleanup_attempts
+            cleanup_attempts += 1
+            if cleanup_attempts == 3:
+                pool._actors.clear()
+
+        pool._cleanup_resources = MagicMock(side_effect=cleanup)
+
+        pool.shutdown()
+
+        assert pool._cleanup_resources.call_count == 2
+        assert pool.owns_resources
+        assert pool.state is GPURankPoolState.CLOSING
+
+        pool.refresh()
+
+        assert pool._cleanup_resources.call_count == 3
+        assert not pool.owns_resources
+        assert pool.state is GPURankPoolState.CLOSED
+
+    def test_shutdown_preserves_failed_state_after_cleanup(self):
+        pool = self._make_pool(nranks=1)
+        failure = RuntimeError("rank failed")
+        pool._actors = [MagicMock()]
+        pool._state = GPURankPoolState.FAILED
+        pool._failure = failure
+
+        with patch("ray.data._internal.gpu_shuffle.hash_shuffle.ray.kill"):
+            pool.shutdown()
+
+        assert not pool.owns_resources
+        assert pool.state is GPURankPoolState.FAILED
+        assert pool._failure is failure
+        with pytest.raises(RuntimeError, match="rank failed"):
+            pool.refresh()
+
+    def test_deactivate_retries_closing_pool_shutdown(self):
+        pool = self._make_pool(nranks=1)
+        pool._state = GPURankPoolState.CLOSING
+
+        with patch.object(pool, "shutdown") as mock_shutdown:
+            pool.deactivate()
+
+        mock_shutdown.assert_called_once_with()
+        assert pool.state is GPURankPoolState.CLOSING
 
 
 # ---------------------------------------------------------------------------
@@ -833,12 +895,24 @@ class TestGPUShuffleOperatorConstructor:
                 "ray.data._internal.gpu_shuffle.hash_shuffle.ray.wait",
                 return_value=([], [pending_ref]),
             ),
-            pytest.raises(TimeoutError, match="UCXX setup"),
+            pytest.raises(TimeoutError, match="GPU shuffle setup"),
         ):
             op.refresh_state()
 
         assert op._next_block_idx == 0
         assert pool.state is GPURankPoolState.FAILED
+
+    def test_zero_grant_cannot_mask_rank_pool_failure(self):
+        op = self._make_op()
+        failure = RuntimeError("rank failed")
+        op._admission_grant = ResourceAdmissionGrant(max_units=0, may_submit=False)
+        op._rank_pool._state = GPURankPoolState.FAILED
+        op._rank_pool._failure = failure
+
+        with pytest.raises(RuntimeError, match="rank failed") as exc_info:
+            op.refresh_state()
+
+        assert exc_info.value is failure
 
     def test_incremental_resource_usage_reuses_rank_actor_resources(self):
         op = self._make_op()
@@ -868,6 +942,9 @@ class TestGPUShuffleOperatorConstructor:
         assert op._extraction_tasks == {}
         assert not op._finalization_started
         assert len(op._output_queue) == 0
+
+    def test_is_blocking_materializing(self):
+        assert self._make_op().is_blocking_materializing()
 
 
 # ---------------------------------------------------------------------------
@@ -1105,6 +1182,59 @@ class TestGPUShuffleOperatorFinalization:
         for actor in mock_actors:
             assert actor.finish_and_extract.options.call_count == 1
 
+    def test_extracted_bundle_is_ordered_and_internal_partition_tag_is_removed(self):
+        op, _ = self._make_op(nranks=1)
+        op._inputs_complete = True
+        op._reduce_bar = MagicMock()
+        op._try_finalize()
+
+        source_bundle = _make_bundle(1)
+        tagged_schema = pa.schema(
+            [("k", pa.int64())],
+            metadata={
+                hash_shuffle._GPU_PARTITION_ID_KEY: b"0",
+                b"source": b"test",
+            },
+        )
+        tagged_bundle = RefBundle(
+            source_bundle.blocks,
+            schema=tagged_schema,
+            owns_blocks=source_bundle.owns_blocks,
+        )
+        output_ready = op._extraction_tasks[0]._output_ready_callback
+
+        with (
+            patch.object(op._reduce_metrics, "on_task_submitted") as mock_submitted,
+            patch.object(op._reduce_metrics, "on_output_queued") as mock_queued,
+            patch.object(
+                op._reduce_metrics, "on_task_output_generated"
+            ) as mock_generated,
+            patch.object(op._reduce_metrics, "on_task_finished") as mock_finished,
+            patch.object(op, "upstream_op_num_outputs", return_value=1),
+            patch(
+                "ray.data._internal.gpu_shuffle.hash_shuffle."
+                "estimate_total_num_of_blocks",
+                return_value=(None, 1, 10),
+            ),
+        ):
+            output_ready(tagged_bundle)
+
+        output = op._output_queue.get_next()
+        assert output.schema.metadata == {b"source": b"test"}
+        assert output.blocks == tagged_bundle.blocks
+        assert op._estimated_num_output_bundles == 1
+        assert op._estimated_output_num_rows == 10
+        mock_submitted.assert_called_once()
+        mock_queued.assert_called_once_with(output)
+        mock_generated.assert_called_once_with(task_index=0, output=output)
+        mock_finished.assert_called_once_with(
+            task_index=0,
+            exception=None,
+            task_exec_stats=None,
+            task_exec_driver_stats=None,
+        )
+        op._reduce_bar.update.assert_called_once_with(increment=10, total=10)
+
     def test_successful_extraction_releases_sticky_gang(self):
         op, _ = self._make_op(nranks=2)
         op._next_block_idx = 1
@@ -1133,6 +1263,46 @@ class TestGPUShuffleOperatorFinalization:
 
         assert op._finalization_started
         assert op._next_block_idx == 0
+        assert not op.can_release_resource_admission()
+
+    def test_empty_finalization_retries_incomplete_gang_cleanup(self):
+        op, _ = self._make_op(nranks=1)
+        op._inputs_complete = True
+
+        with patch.object(op._reduce_metrics, "on_task_submitted"):
+            op._try_finalize()
+
+        cleanup_attempts = 0
+
+        def cleanup():
+            nonlocal cleanup_attempts
+            cleanup_attempts += 1
+            if cleanup_attempts == 3:
+                op._rank_pool._actors.clear()
+
+        op._rank_pool._cleanup_resources = MagicMock(side_effect=cleanup)
+        extraction_done = op._extraction_tasks[0]._task_done_callback
+        extraction_done(None, None, None)
+
+        assert op._rank_pool._cleanup_resources.call_count == 2
+        assert op._rank_pool.state is GPURankPoolState.CLOSING
+        assert not op.can_release_resource_admission()
+        assert not op.has_completed()
+
+        op.refresh_state()
+
+        assert op._rank_pool._cleanup_resources.call_count == 3
+        assert op._rank_pool.state is GPURankPoolState.CLOSED
+        assert op.can_release_resource_admission()
+        assert op.has_completed()
+
+    def test_empty_input_inactive_pool_still_requires_admission(self):
+        op, _ = self._make_op(nranks=2)
+        op._rank_pool._actors.clear()
+        op._rank_pool._state = GPURankPoolState.INACTIVE
+        op._inputs_complete = True
+
+        assert not op._rank_pool.owns_resources
         assert not op.can_release_resource_admission()
 
     def test_extraction_failure_fails_and_cleans_up_complete_gang(self):
@@ -1182,9 +1352,18 @@ class TestGPUShuffleOperatorFinalization:
         assert op._extraction_tasks == {}
         assert op._rank_pool.state is GPURankPoolState.FAILED
 
-    def test_failed_gang_is_not_releasable_while_cleanup_handles_remain(self):
+    @pytest.mark.parametrize(
+        "state",
+        [
+            GPURankPoolState.INACTIVE,
+            GPURankPoolState.CLOSING,
+            GPURankPoolState.FAILED,
+            GPURankPoolState.CLOSED,
+        ],
+    )
+    def test_nonactive_gang_is_not_releasable_while_cleanup_handles_remain(self, state):
         op, _ = self._make_op(nranks=2)
-        op._rank_pool._state = GPURankPoolState.FAILED
+        op._rank_pool._state = state
 
         assert not op.can_release_resource_admission()
         op._rank_pool._actors.clear()
@@ -1226,6 +1405,104 @@ class TestGPUShuffleOperatorFinalization:
         op._finalization_started = True
         op._extraction_tasks[0] = MagicMock()  # still running
         assert not op.has_completed()
+
+    def test_has_completed_waits_for_rank_pool_cleanup(self):
+        op, _ = self._make_op()
+        op._inputs_complete = True
+        op._finalization_started = True
+        op._rank_pool._state = GPURankPoolState.CLOSING
+
+        assert not op.has_completed()
+
+        op._rank_pool._actors.clear()
+        op._rank_pool._state = GPURankPoolState.CLOSED
+        assert op.has_completed()
+
+    def test_failed_rank_pool_never_completes_successfully(self):
+        op, _ = self._make_op()
+        op._inputs_complete = True
+        op._finalization_started = True
+        op._rank_pool._actors.clear()
+        op._rank_pool._state = GPURankPoolState.FAILED
+        op._rank_pool._failure = RuntimeError("rank failed")
+
+        assert not op.has_completed()
+
+    def test_mark_execution_finished_aborts_without_finalizing(self):
+        op, actors = self._make_op(nranks=2)
+        op._next_block_idx = 1
+        op._inputs_complete = True
+        op._insert_tasks[0] = MagicMock()
+        op._insert_error = RuntimeError("ignored after downstream completion")
+        op._extraction_tasks[0] = MagicMock()
+        op._output_queue.add(_make_bundle(1), key=0)
+        op._output_queue.finalize(key=0)
+
+        with patch("ray.data._internal.gpu_shuffle.hash_shuffle.ray.kill"):
+            op.mark_execution_finished()
+
+        assert op.has_execution_finished()
+        assert op.has_completed()
+        assert op.can_release_resource_admission()
+        assert op._rank_pool.state is GPURankPoolState.CLOSED
+        assert op._insert_tasks == {}
+        assert op._insert_error is None
+        assert op._extraction_tasks == {}
+        assert len(op._output_queue) == 0
+        for actor in actors:
+            actor.finish_and_extract.options.assert_not_called()
+
+    def test_mark_execution_finished_waits_for_cleanup_retry(self):
+        op, _ = self._make_op(nranks=1)
+        cleanup_attempts = 0
+
+        def cleanup():
+            nonlocal cleanup_attempts
+            cleanup_attempts += 1
+            if cleanup_attempts == 3:
+                op._rank_pool._actors.clear()
+
+        op._rank_pool._cleanup_resources = MagicMock(side_effect=cleanup)
+
+        op.mark_execution_finished()
+
+        assert op._rank_pool.state is GPURankPoolState.CLOSING
+        assert not op.has_completed()
+        assert not op.can_release_resource_admission()
+
+        op.refresh_state()
+
+        assert op._rank_pool.state is GPURankPoolState.CLOSED
+        assert op.has_completed()
+        assert op.can_release_resource_admission()
+
+    def test_completed_downstream_aborts_gang_and_propagates_upstream_finish(self):
+        ctx = _make_data_context(gpu_shuffle_num_actors=1)
+        upstream = _make_input_op_mock()
+        upstream.input_dependencies = []
+        upstream.has_completed.return_value = False
+        upstream.has_execution_finished.return_value = False
+        op = GPUShuffleOperator(upstream, ctx, key_columns=("k",), num_partitions=1)
+        upstream.output_dependencies = [op]
+        downstream = LimitOperator(0, op, ctx)
+        topology = build_streaming_topology(
+            downstream,
+            ExecutionOptions(),
+            noop_counter(),
+            start_operators=False,
+        )
+        topology[upstream].output_queue.append(_make_bundle(1))
+        op._rank_pool._actors = [MagicMock()]
+        op._rank_pool._state = GPURankPoolState.READY
+        op._next_block_idx = 1
+
+        with patch("ray.data._internal.gpu_shuffle.hash_shuffle.ray.kill"):
+            update_operator_states(topology)
+
+        assert op.has_completed()
+        assert op._rank_pool.state is GPURankPoolState.CLOSED
+        assert len(topology[upstream].output_queue) == 0
+        upstream.mark_execution_finished.assert_called_once_with()
 
     def test_output_order_is_partition_order_regardless_of_arrival(self):
         """Bundles arriving out of order must be emitted in ascending partition order."""
@@ -1278,7 +1555,10 @@ class TestGPUShuffleOperatorFinalization:
     def test_shutdown_clears_tasks_and_kills_actors(self):
         op, mock_actors = self._make_op(nranks=2)
         op._insert_tasks[0] = MagicMock()
+        op._insert_error = RuntimeError("insert failed")
         op._extraction_tasks[0] = MagicMock()
+        op._output_queue.add(_make_bundle(1), key=0)
+        op._output_queue.finalize(key=0)
         expected_kill_count = len(mock_actors)
 
         with (
@@ -1288,7 +1568,9 @@ class TestGPUShuffleOperatorFinalization:
             op._do_shutdown(force=True)
 
         assert op._insert_tasks == {}
+        assert op._insert_error is None
         assert op._extraction_tasks == {}
+        assert len(op._output_queue) == 0
         assert mock_kill.call_count == expected_kill_count
 
 
@@ -1675,9 +1957,9 @@ class TestGPUSingleRankRoundtrip:
                 key_to_part_indices.setdefault(key, set()).add(idx)
 
         for key, part_indices in key_to_part_indices.items():
-            assert (
-                len(part_indices) == 1
-            ), f"Key {key!r} was split across partitions {part_indices}"
+            assert len(part_indices) == 1, (
+                f"Key {key!r} was split across partitions {part_indices}"
+            )
 
 
 # ---------------------------------------------------------------------------

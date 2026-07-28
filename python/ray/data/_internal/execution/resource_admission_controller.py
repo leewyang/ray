@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from ray.data._internal.execution.interfaces.execution_options import ExecutionResources
+from ray.data._internal.execution.interfaces.resource_admission import (
+    ResourceAdmissionGrant,
+    ResourceAdmissionSpec,
+)
 
 if TYPE_CHECKING:
     from ray.data._internal.execution.interfaces import PhysicalOperator
@@ -16,38 +19,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class ResourceAdmissionSpec:
-    """Static resource shape for a persistent physical operator.
-
-    ``minimum_resources`` is the complete progress floor. For an elastic
-    owner, ``unit_resources`` describes one worker and ``min_units`` describes
-    how many workers form that floor. ``unit_resources=None`` denotes an
-    indivisible fixed gang whose only valid grant is one complete gang.
-    ``max_units=None`` leaves elastic growth unbounded.
-    """
-
-    minimum_resources: ExecutionResources
-    unit_resources: Optional[ExecutionResources]
-    min_units: int
-    max_units: Optional[int]
+def _resources_are_finite(resources: ExecutionResources) -> bool:
+    return all(
+        math.isfinite(amount)
+        for amount in (
+            resources.cpu,
+            resources.gpu,
+            resources.memory,
+            resources.object_store_memory,
+        )
+    )
 
 
-@dataclass(frozen=True)
-class ResourceAdmissionGrant:
-    """Executor-owned capacity and submission grant for a persistent operator."""
-
-    max_units: int
-    may_submit: bool
-
-
-def validate_resource_admission_spec(spec: ResourceAdmissionSpec) -> None:
+def _validate_resource_admission_spec(spec: ResourceAdmissionSpec) -> None:
     if spec.minimum_resources.is_zero() or not spec.minimum_resources.is_non_negative():
         raise ValueError("Resource admission minimum resources must be positive")
-    if spec.min_units < 1:
-        raise ValueError("Resource admission min_units must be positive")
-    if spec.unit_resources is None and spec.min_units != 1:
-        raise ValueError("Fixed resource-admission gangs require min_units == 1")
+    if not _resources_are_finite(spec.minimum_resources):
+        raise ValueError("Resource admission minimum resources must be finite")
+    if type(spec.min_units) is not int or spec.min_units < 1:
+        raise ValueError("Resource admission min_units must be a positive integer")
+    if spec.max_units is not None and type(spec.max_units) is not int:
+        raise ValueError("Resource admission max_units must be an integer or None")
+    if spec.unit_resources is None and (spec.min_units != 1 or spec.max_units != 1):
+        raise ValueError(
+            "Fixed resource-admission gangs require min_units == max_units == 1"
+        )
+    if spec.unit_resources is not None and not _resources_are_finite(
+        spec.unit_resources
+    ):
+        raise ValueError("Resource admission unit resources must be finite")
     if spec.unit_resources is not None and (
         not spec.unit_resources.is_non_negative()
         or spec.unit_resources.scale(spec.min_units) != spec.minimum_resources
@@ -75,10 +75,11 @@ class _ResourceAdmissionController:
             if spec := op.resource_admission_spec():
                 self._specs[op] = spec
         self._grants: dict[PhysicalOperator, ResourceAdmissionGrant] = {}
+        self._transient_progress_reservation = ExecutionResources.zero()
 
         if self._specs and any(op.resource_admission_incompatible() for op in topology):
             logger.warning(
-                "GPU resource admission found an incompatible operator; disabling "
+                "Resource admission found an incompatible operator; disabling "
                 "resource admission for the whole topology to avoid mixed ownership.",
             )
             self._specs.clear()
@@ -88,7 +89,7 @@ class _ResourceAdmissionController:
             ExecutionResources.zero()
         )
         for op, spec in self._specs.items():
-            validate_resource_admission_spec(spec)
+            _validate_resource_admission_spec(spec)
             if not spec.minimum_resources.satisfies_limit(
                 permitted, ignore_object_store_memory=True
             ):
@@ -172,22 +173,60 @@ class _ResourceAdmissionController:
                 floor = floor.max(op.min_scheduling_resources())
         return floor
 
-    def _should_expose_demand(
-        self, op: "PhysicalOperator", current_capacity: ExecutionResources
+    @staticmethod
+    def _overlaps_transient_progress_floor(
+        required: ExecutionResources, transient_floor: ExecutionResources
     ) -> bool:
-        spec = self._specs[op]
-        fixed_demand = spec.unit_resources is None
-        if not fixed_demand and not op.can_release_resource_admission():
-            return False
-        if fixed_demand and self._grants[op].max_units > 0:
-            return True
-        return not (
-            spec.minimum_resources.satisfies_limit(
-                current_capacity, ignore_object_store_memory=True
+        # Object-store memory is dynamic and intentionally excluded from admission
+        # fit decisions. CPU, GPU, and heap memory are scheduler-owned resources
+        # that a cold persistent owner could take from an unfinished task.
+        return any(
+            required_amount > 0 and transient_amount > 0
+            for required_amount, transient_amount in (
+                (required.cpu, transient_floor.cpu),
+                (required.gpu, transient_floor.gpu),
+                (required.memory, transient_floor.memory),
             )
         )
 
-    def _set_grant(self, op, max_units: int, *, may_submit: bool) -> None:
+    def _should_expose_demand(
+        self,
+        op: "PhysicalOperator",
+        current_capacity: ExecutionResources,
+        transient_floor: ExecutionResources,
+    ) -> bool:
+        spec = self._specs[op]
+        fixed_demand = spec.unit_resources is None
+        grant = self._grants[op]
+        can_release = op.can_release_resource_admission()
+        overlaps_transient = self._overlaps_transient_progress_floor(
+            spec.minimum_resources, transient_floor
+        )
+
+        if not fixed_demand:
+            if not can_release or overlaps_transient:
+                return False
+            return not spec.minimum_resources.satisfies_limit(
+                current_capacity, ignore_object_store_memory=True
+            )
+
+        if grant.max_units == 0 and not op.current_logical_usage().is_zero():
+            # A zero-granted gang with usage is still releasing a placement
+            # group. Keep retrying cleanup instead of reactivating it.
+            return False
+        if overlaps_transient:
+            return False
+        if grant.max_units > 0 and not grant.may_submit:
+            # Keep a cold atomic placement request alive while it waits only for
+            # managed owners to hand off their resources.
+            return True
+        return not spec.minimum_resources.satisfies_limit(
+            current_capacity, ignore_object_store_memory=True
+        )
+
+    def _set_grant(
+        self, op: "PhysicalOperator", max_units: int, *, may_submit: bool
+    ) -> None:
         spec = self._specs[op]
         if spec.max_units is not None:
             max_units = min(max_units, spec.max_units)
@@ -195,12 +234,15 @@ class _ResourceAdmissionController:
             max_units=max(0, max_units), may_submit=may_submit
         )
         current_grant = self._grants.get(op)
-        if (
-            not grant.may_submit
-            and current_grant is not None
-            and current_grant.may_submit
-            and not op.can_release_resource_admission()
-        ):
+        revokes_admission = (
+            current_grant is not None
+            and current_grant.max_units > 0
+            and (
+                grant.max_units == 0
+                or (current_grant.may_submit and not grant.may_submit)
+            )
+        )
+        if revokes_admission and not op.can_release_resource_admission():
             return
         if current_grant == grant:
             return
@@ -219,14 +261,14 @@ class _ResourceAdmissionController:
         claimants = {op for op in unfinished if self._is_claimant(op)}
         claimants.update(self._unfinished_ancestors(claimants, unfinished))
 
-        current_capacity = limits
-        remaining = limits.subtract(self._transient_progress_floor(claimants)).max(
-            ExecutionResources.zero()
-        )
+        transient_floor = self._transient_progress_floor(claimants)
+        self._transient_progress_reservation = transient_floor
+        remaining = limits.subtract(transient_floor).max(ExecutionResources.zero())
         sticky_ops = {
             op
             for op in claimants
-            if self._grants[op].may_submit and not op.can_release_resource_admission()
+            if self._grants[op].max_units > 0
+            and not op.can_release_resource_admission()
         }
         protected_ops = sticky_ops | self._unfinished_ancestors(sticky_ops, unfinished)
         for op in protected_ops:
@@ -240,7 +282,11 @@ class _ResourceAdmissionController:
                 self._set_grant(op, 0, may_submit=False)
                 continue
             if op in protected_ops:
-                self._set_grant(op, spec.min_units, may_submit=True)
+                self._set_grant(
+                    op,
+                    max(spec.min_units, self._grants[op].max_units),
+                    may_submit=True,
+                )
                 continue
             if has_frontier:
                 self._set_grant(op, 0, may_submit=False)
@@ -250,12 +296,19 @@ class _ResourceAdmissionController:
             if minimum_resources.satisfies_limit(
                 remaining, ignore_object_store_memory=True
             ):
-                self._set_grant(op, spec.min_units, may_submit=True)
+                # Admission owns the submission gate and minimum floor. Preserve
+                # the current expansion until the allocation phase computes its
+                # new target, avoiding a floor/downsize callback on every cycle.
+                self._set_grant(
+                    op,
+                    max(spec.min_units, self._grants[op].max_units),
+                    may_submit=True,
+                )
                 remaining = remaining.subtract(minimum_resources).max(
                     ExecutionResources.zero()
                 )
             else:
-                expose_demand = self._should_expose_demand(op, current_capacity)
+                expose_demand = self._should_expose_demand(op, limits, transient_floor)
                 self._set_grant(
                     op,
                     spec.min_units if expose_demand else 0,
@@ -269,33 +322,21 @@ class _ResourceAdmissionController:
     ) -> int:
         if spec.unit_resources is None:
             return 1
-        max_units = int(cls._unit_capacity(target, spec.unit_resources))
-        if spec.max_units is not None:
-            max_units = min(max_units, spec.max_units)
-        return max_units
+        capacity = cls._unit_capacity(target, spec.unit_resources)
+        if spec.max_units is not None and capacity >= spec.max_units:
+            return spec.max_units
+        if not math.isfinite(capacity):
+            raise ValueError(
+                "An uncapped resource-admission owner requires a finite "
+                "allocation target"
+            )
+        return int(capacity)
 
     def update_allocation_grants(self, limits: ExecutionResources) -> None:
+        if not self._specs:
+            return
         if not self._resource_manager.op_resource_allocator_enabled():
-            floors = ExecutionResources.combine_sum(
-                self._specs[op].minimum_resources
-                for op, grant in self._grants.items()
-                if grant.may_submit
-            )
-            remaining = limits.subtract(floors).max(ExecutionResources.zero())
-            for op, spec in self._specs.items():
-                if not self._grants[op].may_submit:
-                    continue
-                floor_units = spec.min_units
-                target = spec.minimum_resources.add(remaining)
-                target_units = max(
-                    floor_units, self._max_units_for_target(target, spec)
-                )
-                if spec.unit_resources is not None:
-                    claimed = spec.unit_resources.scale(target_units - floor_units)
-                    remaining = remaining.subtract(claimed).max(
-                        ExecutionResources.zero()
-                    )
-                self._set_grant(op, target_units, may_submit=True)
+            self._update_grants_without_allocator(limits)
             return
 
         admitted = [
@@ -303,26 +344,58 @@ class _ResourceAdmissionController:
             for op, spec in self._specs.items()
             if self._grants[op].may_submit
         ]
+        granted_units = self._allocate_from_targets(limits, admitted)
+        self._apply_unit_grants(admitted, granted_units)
+
+    def _update_grants_without_allocator(self, limits: ExecutionResources) -> None:
+        floors = ExecutionResources.combine_sum(
+            self._specs[op].minimum_resources
+            for op, grant in self._grants.items()
+            if grant.may_submit
+        )
+        # Without an allocator, no separate task budget protects the unmanaged
+        # ancestor floor reserved by the immediately preceding admission pass.
+        remaining = (
+            limits.subtract(self._transient_progress_reservation)
+            .subtract(floors)
+            .max(ExecutionResources.zero())
+        )
+        for op, spec in self._specs.items():
+            if not self._grants[op].may_submit:
+                continue
+            floor_units = spec.min_units
+            target = spec.minimum_resources.add(remaining)
+            target_units = max(floor_units, self._max_units_for_target(target, spec))
+            if spec.unit_resources is not None:
+                claimed = spec.unit_resources.scale(target_units - floor_units)
+                remaining = remaining.subtract(claimed).max(ExecutionResources.zero())
+            self._set_grant(op, target_units, may_submit=True)
+
+    def _allocate_from_targets(
+        self,
+        limits: ExecutionResources,
+        admitted: list[tuple[PhysicalOperator, ResourceAdmissionSpec]],
+    ) -> dict[PhysicalOperator, int]:
         remaining = limits.subtract(
             ExecutionResources.combine_sum(
                 spec.minimum_resources for _, spec in admitted
             )
         ).max(ExecutionResources.zero())
 
-        targets = {
+        targets: dict[PhysicalOperator, Optional[ExecutionResources]] = {
             op: self._resource_manager.get_allocation_target(op) for op, _ in admitted
         }
-        target_units = {
-            op: (
+        target_units = {}
+        for op, spec in admitted:
+            target = targets[op]
+            target_units[op] = (
                 spec.min_units
-                if targets[op] is None
+                if target is None
                 else max(
                     spec.min_units,
-                    self._max_units_for_target(targets[op], spec),
+                    self._max_units_for_target(target, spec),
                 )
             )
-            for op, spec in admitted
-        }
         granted_units = {op: spec.min_units for op, spec in admitted}
 
         # First honor every complete unit represented by the allocator targets.
@@ -332,26 +405,47 @@ class _ResourceAdmissionController:
             if spec.unit_resources is None:
                 continue
             desired = target_units[op] - granted_units[op]
-            additional = int(
-                min(desired, self._unit_capacity(remaining, spec.unit_resources))
-            )
+            capacity = self._unit_capacity(remaining, spec.unit_resources)
+            additional = int(capacity) if capacity < desired else desired
             granted_units[op] += additional
             remaining = remaining.subtract(spec.unit_resources.scale(additional)).max(
                 ExecutionResources.zero()
             )
 
+        self._redistribute_rounding_budget(
+            admitted,
+            targets,
+            target_units,
+            granted_units,
+            remaining,
+        )
+        return granted_units
+
+    def _redistribute_rounding_budget(
+        self,
+        admitted: list[tuple[PhysicalOperator, ResourceAdmissionSpec]],
+        targets: dict[PhysicalOperator, Optional[ExecutionResources]],
+        target_units: dict[PhysicalOperator, int],
+        granted_units: dict[PhysicalOperator, int],
+        remaining: ExecutionResources,
+    ) -> None:
         # Allocator targets are continuous, but elastic actor pools grow in whole
         # units. Pool-local flooring can strand an aggregate complete unit (for
         # example, two 1.5-GPU targets on three GPUs). Use largest remainders to
         # coordinate rounding without exceeding either the aggregate targets or
         # the global execution limits.
-        rounding_budget = ExecutionResources.combine_sum(
-            targets[op]
-            .subtract(spec.unit_resources.scale(target_units[op]))
-            .max(ExecutionResources.zero())
-            for op, spec in admitted
-            if targets[op] is not None and spec.unit_resources is not None
-        )
+        rounding_remainders = []
+        for op, spec in admitted:
+            target = targets[op]
+            unit = spec.unit_resources
+            if target is None or unit is None:
+                continue
+            rounding_remainders.append(
+                target.subtract(unit.scale(granted_units[op])).max(
+                    ExecutionResources.zero()
+                )
+            )
+        rounding_budget = ExecutionResources.combine_sum(rounding_remainders)
         candidates = []
         for index, (op, spec) in enumerate(admitted):
             target = targets[op]
@@ -391,6 +485,11 @@ class _ResourceAdmissionController:
                 break
             candidates = next_candidates
 
+    def _apply_unit_grants(
+        self,
+        admitted: list[tuple[PhysicalOperator, ResourceAdmissionSpec]],
+        granted_units: dict[PhysicalOperator, int],
+    ) -> None:
         for op, _ in admitted:
             self._set_grant(op, granted_units[op], may_submit=True)
 
