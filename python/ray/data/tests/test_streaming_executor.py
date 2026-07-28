@@ -61,6 +61,7 @@ from ray.data._internal.execution.streaming_executor_state import (
     get_eligible_operators,
     process_completed_tasks,
     select_operator_to_run,
+    start_streaming_topology,
     update_operator_states,
 )
 from ray.data._internal.execution.util import make_ref_bundles
@@ -141,6 +142,120 @@ def test_build_streaming_topology(verbose_progress, ray_start_regular_shared):
     assert topo[o1].output_queue == topo[o2].input_queues[0], topo
     assert topo[o2].output_queue == topo[o3].input_queues[0], topo
     assert list(topo) == [o1, o2, o3]
+
+
+def test_build_then_start_streaming_topology_in_two_phases():
+    events = []
+
+    class StartTrackingOperator(PhysicalOperator):
+        def __init__(self, name, input_dependencies):
+            super().__init__(name, input_dependencies, DataContext())
+
+        def start(self, options, block_ref_counter):
+            events.append(f"start:{self.name}")
+            super().start(options, block_ref_counter)
+
+    source = StartTrackingOperator("source", [])
+    sink = StartTrackingOperator("sink", [source])
+    options = ExecutionOptions()
+    block_ref_counter = noop_counter()
+
+    topology = build_streaming_topology(
+        sink,
+        options,
+        block_ref_counter,
+        start_operators=False,
+    )
+
+    assert events == []
+    assert list(topology) == [source, sink]
+
+    start_streaming_topology(topology, options, block_ref_counter)
+
+    assert events == ["start:source", "start:sink"]
+    assert source._started
+    assert sink._started
+
+
+@pytest.mark.parametrize("start_with_build", [False, True])
+def test_start_streaming_topology_rolls_back_partial_start(start_with_build):
+    events = []
+
+    class CleanupFailure(BaseException):
+        pass
+
+    class StartTrackingOperator(PhysicalOperator):
+        def __init__(
+            self,
+            name,
+            input_dependencies,
+            *,
+            fail_start=False,
+            fail_cleanup=False,
+        ):
+            super().__init__(name, input_dependencies, DataContext())
+            self._fail_start = fail_start
+            self._fail_cleanup = fail_cleanup
+
+        def start(self, options, block_ref_counter):
+            events.append(f"start:{self.name}")
+            super().start(options, block_ref_counter)
+            if self._fail_start:
+                raise RuntimeError("start failed")
+
+        def _do_shutdown(self, force=False):
+            events.append(f"stop:{self.name}")
+            assert force
+            if self._fail_cleanup:
+                raise CleanupFailure("cleanup failed")
+
+    source = StartTrackingOperator("source", [])
+    failing = StartTrackingOperator(
+        "failing",
+        [source],
+        fail_start=True,
+        fail_cleanup=True,
+    )
+    unreached = StartTrackingOperator("unreached", [failing])
+    options = ExecutionOptions()
+    block_ref_counter = noop_counter()
+
+    if start_with_build:
+        def start():
+            build_streaming_topology(
+                unreached,
+                options,
+                block_ref_counter,
+            )
+
+    else:
+        topology = build_streaming_topology(
+            unreached,
+            options,
+            block_ref_counter,
+            start_operators=False,
+        )
+
+        def start():
+            start_streaming_topology(
+                topology,
+                options,
+                block_ref_counter,
+            )
+
+    with pytest.raises(RuntimeError, match="start failed") as exc_info:
+        start()
+
+    assert type(exc_info.value) is RuntimeError
+    assert events == [
+        "start:source",
+        "start:failing",
+        "stop:failing",
+        "stop:source",
+    ]
+    assert source._shutdown
+    assert failing._shutdown
+    assert not unreached._started
 
 
 def test_disallow_non_unique_operators(ray_start_regular_shared):

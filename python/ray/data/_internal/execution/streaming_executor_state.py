@@ -550,6 +550,8 @@ def build_streaming_topology(
     dag: PhysicalOperator,
     options: ExecutionOptions,
     block_ref_counter: BlockRefCounter,
+    *,
+    start_operators: bool = True,
 ) -> Topology:
     """Instantiate the streaming operator state topology for the given DAG.
 
@@ -562,6 +564,9 @@ def build_streaming_topology(
         options: The execution options to use to start operators.
         block_ref_counter: The executor-wide shared counter for tracking
             object-store memory.
+        start_operators: Whether to start operators after building the topology.
+            Set this to ``False`` when executor components need to inspect the
+            complete topology before operator resources are acquired.
 
     Returns:
         The topology dict holding the streaming execution state.
@@ -583,11 +588,37 @@ def build_streaming_topology(
         # Create state.
         op_state = OpState(op, inqueues)
         topology[op] = op_state
-        op.start(options, block_ref_counter)
         return op_state
 
     setup_state(dag)
+    if start_operators:
+        start_streaming_topology(topology, options, block_ref_counter)
     return topology
+
+
+def start_streaming_topology(
+    topology: Topology,
+    options: ExecutionOptions,
+    block_ref_counter: BlockRefCounter,
+) -> None:
+    """Start a built topology in topological order.
+
+    If any operator fails to start, all attempted operators are rolled back in
+    reverse order. Cleanup failures are logged without replacing the original
+    startup failure.
+    """
+    attempted = []
+    try:
+        for op in topology:
+            attempted.append(op)
+            op.start(options, block_ref_counter)
+    except BaseException:
+        for op in reversed(attempted):
+            try:
+                op.rollback_start()
+            except BaseException:
+                logger.exception("Failed to roll back operator %s", op)
+        raise
 
 
 def process_completed_tasks(

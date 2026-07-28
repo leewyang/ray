@@ -928,9 +928,25 @@ class PhysicalOperator(Operator):
             options: The global options used for the overall execution.
             block_ref_counter: The executor-wide shared counter for tracking
                 object-store memory.
+
+        Overrides that acquire external resources must call ``super().start()``
+        before doing so and support forced shutdown after a partially completed
+        start. This lets the executor roll back an operator topology if a later
+        operator fails to start.
         """
         self._block_ref_counter = block_ref_counter
         self._started = True
+
+    def rollback_start(self) -> None:
+        """Best-effort cleanup after topology startup fails.
+
+        The executor calls this for every operator whose ``start()`` was attempted,
+        in reverse startup order. Operators that failed before calling
+        ``super().start()`` are unchanged.
+        """
+        if not self._started or self._shutdown:
+            return
+        self.shutdown(Timer(), force=True)
 
     def can_add_input(self) -> bool:
         """Return whether it is desirable to add input to this operator right now.

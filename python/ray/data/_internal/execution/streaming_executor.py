@@ -39,6 +39,7 @@ from ray.data._internal.execution.streaming_executor_state import (
     format_op_state_summary,
     process_completed_tasks,
     select_operator_to_run,
+    start_streaming_topology,
     update_operator_states,
 )
 from ray.data._internal.logging import (
@@ -227,11 +228,16 @@ class StreamingExecutor(Executor, threading.Thread):
                     ),
                 )
 
-        # Setup the streaming DAG topology and start the runner thread.
+        # Build and start the operator topology as separate phases so a partial
+        # startup can be rolled back as one transaction.
         self._block_ref_counter = BlockRefCounter()
         self._topology = build_streaming_topology(
-            dag, self._options, self._block_ref_counter
+            dag,
+            self._options,
+            self._block_ref_counter,
+            start_operators=False,
         )
+        start_streaming_topology(self._topology, self._options, self._block_ref_counter)
 
         self._resource_manager = ResourceManager(
             self._topology,
