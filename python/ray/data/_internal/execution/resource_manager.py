@@ -16,9 +16,6 @@ from ray.data._internal.execution.interfaces.physical_operator import (
     PhysicalOperator,
     ReportsExtraResourceUsage,
 )
-from ray.data._internal.execution.interfaces.resource_admission import (
-    ResourceAdmissionGrant,
-)
 from ray.data._internal.execution.operators.base_physical_operator import (
     AllToAllOperator,
 )
@@ -30,9 +27,6 @@ from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operat
     ShuffleMapOp,
 )
 from ray.data._internal.execution.operators.zip_operator import ZipOperator
-from ray.data._internal.execution.resource_admission_controller import (
-    _ResourceAdmissionController,
-)
 from ray.data._internal.execution.util import memory_string
 from ray.data.context import DataContext
 from ray.util.debug import log_once
@@ -68,14 +62,6 @@ _BLOCKING_MATERIALIZING_OPERATORS = (
 )
 
 
-def _is_blocking_materializing_operator(op: PhysicalOperator) -> bool:
-    """Return whether ``op`` blocks downstream execution while materializing."""
-    return (
-        isinstance(op, _BLOCKING_MATERIALIZING_OPERATORS)
-        or op.is_blocking_materializing()
-    )
-
-
 def terminal_operator_from_topology(topology: "Topology") -> PhysicalOperator:
     """Return the executor sink: the unique op with no in-DAG downstream consumers.
 
@@ -85,7 +71,11 @@ def terminal_operator_from_topology(topology: "Topology") -> PhysicalOperator:
     """
     if not topology:
         raise ValueError("topology must be non-empty")
-    sinks = [op for op in topology if not op.output_dependencies]
+    sinks = [
+        op
+        for op in topology
+        if not any(dep in topology for dep in op.output_dependencies)
+    ]
     if len(sinks) == 1:
         return sinks[0]
     if not sinks:
@@ -124,6 +114,9 @@ class ResourceManager:
         get_total_resources: Callable[[], ExecutionResources],
         data_context: DataContext,
         block_ref_counter: BlockRefCounter,
+        *,
+        output_operator: Optional[PhysicalOperator] = None,
+        forced_materializing_op: Optional[PhysicalOperator] = None,
     ):
         self._topology = topology
         self._options = options
@@ -154,16 +147,16 @@ class ResourceManager:
         # Executor sink (DAG root: unique op with no output_dependencies).
         # Iterator/streaming_split prefetch bytes are charged on this
         # operator's output usage.
-        self._output_operator = terminal_operator_from_topology(topology)
+        self._output_operator = output_operator or terminal_operator_from_topology(
+            topology
+        )
+        self._forced_materializing_op = forced_materializing_op
 
         self._block_ref_counter = block_ref_counter
 
         self._op_resource_allocator: Optional[
             "OpResourceAllocator"
         ] = create_resource_allocator(self, data_context)
-        self._resource_admission_controller = _ResourceAdmissionController(
-            topology, self
-        )
 
         self._object_store_memory_limit_fraction = (
             data_context.override_object_store_memory_limit_fraction
@@ -263,24 +256,19 @@ class ResourceManager:
             self._op_pending_usages.values()
         )
 
-        self._update_resource_allocations()
+        if self._op_resource_allocator is not None:
+            self._update_allocated_budgets()
 
-    def _update_resource_allocations(self) -> None:
-        if (
-            self._op_resource_allocator is None
-            and not self._resource_admission_controller.has_participants()
-        ):
-            return
+    def _update_allocated_budgets(self):
+        completed_ops_usage = self._get_completed_ops_usage()
 
         available_limits = (
             self.get_global_limits()
-            .subtract(self._get_completed_ops_usage())
+            .subtract(completed_ops_usage)
             .max(ExecutionResources.zero())
         )
-        self._resource_admission_controller.update_admission(available_limits)
-        if self._op_resource_allocator is not None:
-            self._op_resource_allocator.update_budgets(limits=available_limits)
-        self._resource_admission_controller.update_allocation_grants(available_limits)
+
+        self._op_resource_allocator.update_budgets(limits=available_limits)
 
     def get_global_usage(self) -> ExecutionResources:
         """Return the global resource usage at the current time."""
@@ -432,24 +420,6 @@ class ResourceManager:
         """Return whether OpResourceAllocator is enabled."""
         return self._op_resource_allocator is not None
 
-    def get_resource_admission_grant(
-        self, op: PhysicalOperator
-    ) -> Optional[ResourceAdmissionGrant]:
-        """Return the latest executor-owned grant, or ``None`` if unmanaged."""
-        return self._resource_admission_controller.get_grant(op)
-
-    def get_admission_floor(self, op: PhysicalOperator) -> Optional[ExecutionResources]:
-        return self._resource_admission_controller.get_floor(op)
-
-    def can_submit_new_task(self, op: PhysicalOperator) -> bool:
-        """Whether admission and the optional allocator permit new work."""
-        grant = self.get_resource_admission_grant(op)
-        if grant is not None and (not grant.may_submit or not op.can_add_input()):
-            return False
-        if self._op_resource_allocator is not None:
-            return self._op_resource_allocator.can_submit_new_task(op)
-        return True
-
     @property
     def op_resource_allocator(self) -> "OpResourceAllocator":
         """Return the OpResourceAllocator."""
@@ -470,22 +440,22 @@ class ResourceManager:
             return None
         return self._op_resource_allocator.get_allocation(op)
 
-    def get_allocation_target(
-        self, op: PhysicalOperator
-    ) -> Optional[ExecutionResources]:
-        """Return the allocator's usage-independent resource target."""
-        if self._op_resource_allocator is None:
-            return None
-        return self._op_resource_allocator.get_allocation_target(op)
-
     def is_op_eligible(self, op: PhysicalOperator) -> bool:
         """Whether the op is eligible for memory reservation."""
         return (
-            not op.throttling_disabled()
+            op in self._topology
+            and not op.throttling_disabled()
             # As long as the op has finished execution, even if there are still
             # non-taken outputs, we don't need to allocate resources for it.
             and not op.has_execution_finished()
         )
+
+    def should_force_drain_output(self, op: PhysicalOperator) -> bool:
+        """Whether this temporary segment boundary must materialize all output."""
+        return op is self._forced_materializing_op
+
+    def set_forced_materializing_op(self, op: Optional[PhysicalOperator]) -> None:
+        self._forced_materializing_op = op
 
     def _get_downstream_ineligible_ops(
         self, op: PhysicalOperator
@@ -497,6 +467,8 @@ class ResourceManager:
           - "cur_map->limit1->limit2->downstream_map" will return [limit1, limit2].
         """
         for next_op in op.output_dependencies:
+            if next_op not in self._topology:
+                continue
             if not self.is_op_eligible(next_op):
                 yield next_op
                 yield from self._get_downstream_ineligible_ops(next_op)
@@ -512,6 +484,8 @@ class ResourceManager:
           - "cur_map->limit1->limit2->downstream_map" will return [downstream_map].
         """
         for next_op in op.output_dependencies:
+            if next_op not in self._topology:
+                continue
             if self.is_op_eligible(next_op):
                 yield next_op
             else:
@@ -521,19 +495,6 @@ class ResourceManager:
         if self._op_resource_allocator is not None:
             return self._op_resource_allocator.max_task_output_bytes_to_read(op)
         return None
-
-    def _get_excluded_completed_op_usage(
-        self, op: PhysicalOperator
-    ) -> ExecutionResources:
-        """Return completed usage not represented by a retained admission floor."""
-        usage = self.get_op_usage(op)
-        grant = self.get_resource_admission_grant(op)
-        if grant is None or grant.max_units == 0 or op.can_release_resource_admission():
-            return usage
-
-        floor = self.get_admission_floor(op)
-        assert floor is not None
-        return usage.subtract(floor).max(ExecutionResources.zero())
 
     def _get_completed_ops_usage(self) -> ExecutionResources:
         """
@@ -566,7 +527,7 @@ class ResourceManager:
 
         completed_ops = list(set(ops_to_exclude))
         completed_ops_usage = ExecutionResources.combine_sum(
-            self._get_excluded_completed_op_usage(op) for op in completed_ops
+            self.get_op_usage(op) for op in completed_ops
         )
 
         return completed_ops_usage
@@ -584,7 +545,9 @@ class ResourceManager:
         """
 
         # Check if Op itself is a blocking, materializing operator
-        if _is_blocking_materializing_operator(op):
+        if op is self._forced_materializing_op or isinstance(
+            op, _BLOCKING_MATERIALIZING_OPERATORS
+        ):
             return True
 
         # Check if any of its direct *ineligible* downstream dependencies are
@@ -593,14 +556,14 @@ class ResourceManager:
         # NOTE: We only check ineligible downstream deps, since eligible downstream
         #       deps will have their own allocation that is adjusted appropriately
         return any(
-            _is_blocking_materializing_operator(op)
+            isinstance(op, _BLOCKING_MATERIALIZING_OPERATORS)
             for op in self._get_downstream_ineligible_ops(op)
         )
 
 
 def _get_first_pending_materializing_op(topology: "Topology") -> int:
     for idx, op in enumerate(topology):
-        if _is_blocking_materializing_operator(op) and not op.has_completed():
+        if isinstance(op, _BLOCKING_MATERIALIZING_OPERATORS) and not op.has_completed():
             return idx
 
     return -1
@@ -660,12 +623,6 @@ class OpResourceAllocator(ABC):
         allocation is unlimited."""
         ...
 
-    def get_allocation_target(
-        self, op: PhysicalOperator
-    ) -> Optional[ExecutionResources]:
-        """Return reserved plus assigned shared resources, independent of usage."""
-        return None
-
     def _get_eligible_ops(self) -> List[PhysicalOperator]:
         """Returns a list of operators eligible for allocation.
 
@@ -677,20 +634,15 @@ class OpResourceAllocator(ABC):
         first_pending_materializing_op_idx = _get_first_pending_materializing_op(
             self._topology
         )
-        eligible_ops = []
-        for idx, op in enumerate(self._topology):
-            grant = self._resource_manager.get_resource_admission_grant(op)
-            if grant is not None and not grant.may_submit:
-                continue
-            if not self._is_op_eligible(op):
-                continue
-            if (
-                first_pending_materializing_op_idx != -1
-                and idx > first_pending_materializing_op_idx
-            ):
-                continue
-            eligible_ops.append(op)
-        return eligible_ops
+        return [
+            op
+            for idx, op in enumerate(self._topology)
+            if self._is_op_eligible(op)
+            and (
+                first_pending_materializing_op_idx == -1
+                or idx <= first_pending_materializing_op_idx
+            )
+        ]
 
     @staticmethod
     def _is_op_eligible(op: PhysicalOperator) -> bool:
@@ -749,7 +701,6 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
         self._total_shared = ExecutionResources.zero()
         # Resource budgets for each operator, excluding `_reserved_for_op_outputs`.
         self._op_budgets: Dict[PhysicalOperator, ExecutionResources] = {}
-        self._allocation_targets: Dict[PhysicalOperator, ExecutionResources] = {}
         # Remaining memory budget for generating new task outputs, per operator.
         self._output_budgets: Dict[PhysicalOperator, float] = {}
         # Whether each operator has reserved the minimum resources to run
@@ -768,37 +719,16 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
         self._op_reserved.clear()
         self._reserved_for_op_outputs.clear()
         self._reserved_min_resources.clear()
-        self._allocation_targets.clear()
 
         if len(eligible_ops) == 0:
             return
 
-        # Admission is topology-wide, while allocator eligibility stops at the
-        # first pending materializing operator. Protect every admitted floor
-        # before sharing resources among the currently eligible operators.
-        admission_floors: Dict[PhysicalOperator, ExecutionResources] = {}
-        for op in self._topology:
-            grant = self._resource_manager.get_resource_admission_grant(op)
-            if grant is None or not grant.may_submit:
-                continue
-            admission_floor = self._resource_manager.get_admission_floor(op)
-            assert admission_floor is not None
-            admission_floors[op] = admission_floor
+        remaining = limits.copy()
 
-        total_admission_floor = ExecutionResources.combine_sum(
-            admission_floors.values()
-        )
-        remaining = limits.subtract(total_admission_floor).max(
-            ExecutionResources.zero()
-        )
-
-        # Distribute the configured default reservation from resources remaining
-        # after protected admission floors.
-        default_reserved = remaining.scale(
-            self._reservation_ratio / (len(eligible_ops))
-        )
+        # Reserve `reservation_ratio * global_limits / num_ops` resources for each
+        # operator.
+        default_reserved = limits.scale(self._reservation_ratio / (len(eligible_ops)))
         for index, op in enumerate(eligible_ops):
-            admission_floor = admission_floors.get(op, ExecutionResources.zero())
             # Reserve at least half of the default reserved resources for the outputs.
             # This makes sure that we will have enough budget to pull blocks from the
             # op.
@@ -806,9 +736,7 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
                 0, 0, max(default_reserved.object_store_memory / 2, 1)
             )
 
-            reserved_for_tasks = default_reserved.subtract(reserved_for_outputs).add(
-                admission_floor
-            )
+            reserved_for_tasks = default_reserved.subtract(reserved_for_outputs)
 
             min_resource_usage, max_resource_usage = op.min_max_resource_requirements()
 
@@ -821,10 +749,7 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
             # and reserved_for_outputs. Note, we only consider CPU and GPU, but not
             # object_store_memory, because object_store_memory can be oversubscribed,
             # but CPU/GPU cannot.
-            additional_task_reservation = reserved_for_tasks.subtract(
-                admission_floor
-            ).max(ExecutionResources.zero())
-            if additional_task_reservation.add(reserved_for_outputs).satisfies_limit(
+            if reserved_for_tasks.add(reserved_for_outputs).satisfies_limit(
                 remaining, ignore_object_store_memory=True
             ):
                 self._reserved_min_resources[op] = True
@@ -841,8 +766,8 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
                 # NOTE: we prioritize upstream operators for minimum resource reservation.
                 # ops. It's fine that downstream ops don't get the minimum reservation,
                 # because they can wait for upstream ops to finish and release resources.
-                reserved_for_tasks = admission_floor.copy(
-                    object_store_memory=min_resource_usage.object_store_memory
+                reserved_for_tasks = ExecutionResources(
+                    0, 0, min_resource_usage.object_store_memory
                 )
 
             # Log a warning if even the first operator cannot reserve the minimum
@@ -853,49 +778,11 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
             self._op_reserved[op] = reserved_for_tasks
             self._reserved_for_op_outputs[op] = reserved_for_outputs.object_store_memory
 
-            additional_task_reservation = reserved_for_tasks.subtract(
-                admission_floor
-            ).max(ExecutionResources.zero())
-            additional_op_reservation = additional_task_reservation.add(
-                reserved_for_outputs
-            )
-            remaining = remaining.subtract(additional_op_reservation)
+            op_total_reserved = reserved_for_tasks.add(reserved_for_outputs)
+            remaining = remaining.subtract(op_total_reserved)
             remaining = remaining.max(ExecutionResources.zero())
 
         self._total_shared = remaining
-        if admission_floors:
-            self._update_allocation_targets()
-
-    def _update_allocation_targets(self) -> None:
-        ops = list(self._op_reserved)
-        maximum = {
-            op: op.min_max_resource_requirements()[1] or ExecutionResources.inf()
-            for op in ops
-        }
-        self._allocation_targets = {op: self._get_total_reserved(op) for op in ops}
-
-        remaining = self._total_shared
-        # Mirror shared-budget ordering without coupling the target to current usage.
-        for index, op in enumerate(reversed(ops)):
-            target = self._allocation_targets[op]
-            shared = remaining.scale(1.0 / (len(ops) - index))
-            capacity = maximum[op].subtract(target).max(ExecutionResources.zero())
-            shared = shared.min(capacity)
-            self._allocation_targets[op] = target.add(shared)
-            remaining = remaining.subtract(shared)
-
-        # Redistribute capacity stranded when an operator hits its finite maximum.
-        for op in reversed(ops):
-            if remaining.is_zero():
-                break
-            capacity = (
-                maximum[op]
-                .subtract(self._allocation_targets[op])
-                .max(ExecutionResources.zero())
-            )
-            shared = remaining.min(capacity)
-            self._allocation_targets[op] = self._allocation_targets[op].add(shared)
-            remaining = remaining.subtract(shared)
 
     def _warn_if_op_starved_too_long(self, op: PhysicalOperator) -> None:
         # The operator isn't starved. Return early.
@@ -942,12 +829,6 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
             return None
         return budget.add(self._resource_manager.get_op_usage(op))
 
-    def get_allocation_target(
-        self, op: PhysicalOperator
-    ) -> Optional[ExecutionResources]:
-        """Return this operator's target before subtracting current usage."""
-        return self._allocation_targets.get(op)
-
     def _get_total_reserved(self, op: PhysicalOperator) -> ExecutionResources:
         """Get total reserved resources for an operator, including outputs reservation."""
         op_reserved = self._op_reserved[op]
@@ -981,7 +862,8 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
         *,
         limits: ExecutionResources,
     ):
-        self._update_reservation(limits)
+        # Remaining resources to be distributed across operators
+        remaining_shared = self._update_reservation(limits)
 
         self._op_budgets.clear()
         eligible_ops = self._get_eligible_ops()

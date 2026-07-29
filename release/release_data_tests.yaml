@@ -665,7 +665,7 @@
       # 1op: the original single-operator workload. 15ops: 15 chained
       # map_batches operators sharing the worker pool (each gets
       # num_workers // 15 workers). Exercises the per-iteration
-      # update_usages / _update_resource_allocations cost which scales with
+      # update_usages / _update_allocated_budgets cost which scales with
       # N_ops.
       num_operators: [1, 15]
 

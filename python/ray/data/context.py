@@ -261,13 +261,6 @@ DEFAULT_ENABLE_OP_RESOURCE_RESERVATION = env_bool(
     "RAY_DATA_ENABLE_OP_RESOURCE_RESERVATION", True
 )
 
-# Internal rollback switch for resource-aware admission of persistent owners with
-# statically declared resources. Keep this private until the policy has had enough
-# production exposure.
-_DEFAULT_ENABLE_RESOURCE_ADMISSION_CONTROL = env_bool(
-    "RAY_DATA_ENABLE_RESOURCE_ADMISSION_CONTROL", True
-)
-
 DEFAULT_OP_RESOURCE_RESERVATION_RATIO = float(
     os.environ.get("RAY_DATA_OP_RESERVATION_RATIO", "0.5")
 )
@@ -709,9 +702,9 @@ class DataContext:
         gpu_shuffle_spill_memory_limit: Device-to-host spill threshold per rank.
             ``"auto"`` uses 80% of ``gpu_shuffle_rmm_pool_size``; ``None`` disables
             spilling.
-        gpu_shuffle_setup_timeout_s: Maximum time in seconds to wait for the
-            complete GPU shuffle setup, including placement-group provisioning
-            and UCXX root/worker initialization. Defaults to 120 seconds.
+        gpu_shuffle_setup_timeout_s: Maximum time in seconds to wait for UCXX
+            communicator setup (actor creation + root/worker init) before raising
+            a ``TimeoutError``. Defaults to 120 seconds.
         isolate_read_workers: If ``True``, other operators' tasks don't get scheduled on
             the same worker processes as the read operators'. This prevents large
             PyArrow memory allocation during reads from inflating the resident memory of
@@ -811,8 +804,8 @@ class DataContext:
     # "auto" = 80% of rmm_pool_size; None = spilling disabled.
     gpu_shuffle_spill_memory_limit: Union[int, str, None] = "auto"
 
-    # Maximum seconds to wait for placement and UCXX communicator setup before
-    # raising TimeoutError.
+    # Maximum seconds to wait for UCXX communicator setup before raising
+    # TimeoutError.
     gpu_shuffle_setup_timeout_s: float = 120.0
 
     scheduling_strategy: SchedulingStrategyT = DEFAULT_SCHEDULING_STRATEGY
@@ -866,9 +859,6 @@ class DataContext:
     max_map_retries: int = DEFAULT_MAX_MAP_RETRIES
     op_resource_reservation_enabled: bool = DEFAULT_ENABLE_OP_RESOURCE_RESERVATION
     op_resource_reservation_ratio: float = DEFAULT_OP_RESOURCE_RESERVATION_RATIO
-    _enable_resource_admission_control: bool = (
-        _DEFAULT_ENABLE_RESOURCE_ADMISSION_CONTROL
-    )
     max_errored_blocks: int = DEFAULT_MAX_ERRORED_BLOCKS
     log_internal_stack_trace: bool = DEFAULT_LOG_INTERNAL_STACK_TRACE
     raise_original_map_exception: bool = DEFAULT_RAY_DATA_RAISE_ORIGINAL_MAP_EXCEPTION

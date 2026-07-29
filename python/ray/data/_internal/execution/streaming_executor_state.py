@@ -40,6 +40,7 @@ from ray.data._internal.execution.resource_manager import (
     terminal_operator_from_topology,
 )
 from ray.data._internal.execution.util import memory_string
+from ray.data._internal.stats import Timer
 from ray.data._internal.util import (
     unify_schemas_with_validation,
 )
@@ -55,6 +56,23 @@ logger = logging.getLogger(__name__)
 # Holds the full execution state of the streaming topology. It's a dict mapping each
 # operator to tracked streaming exec state.
 Topology = Dict[PhysicalOperator, "OpState"]
+ExecutionSegments = Tuple[Tuple[PhysicalOperator, ...], ...]
+
+
+def validate_execution_segments(
+    segments: ExecutionSegments, topology: Topology
+) -> None:
+    """Validate contiguous operator slices executed in order.
+
+    Each segment must have one terminal operator. Planners are responsible for
+    ensuring that non-final segments can be safely materialized and released.
+    """
+    flattened = [op for segment in segments for op in segment]
+    if flattened != list(topology):
+        raise ValueError("Execution segments must partition the topology in order")
+    for segment in segments:
+        terminal_operator_from_topology(dict.fromkeys(segment))
+
 
 # Maximum time `process_completed_tasks` will block in `ray.wait()` waiting for tasks to complete.
 WAIT_FOR_TASK_COMPLETION_TIMEOUT_S = 0.1
@@ -144,6 +162,9 @@ class OutputBackpressureGuard:
     def should_unblock(self, op: PhysicalOperator) -> bool:
         """Return True if output backpressure should be relaxed for ``op``
         to preserve pipeline liveness."""
+        if self._resource_manager.should_force_drain_output(op):
+            return True
+
         downstream_eligible_ops = list(
             self._resource_manager.get_downstream_eligible_ops(op)
         )
@@ -177,23 +198,33 @@ class OutputBackpressureGuard:
                 #
                 # In this case by relaxing output backpressure we allow upstream
                 # operator's task to complete sooner to free up resources.
-                if not self._resource_manager.can_submit_new_task(downstream_op):
+                if not self._can_submit_new_task(downstream_op):
                     return True
 
                 # Case 2: Downstream operator
                 #   - Does *not* have running tasks and
                 #   - *Can* schedule new tasks
-                #   - Does *not* have any externally dispatchable input
+                #   - Does *not* have any input blocks in the queue
                 #
                 # In this case we relax output backpressure to produce at least
-                # 1 block for downstream operator. Internally buffered blocks
-                # may still be insufficient to form a batch.
-                elif not downstream_op_state.has_pending_bundles():
+                # 1 block for downstream operator.
+                elif downstream_op_state.total_enqueued_input_blocks() == 0:
                     return True
 
         # As a last resort we check whether operator has been idling (ie not
         # producing any outputs) for a while, and unblock in that case.
         return self._idle_detector.detect_idle(op)
+
+    def _can_submit_new_task(self, op: PhysicalOperator) -> bool:
+        """Whether ``op`` can submit a new task under current resource budgets.
+
+        Falls back to True when no op-level resource allocator is enabled —
+        in that case there is no budget-based throttling to wait on, so the
+        liveness check shouldn't claim downstream is blocked on resources.
+        """
+        if not self._resource_manager.op_resource_allocator_enabled():
+            return True
+        return self._resource_manager.op_resource_allocator.can_submit_new_task(op)
 
 
 class OpBufferQueue:
@@ -554,9 +585,9 @@ def build_streaming_topology(
         options: The execution options to use to start operators.
         block_ref_counter: The executor-wide shared counter for tracking
             object-store memory.
-        start_operators: Whether to start operators while building the topology.
-            The streaming executor disables this so resource admission can apply
-            initial zero-unit grants before any resource-owning workers start.
+        start_operators: Whether to start operators after building the topology.
+            Set this to False when the complete topology must be inspected before
+            selecting which operators to start.
 
     Returns:
         The topology dict holding the streaming execution state.
@@ -578,11 +609,11 @@ def build_streaming_topology(
         # Create state.
         op_state = OpState(op, inqueues)
         topology[op] = op_state
-        if start_operators:
-            op.start(options, block_ref_counter)
         return op_state
 
     setup_state(dag)
+    if start_operators:
+        start_streaming_topology(topology, options, block_ref_counter)
     return topology
 
 
@@ -598,9 +629,11 @@ def start_streaming_topology(
             started.append(op)
             op.start(options, block_ref_counter)
     except BaseException:
+        timer = Timer()
         for op in reversed(started):
             try:
-                op.rollback_start()
+                if op.is_started:
+                    op.shutdown(timer, force=True)
             except BaseException:
                 logger.exception("Failed to roll back operator %s", op)
         raise
@@ -797,6 +830,7 @@ def update_operator_states(topology: Topology) -> None:
     Should be called after `process_completed_tasks()`."""
 
     for op, op_state in topology.items():
+
         # Call inputs_done() on ops where no more inputs are coming.
         if op_state.inputs_done_called:
             continue
@@ -818,14 +852,15 @@ def update_operator_states(topology: Topology) -> None:
     # call mark_execution_finished() to also complete this op.
     for op, op_state in reversed(list(topology.items())):
 
-        dependents_completed = len(op.output_dependencies) > 0 and all(
-            dep.has_completed() for dep in op.output_dependencies
+        output_dependencies = [dep for dep in op.output_dependencies if dep in topology]
+        dependents_completed = len(output_dependencies) > 0 and all(
+            dep.has_completed() for dep in output_dependencies
         )
         # For terminal operators (no output dependencies, e.g. OutputSplitter),
         # mark execution finished once the operator has fully completed so that
         # internal queues are properly cleared via clear_internal_input_queue()
         # and clear_internal_output_queue().
-        terminal_completed = len(op.output_dependencies) == 0 and op.has_completed()
+        terminal_completed = len(output_dependencies) == 0 and op.has_completed()
         if dependents_completed or terminal_completed:
             op.mark_execution_finished()
 
@@ -843,7 +878,6 @@ def get_eligible_operators(
     backpressure_policies: List[BackpressurePolicy],
     *,
     ensure_liveness: bool,
-    resource_manager: ResourceManager,
 ) -> List[PhysicalOperator]:
     """This method returns all operators that are eligible for execution in the current state
     of the pipeline.
@@ -864,16 +898,6 @@ def get_eligible_operators(
     eligible_ops: List[PhysicalOperator] = []
 
     for op, state in topology.items():
-        admission_grant = resource_manager.get_resource_admission_grant(op)
-        if admission_grant is not None and not admission_grant.may_submit:
-            # Admission is a hard lifecycle constraint; the liveness fallback
-            # must never let a later pool leapfrog and consume input.
-            state._scheduling_status = OpSchedulingStatus(
-                runnable=False, under_resource_limits=False
-            )
-            op.notify_in_task_submission_backpressure(True, "ResourceAdmissionControl")
-            continue
-
         # Operator is considered being in task-submission back-pressure if any
         # back-pressure policy is violated. Track the first triggered policy.
         triggered_policy = None
@@ -945,7 +969,6 @@ def select_operator_to_run(
         topology,
         backpressure_policies,
         ensure_liveness=ensure_liveness,
-        resource_manager=resource_manager,
     )
 
     if not eligible_ops:

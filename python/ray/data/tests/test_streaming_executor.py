@@ -29,8 +29,6 @@ from ray.data._internal.execution.interfaces import (
     ExecutionOptions,
     ExecutionResources,
     PhysicalOperator,
-    ResourceAdmissionGrant,
-    ResourceAdmissionSpec,
 )
 from ray.data._internal.execution.interfaces.physical_operator import (
     DataOpTask,
@@ -40,6 +38,9 @@ from ray.data._internal.execution.metadata_fetcher import (
     InlineMetadataFetcher,
     MetadataFetcher,
     ThreadedMetadataFetcher,
+)
+from ray.data._internal.execution.operators.base_physical_operator import (
+    InternalQueueOperatorMixin,
 )
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
 from ray.data._internal.execution.operators.limit_operator import LimitOperator
@@ -65,6 +66,7 @@ from ray.data._internal.execution.streaming_executor_state import (
     select_operator_to_run,
     start_streaming_topology,
     update_operator_states,
+    validate_execution_segments,
 )
 from ray.data._internal.execution.util import make_ref_bundles
 from ray.data._internal.logical.operators import (
@@ -93,7 +95,6 @@ def mock_resource_manager(
     return MagicMock(
         get_global_limits=MagicMock(return_value=global_limits),
         get_global_usage=MagicMock(return_value=global_usage),
-        get_resource_admission_grant=MagicMock(return_value=None),
         op_resource_allocator_enabled=MagicMock(return_value=True),
     )
 
@@ -117,6 +118,76 @@ def make_map_transformer(block_fn):
 
 def make_ref_bundle(x):
     return make_ref_bundles([[x]])[0]
+
+
+class _SegmentLifecycleOperator(InternalQueueOperatorMixin):
+    def __init__(self, name, events, *, fail_start=False, on_start=None):
+        super().__init__(name, [], DataContext())
+        self._events = events
+        self._fail_start = fail_start
+        self._on_start = on_start
+
+    @property
+    def _input_queues(self):
+        return []
+
+    @property
+    def _output_queues(self):
+        return []
+
+    def start(self, options, block_ref_counter):
+        self._events.append(f"start:{self.name}")
+        super().start(options, block_ref_counter)
+        if self._on_start is not None:
+            self._on_start()
+        if self._fail_start:
+            raise RuntimeError(f"{self.name} start failed")
+
+    def _do_shutdown(self, force=False):
+        self._events.append(f"stop:{self.name}:{force}")
+
+    def clear_internal_input_queue(self):
+        self._events.append(f"clear-input:{self.name}")
+
+    def clear_internal_output_queue(self):
+        self._events.append(f"clear-output:{self.name}")
+
+
+def _make_segmented_lifecycle_executor(*segments):
+    executor = StreamingExecutor.__new__(StreamingExecutor)
+    executor._data_context = DataContext()
+    executor._shutdown_lock = threading.RLock()
+    executor._execution_started = False
+    executor._shutdown = False
+    executor._options = ExecutionOptions()
+    executor._block_ref_counter = noop_counter()
+    executor._resource_manager = MagicMock(spec=ResourceManager)
+    operators = [op for segment in segments for op in segment]
+    for index, op in enumerate(operators):
+        op._input_dependencies = [] if index == 0 else [operators[index - 1]]
+        op._output_dependencies = (
+            [] if index == len(operators) - 1 else [operators[index + 1]]
+        )
+    executor._execution_segments = [dict.fromkeys(segment) for segment in segments]
+    executor._active_segment_index = 0
+    executor._active_topology = dict(executor._execution_segments[0])
+    return executor, executor._execution_segments
+
+
+def _make_run_loop_executor(schedule_results):
+    executor = StreamingExecutor.__new__(StreamingExecutor)
+    executor._shutdown_lock = threading.RLock()
+    executor._execution_started = False
+    executor._shutdown = False
+    executor._metadata_fetcher = MagicMock()
+    executor._active_topology = object()
+    executor._scheduling_loop_step = MagicMock(side_effect=schedule_results)
+    executor.update_metrics = MagicMock()
+    executor._initial_stats = None
+    executor._callbacks = []
+    output_state = MagicMock(spec=OpState)
+    executor._output_node = (MagicMock(spec=PhysicalOperator), output_state)
+    return executor, output_state
 
 
 @pytest.mark.parametrize(
@@ -174,20 +245,89 @@ def test_build_then_start_streaming_topology_in_two_phases():
     o2.start.assert_called_once_with(options, block_ref_counter)
 
 
-def test_start_streaming_topology_rolls_back_partial_start():
+def test_segmented_execution_plan_validates_structure():
+    events = []
+    first = [_SegmentLifecycleOperator("first", events)]
+    second = [_SegmentLifecycleOperator("second", events)]
+    _, segments = _make_segmented_lifecycle_executor(first, second)
+    topology = {op: None for segment in segments for op in segment}
+    operator_segments = tuple(tuple(segment) for segment in segments)
+
+    validate_execution_segments(operator_segments, topology)
+
+    with pytest.raises(ValueError, match="partition the topology in order"):
+        validate_execution_segments(tuple(reversed(operator_segments)), topology)
+    with pytest.raises(ValueError, match="partition the topology in order"):
+        validate_execution_segments((), topology)
+
+    left = _SegmentLifecycleOperator("left", events)
+    right = _SegmentLifecycleOperator("right", events)
+    disconnected = dict.fromkeys([left, right])
+    with pytest.raises(ValueError, match="exactly one terminal operator"):
+        validate_execution_segments((tuple(disconnected),), disconnected)
+
+
+def test_update_operator_states_treats_segment_boundary_as_terminal():
+    events = []
+    active = _SegmentLifecycleOperator("active", events)
+    inactive = _SegmentLifecycleOperator("inactive", events)
+    active._output_dependencies = [inactive]
+    active.has_completed = MagicMock(return_value=True)
+    active.mark_execution_finished = MagicMock()
+    inactive.has_completed = MagicMock(
+        side_effect=AssertionError("inactive operator must not be inspected")
+    )
+    state = MagicMock(spec=OpState)
+    state.inputs_done_called = True
+    state.input_queues = []
+
+    update_operator_states({active: state})
+
+    active.mark_execution_finished.assert_called_once_with()
+    inactive.has_completed.assert_not_called()
+
+
+def test_execute_applies_generic_segment_plan(ray_start_regular_shared):
+    context = DataContext.get_current()
+    source = InputDataBuffer(context, make_ref_bundles([[1], [2]]))
+    producer = LimitOperator(2, source, context)
+    executor = StreamingExecutor(context)
+
+    with patch(
+        "ray.data._internal.execution.streaming_executor."
+        "plan_gpu_shuffle_startup",
+        return_value=((source,), (producer,)),
+    ):
+        output = list(executor.execute(producer))
+
+    assert sum(bundle.num_rows() or 0 for bundle in output) == 2
+
+
+@pytest.mark.parametrize("fail_before_super", [False, True])
+def test_start_streaming_topology_rolls_back_partial_start(fail_before_super):
     events = []
 
     class CleanupFailure(BaseException):
         pass
 
     class StartTrackingOperator(PhysicalOperator):
-        def __init__(self, name, *, fail_start=False, fail_cleanup=False):
+        def __init__(
+            self,
+            name,
+            *,
+            fail_start=False,
+            fail_before_super=False,
+            fail_cleanup=False,
+        ):
             super().__init__(name, [], DataContext())
             self._fail_start = fail_start
+            self._fail_before_super = fail_before_super
             self._fail_cleanup = fail_cleanup
 
         def start(self, options, block_ref_counter):
             events.append(f"start:{self.name}")
+            if self._fail_before_super:
+                raise RuntimeError("start failed")
             super().start(options, block_ref_counter)
             if self._fail_start:
                 raise RuntimeError("start failed")
@@ -200,7 +340,12 @@ def test_start_streaming_topology_rolls_back_partial_start():
 
     operators = [
         StartTrackingOperator("first"),
-        StartTrackingOperator("failing", fail_start=True, fail_cleanup=True),
+        StartTrackingOperator(
+            "failing",
+            fail_start=True,
+            fail_before_super=fail_before_super,
+            fail_cleanup=True,
+        ),
         StartTrackingOperator("unreached"),
     ]
 
@@ -210,62 +355,322 @@ def test_start_streaming_topology_rolls_back_partial_start():
         )
 
     assert type(exc_info.value) is RuntimeError
-    assert events == [
-        "start:first",
-        "start:failing",
-        "stop:failing",
-        "stop:first",
-    ]
+    expected = ["start:first", "start:failing"]
+    if not fail_before_super:
+        expected.append("stop:failing")
+    expected.append("stop:first")
+    assert events == expected
     assert operators[0]._shutdown
-    assert operators[1]._shutdown
+    assert operators[1]._shutdown is not fail_before_super
     assert not operators[2]._started
-    operators[2].rollback_start()
-    assert events[-1] == "stop:first"
 
 
-def test_resource_admission_initial_grant_is_applied_before_start():
-    class AdmissionOperator(PhysicalOperator):
-        def __init__(self, input_op, data_context):
-            super().__init__("AdmissionOperator", [input_op], data_context)
-            self.grant = None
-            self.grant_at_start = None
+def test_segment_transition_releases_prefix_in_reverse_before_suffix_start():
+    events = []
+    prefix = [
+        _SegmentLifecycleOperator("prefix-1", events),
+        _SegmentLifecycleOperator("prefix-2", events),
+    ]
+    suffix = [
+        _SegmentLifecycleOperator("suffix-1", events),
+        _SegmentLifecycleOperator("suffix-2", events),
+    ]
+    executor, segments = _make_segmented_lifecycle_executor(prefix, suffix)
+    start_streaming_topology(
+        segments[0], executor._options, executor._block_ref_counter
+    )
+    events.clear()
 
-        def resource_admission_spec(self):
-            return ResourceAdmissionSpec(
-                minimum_resources=ExecutionResources(gpu=1),
-                unit_resources=ExecutionResources(gpu=1),
-                min_units=1,
-                max_units=1,
-            )
+    with patch(
+        "ray.data._internal.execution.streaming_executor."
+        "get_backpressure_policies",
+        return_value=[],
+    ):
+        assert executor._maybe_start_next_segment()
 
-        def apply_resource_admission_grant(self, grant):
-            self.grant = grant
+    assert events == [
+        "stop:prefix-2:False",
+        "stop:prefix-1:False",
+        "start:suffix-1",
+        "start:suffix-2",
+    ]
 
-        def start(self, options, block_ref_counter):
-            self.grant_at_start = self.grant
-            super().start(options, block_ref_counter)
 
-    data_context = DataContext()
-    source = InputDataBuffer(data_context, input_data=[])
-    owner = AdmissionOperator(source, data_context)
+def test_segment_transition_supports_more_than_two_segments():
+    events = []
+    first = [_SegmentLifecycleOperator("first", events)]
+    second = [_SegmentLifecycleOperator("second", events)]
+    third = [_SegmentLifecycleOperator("third", events)]
+    executor, segments = _make_segmented_lifecycle_executor(first, second, third)
+    start_streaming_topology(
+        segments[0], executor._options, executor._block_ref_counter
+    )
+    events.clear()
+
+    with patch(
+        "ray.data._internal.execution.streaming_executor."
+        "get_backpressure_policies",
+        return_value=[],
+    ):
+        assert executor._maybe_start_next_segment()
+        assert executor._maybe_start_next_segment()
+        assert not executor._maybe_start_next_segment()
+
+    assert events == [
+        "stop:first:False",
+        "start:second",
+        "stop:second:False",
+        "start:third",
+    ]
+    assert executor._active_segment_index == 2
+    assert list(executor._active_topology) == first + second + third
+    assert executor._resource_manager.set_forced_materializing_op.call_args_list == [
+        unittest.mock.call(second[0]),
+        unittest.mock.call(None),
+    ]
+
+
+def test_segment_suffix_is_published_only_after_transactional_start():
+    events = []
+    prefix = [_SegmentLifecycleOperator("prefix", events)]
+    suffix = [
+        _SegmentLifecycleOperator("suffix-1", events),
+        _SegmentLifecycleOperator("suffix-2", events),
+    ]
+    executor, segments = _make_segmented_lifecycle_executor(prefix, suffix)
+
+    def assert_suffix_unpublished():
+        assert all(op not in executor._active_topology for op in suffix)
+
+    for op in suffix:
+        op._on_start = assert_suffix_unpublished
+
+    start_streaming_topology(
+        segments[0], executor._options, executor._block_ref_counter
+    )
+    events.clear()
+    with patch(
+        "ray.data._internal.execution.streaming_executor."
+        "get_backpressure_policies",
+        return_value=[],
+    ):
+        assert executor._maybe_start_next_segment()
+
+    assert all(op in executor._active_topology for op in suffix)
+    assert executor._active_segment_index == 1
+
+
+def test_segment_suffix_failure_rolls_back_and_remains_unpublished():
+    events = []
+    prefix = [_SegmentLifecycleOperator("prefix", events)]
+    suffix = [
+        _SegmentLifecycleOperator("suffix-1", events),
+        _SegmentLifecycleOperator("suffix-failing", events, fail_start=True),
+        _SegmentLifecycleOperator("suffix-unreached", events),
+    ]
+    executor, segments = _make_segmented_lifecycle_executor(prefix, suffix)
+    start_streaming_topology(
+        segments[0], executor._options, executor._block_ref_counter
+    )
+    events.clear()
+
+    with patch(
+        "ray.data._internal.execution.streaming_executor."
+        "get_backpressure_policies"
+    ) as get_backpressure_policies:
+        with pytest.raises(RuntimeError, match="suffix-failing start failed"):
+            executor._maybe_start_next_segment()
+
+    assert events == [
+        "stop:prefix:False",
+        "start:suffix-1",
+        "start:suffix-failing",
+        "stop:suffix-failing:True",
+        "stop:suffix-1:True",
+    ]
+    assert list(executor._active_topology) == prefix
+    assert executor._active_segment_index == 0
+    assert not suffix[-1].is_started
+    get_backpressure_policies.assert_not_called()
+
+
+def test_segment_transition_is_skipped_after_cancellation_or_shutdown():
+    events = []
+    prefix = [_SegmentLifecycleOperator("prefix", events)]
+    suffix = [_SegmentLifecycleOperator("suffix", events)]
+    executor, segments = _make_segmented_lifecycle_executor(prefix, suffix)
+    start_streaming_topology(
+        segments[0], executor._options, executor._block_ref_counter
+    )
+    events.clear()
+    executor._shutdown = True
+
+    assert not executor._maybe_start_next_segment()
+    assert events == []
+    assert list(executor._active_topology) == prefix
+    assert executor._active_segment_index == 0
+    assert not suffix[0].is_started
+
+
+def test_segment_transition_serializes_cancellation_during_suffix_start():
+    events = []
+    suffix_started = threading.Event()
+    release_suffix = threading.Event()
+    cancellation_attempted = threading.Event()
+    cancellation_acquired = threading.Event()
+
+    def block_suffix_start():
+        suffix_started.set()
+        assert release_suffix.wait(timeout=5)
+
+    prefix = [_SegmentLifecycleOperator("prefix", events)]
+    suffix = [
+        _SegmentLifecycleOperator("suffix", events, on_start=block_suffix_start)
+    ]
+    executor, segments = _make_segmented_lifecycle_executor(prefix, suffix)
+    start_streaming_topology(
+        segments[0], executor._options, executor._block_ref_counter
+    )
+
+    with patch(
+        "ray.data._internal.execution.streaming_executor."
+        "get_backpressure_policies",
+        return_value=[],
+    ):
+        transition = threading.Thread(target=executor._maybe_start_next_segment)
+        transition.start()
+        assert suffix_started.wait(timeout=5)
+
+        def cancel():
+            cancellation_attempted.set()
+            with executor._shutdown_lock:
+                executor._shutdown = True
+                cancellation_acquired.set()
+
+        cancellation = threading.Thread(target=cancel)
+        cancellation.start()
+        assert cancellation_attempted.wait(timeout=5)
+        assert not cancellation_acquired.wait(timeout=0.05)
+        release_suffix.set()
+        transition.join(timeout=5)
+        cancellation.join(timeout=5)
+
+    assert cancellation_acquired.is_set()
+    assert executor._shutdown
+    assert executor._active_segment_index == 1
+
+
+def test_shutdown_skips_never_started_operator_cleanup():
+    events = []
+    started = _SegmentLifecycleOperator("started", events)
+    never_started = _SegmentLifecycleOperator("never-started", events)
+    executor = StreamingExecutor.__new__(StreamingExecutor)
+    executor._data_context = DataContext()
+    executor._shutdown_lock = threading.RLock()
+    executor._shutdown = False
+    executor._dataset_id = "segmented-lifecycle-test"
+    executor._callbacks = []
     options = ExecutionOptions()
-    block_ref_counter = noop_counter()
-    topology = build_streaming_topology(
-        owner, options, block_ref_counter, start_operators=False
-    )
+    started.start(options, noop_counter())
+    events.clear()
 
-    ResourceManager(
-        topology,
-        options,
-        lambda: ExecutionResources(gpu=1),
-        data_context,
-        block_ref_counter,
-    )
-    start_streaming_topology(topology, options, block_ref_counter)
+    started_state = MagicMock(spec=OpState)
+    started_state.input_queues = []
+    started_state.output_queue = MagicMock()
+    never_started_state = MagicMock(spec=OpState)
+    never_started_state.input_queues = []
+    never_started_state.output_queue = MagicMock()
+    executor._topology = {
+        started: started_state,
+        never_started: never_started_state,
+    }
+    executor._active_topology = dict(executor._topology)
+    executor._output_node = (started, started_state)
+    executor._execution_started = True
+    executor.join = MagicMock()
+    executor._metadata_fetcher = MagicMock()
+    executor._resource_manager = MagicMock()
+    executor._progress_manager = MagicMock()
+    executor._cluster_autoscaler = MagicMock()
+    executor._block_ref_counter = MagicMock()
+    executor._update_stats_metrics = MagicMock()
+    executor.update_metrics = MagicMock()
+    final_stats = MagicMock()
+    final_stats.time_total_s = 0.0
+    final_stats.to_summary().to_string.return_value = ""
+    executor._generate_stats = MagicMock(return_value=final_stats)
 
-    assert owner.grant_at_start == ResourceAdmissionGrant(0, False)
-    for op in reversed(topology):
-        op.rollback_start()
+    with patch(
+        "ray.data._internal.execution.streaming_executor."
+        "unregister_dataset_logger",
+        return_value=None,
+    ):
+        executor.shutdown(force=False)
+
+    assert events == [
+        "stop:started:False",
+        "clear-input:started",
+        "clear-output:started",
+    ]
+    assert not never_started.is_started
+    assert not never_started._shutdown
+
+
+def test_streaming_executor_initializes_segmented_lifecycle_state():
+    with patch(
+        "ray.data._internal.execution.streaming_executor."
+        "register_dataset_logger",
+        return_value=None,
+    ):
+        executor = StreamingExecutor(DataContext(), dataset_id="lifecycle-init-test")
+
+    assert executor._active_topology is None
+    assert executor._execution_segments == []
+    assert executor._active_segment_index == 0
+
+
+def test_run_shutdown_breaks_before_segment_transition():
+    executor, output_state = _make_run_loop_executor([False])
+    executor._shutdown = True
+    executor._maybe_start_next_segment = MagicMock()
+
+    executor.run()
+
+    executor._metadata_fetcher.start.assert_called_once_with()
+    executor._scheduling_loop_step.assert_called_once_with(executor._active_topology)
+    executor._maybe_start_next_segment.assert_not_called()
+    output_state.mark_finished.assert_called_once_with(None)
+
+
+def test_run_completed_prefix_transitions_then_completes_suffix():
+    executor, output_state = _make_run_loop_executor([False, False])
+    executor._maybe_start_next_segment = MagicMock(side_effect=[True, False])
+
+    executor.run()
+
+    assert executor._scheduling_loop_step.call_count == 2
+    assert executor._maybe_start_next_segment.call_count == 2
+    output_state.mark_finished.assert_called_once_with(None)
+
+
+def test_run_without_another_segment_exits_after_completion():
+    executor, output_state = _make_run_loop_executor([False])
+    executor._maybe_start_next_segment = MagicMock(return_value=False)
+
+    executor.run()
+
+    executor._scheduling_loop_step.assert_called_once_with(executor._active_topology)
+    output_state.mark_finished.assert_called_once_with(None)
+
+
+def test_run_marks_output_finished_with_scheduling_exception():
+    error = RuntimeError("scheduling failed")
+    executor, output_state = _make_run_loop_executor([error])
+
+    executor.run()
+
+    finished_error = output_state.mark_finished.call_args.args[0]
+    assert finished_error is error
 
 
 def test_disallow_non_unique_operators(ray_start_regular_shared):
@@ -552,12 +957,7 @@ def test_get_eligible_operators_to_run(ray_start_regular_shared):
     )
 
     def _get_eligible_ops_to_run(ensure_liveness: bool):
-        return get_eligible_operators(
-            topo,
-            [],
-            ensure_liveness=ensure_liveness,
-            resource_manager=resource_manager,
-        )
+        return get_eligible_operators(topo, [], ensure_liveness=ensure_liveness)
 
     # Test empty.
     assert _get_eligible_ops_to_run(ensure_liveness=False) == []
@@ -595,10 +995,7 @@ def test_get_eligible_operators_to_run(ray_start_regular_shared):
 
         def _get_eligible_ops_to_run_with_policy(ensure_liveness: bool):
             return get_eligible_operators(
-                topo,
-                [test_policy],
-                ensure_liveness=ensure_liveness,
-                resource_manager=resource_manager,
+                topo, [test_policy], ensure_liveness=ensure_liveness
             )
 
         assert _get_eligible_ops_to_run_with_policy(ensure_liveness=False) == [o3]
@@ -611,41 +1008,6 @@ def test_get_eligible_operators_to_run(ray_start_regular_shared):
 
             # To ensure liveness back-pressure limits will be ignored
             assert _get_eligible_ops_to_run_with_policy(ensure_liveness=True) == [o2]
-
-    # Admission is a hard constraint: the idle-pipeline liveness fallback must
-    # not dispatch new input to a frontier pool and let it leapfrog upstream.
-    for max_units in (0, 1):
-        resource_manager.get_resource_admission_grant.side_effect = lambda op: (
-            ResourceAdmissionGrant(max_units, False) if op is o2 else None
-        )
-        with patch.object(
-            o2,
-            "can_add_input",
-            side_effect=AssertionError("hard admission gate must not probe readiness"),
-        ):
-            assert (
-                get_eligible_operators(
-                    topo,
-                    [],
-                    ensure_liveness=True,
-                    resource_manager=resource_manager,
-                )
-                == []
-            )
-
-    resource_manager.get_resource_admission_grant.side_effect = lambda op: (
-        ResourceAdmissionGrant(1, True) if op is o2 else None
-    )
-    assert get_eligible_operators(
-        topo,
-        [],
-        ensure_liveness=False,
-        resource_manager=resource_manager,
-    ) == [o2]
-    assert topo[o2]._scheduling_status.runnable
-    assert topo[o2]._scheduling_status.under_resource_limits
-    assert not o2._in_task_submission_backpressure
-    assert o2._task_submission_backpressure_policy is None
 
 
 def test_backpressure_policy_tracking(ray_start_regular_shared):
@@ -660,7 +1022,6 @@ def test_backpressure_policy_tracking(ray_start_regular_shared):
         name="O2",
     )
     topo = build_streaming_topology(o2, opts, noop_counter())
-    resource_manager = mock_resource_manager()
 
     # Add input to o2's input queue so it becomes eligible
     topo[o1].output_queue.append(make_ref_bundle("dummy1"))
@@ -702,12 +1063,7 @@ def test_backpressure_policy_tracking(ray_start_regular_shared):
     policies = [MockPolicy1(), MockPolicy2(), MockPolicy3()]
 
     # Call get_eligible_operators which should track triggered policies
-    get_eligible_operators(
-        topo,
-        policies,
-        ensure_liveness=False,
-        resource_manager=resource_manager,
-    )
+    get_eligible_operators(topo, policies, ensure_liveness=False)
 
     # Check that o2 has the first triggered policy tracked
     assert o2._in_task_submission_backpressure is True
@@ -725,12 +1081,7 @@ def test_backpressure_policy_tracking(ray_start_regular_shared):
         def max_task_output_bytes_to_read(self, op):
             return None
 
-    get_eligible_operators(
-        topo,
-        [AllowAllPolicy()],
-        ensure_liveness=False,
-        resource_manager=resource_manager,
-    )
+    get_eligible_operators(topo, [AllowAllPolicy()], ensure_liveness=False)
 
     # Check that o2 is no longer in backpressure
     assert o2._in_task_submission_backpressure is False
@@ -846,31 +1197,6 @@ def test_process_completed_tasks_unblocks_when_non_resource_budget_policy_zeros_
     # and the policy attribution should be cleared.
     assert o2._in_task_output_backpressure is False
     assert o2._task_output_backpressure_policy is None
-
-
-def test_output_backpressure_ignores_partial_internal_input_bundle():
-    upstream = MagicMock(spec=PhysicalOperator)
-    downstream = MagicMock(spec=PhysicalOperator)
-    downstream.num_active_tasks.return_value = 0
-    downstream_state = MagicMock(spec=OpState)
-    downstream_state.has_pending_bundles.return_value = False
-    downstream_state.total_enqueued_input_blocks.return_value = 1
-    topology = {
-        upstream: MagicMock(spec=OpState),
-        downstream: downstream_state,
-    }
-    resource_manager = MagicMock(spec=ResourceManager)
-    resource_manager.get_downstream_eligible_ops.return_value = [downstream]
-    resource_manager.can_submit_new_task.return_value = True
-    guard = OutputBackpressureGuard(topology, resource_manager)
-
-    # An internally buffered partial rebundler input cannot be dispatched yet,
-    # so upstream must be allowed to produce another block.
-    assert guard.should_unblock(upstream)
-
-    downstream_state.has_pending_bundles.return_value = True
-    guard._idle_detector.detect_idle = MagicMock(return_value=False)
-    assert not guard.should_unblock(upstream)
 
 
 def test_summary_str_backpressure_policies(ray_start_regular_shared):

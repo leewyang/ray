@@ -1278,12 +1278,6 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
             object_store_memory=0,
         )
 
-    def resource_admission_incompatible(self) -> bool:
-        # The CPU aggregator actors persist until operator shutdown and are not
-        # controlled by the GPU resource-admission contract. Avoid mixing their
-        # eager lifecycle with admission-gated owners in the same topology.
-        return True
-
     def _build_aggregator_ray_remote_args(
         self,
         *,

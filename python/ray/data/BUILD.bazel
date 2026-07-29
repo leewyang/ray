@@ -719,6 +719,35 @@ py_test(
 )
 
 py_test(
+    name = "test_gpu_shuffle_startup",
+    size = "small",
+    srcs = ["tests/test_gpu_shuffle_startup.py"],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
+py_test(
+    name = "test_gpu_shuffle_startup_e2e",
+    size = "large",
+    srcs = ["tests/test_gpu_shuffle_startup_e2e.py"],
+    tags = [
+        "exclusive",
+        "gpu",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
+py_test(
     name = "test_gpu_aggregate",
     size = "medium",
     srcs = ["tests/test_gpu_aggregate.py"],
@@ -1757,20 +1786,6 @@ py_test(
     name = "test_reservation_based_resource_allocator",
     size = "small",
     srcs = ["tests/test_reservation_based_resource_allocator.py"],
-    tags = [
-        "exclusive",
-        "team:data",
-    ],
-    deps = [
-        ":conftest",
-        "//:ray_lib",
-    ],
-)
-
-py_test(
-    name = "test_resource_admission",
-    size = "small",
-    srcs = ["tests/test_resource_admission.py"],
     tags = [
         "exclusive",
         "team:data",

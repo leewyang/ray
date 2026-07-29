@@ -381,11 +381,9 @@ def test_map_operator_disable_block_shaping_with_batches(
 
 
 @pytest.mark.parametrize("use_actors", [False, True])
-def test_map_operator_ray_args(shutdown_only, restore_data_context, use_actors):
+def test_map_operator_ray_args(shutdown_only, use_actors):
     ray.shutdown()
     ray.init(num_cpus=0, num_gpus=1)
-    # This directly drives an operator without StreamingExecutor/ResourceManager.
-    DataContext.get_current()._enable_resource_admission_control = False
     # Create with inputs.
     input_op = InputDataBuffer(
         DataContext.get_current(), make_ref_bundles([[i] for i in range(10)])
@@ -427,11 +425,9 @@ def test_map_operator_ray_args(shutdown_only, restore_data_context, use_actors):
 
 
 @pytest.mark.parametrize("use_actors", [False, True])
-def test_map_operator_shutdown(shutdown_only, restore_data_context, use_actors):
+def test_map_operator_shutdown(shutdown_only, use_actors):
     ray.shutdown()
     ray.init(num_cpus=0, num_gpus=1)
-    # This directly drives an operator without StreamingExecutor/ResourceManager.
-    DataContext.get_current()._enable_resource_admission_control = False
 
     def _sleep(block_iter: Iterable[Block]) -> Iterable[Block]:
         time.sleep(999)
@@ -488,78 +484,6 @@ def test_map_operator_pool_delegation(compute, expected):
         compute_strategy=compute,
     )
     assert isinstance(op, expected)
-
-
-def _make_task_pool_admission_op(
-    data_context=None, *, ray_remote_args_fn=None
-) -> TaskPoolMapOperator:
-    data_context = data_context or DataContext()
-    op = MapOperator.create(
-        _mul2_map_data_prcessor,
-        input_op=InputDataBuffer(data_context, input_data=[]),
-        data_context=data_context,
-        compute_strategy=TaskPoolStrategy(),
-        ray_remote_args={"num_gpus": 1},
-        ray_remote_args_fn=ray_remote_args_fn,
-    )
-    assert isinstance(op, TaskPoolMapOperator)
-    return op
-
-
-@pytest.mark.parametrize(
-    ("option", "value"),
-    [
-        ("resources", {"custom": 1}),
-        ("accelerator_type", "L4"),
-        ("object_store_memory", 1024),
-        ("label_selector", {"zone": "west"}),
-        ("fallback_strategy", [{"label_selector": {"zone": "west"}}]),
-        ("scheduling_strategy", None),
-        ("scheduling_strategy", object()),
-        ("placement_group", "default"),
-        ("placement_group_bundle_index", 0),
-        ("placement_group_capture_child_tasks", True),
-    ],
-)
-def test_task_pool_resource_admission_rejects_placement_constraints(option, value):
-    op = _make_task_pool_admission_op()
-    op._ray_remote_args[option] = value
-
-    assert op.resource_admission_incompatible()
-
-
-@pytest.mark.parametrize(
-    "context_option",
-    [
-        "scheduling_strategy",
-        "scheduling_strategy_large_args",
-    ],
-)
-def test_task_pool_resource_admission_checks_context_strategies(context_option):
-    data_context = DataContext()
-    setattr(data_context, context_option, object())
-
-    assert _make_task_pool_admission_op(
-        data_context
-    ).resource_admission_incompatible()
-
-
-def test_task_pool_resource_admission_compatible_scalar_resources():
-    op = _make_task_pool_admission_op()
-    assert not op.resource_admission_incompatible()
-
-    for strategy in ("DEFAULT", "SPREAD"):
-        op._ray_remote_args["scheduling_strategy"] = strategy
-        assert not op.resource_admission_incompatible()
-
-    data_context = DataContext()
-    data_context.execution_options.label_selector = {"zone": "west"}
-    assert _make_task_pool_admission_op(
-        data_context
-    ).resource_admission_incompatible()
-    assert _make_task_pool_admission_op(
-        ray_remote_args_fn=lambda: {"num_gpus": 1}
-    ).resource_admission_incompatible()
 
 
 @pytest.mark.parametrize("use_actors", [False, True])

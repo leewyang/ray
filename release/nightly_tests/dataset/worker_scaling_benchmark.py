@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
             "The total worker pool (--num-workers) is split evenly across "
             "operators (each gets num_workers // num_operators workers). "
             "Useful for stressing the per-iteration update_usages / "
-            "_update_resource_allocations work that scales with N_ops."
+            "_update_allocated_budgets work that scales with N_ops."
         ),
     )
     parser.add_argument(
