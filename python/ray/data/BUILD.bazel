@@ -719,6 +719,20 @@ py_test(
 )
 
 py_test(
+    name = "test_gpu_handoff",
+    size = "small",
+    srcs = ["tests/test_gpu_handoff.py"],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
+py_test(
     name = "test_gpu_aggregate",
     size = "medium",
     srcs = ["tests/test_gpu_aggregate.py"],

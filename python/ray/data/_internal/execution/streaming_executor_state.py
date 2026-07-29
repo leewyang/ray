@@ -9,7 +9,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import ray
 from ray.data._internal.actor_autoscaler.autoscaling_actor_pool import ActorPoolInfo
@@ -136,14 +136,29 @@ class OutputBackpressureGuard:
     scheduling-loop iterations.
     """
 
-    def __init__(self, topology: Topology, resource_manager: ResourceManager):
+    def __init__(
+        self,
+        topology: Topology,
+        resource_manager: ResourceManager,
+        *,
+        gpu_handoff_should_drain_output: Optional[
+            Callable[[PhysicalOperator], bool]
+        ] = None,
+    ):
         self._topology = topology
         self._resource_manager = resource_manager
+        self._gpu_handoff_should_drain_output = gpu_handoff_should_drain_output
         self._idle_detector = IdleDetector()
 
     def should_unblock(self, op: PhysicalOperator) -> bool:
         """Return True if output backpressure should be relaxed for ``op``
         to preserve pipeline liveness."""
+        if (
+            self._gpu_handoff_should_drain_output is not None
+            and self._gpu_handoff_should_drain_output(op)
+        ):
+            return True
+
         downstream_eligible_ops = list(
             self._resource_manager.get_downstream_eligible_ops(op)
         )

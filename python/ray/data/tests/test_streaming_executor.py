@@ -8,7 +8,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import List, Literal, Optional, Union
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import pyarrow as pa
@@ -782,6 +782,123 @@ def test_process_completed_tasks_unblocks_when_non_resource_budget_policy_zeros_
     # and the policy attribution should be cleared.
     assert o2._in_task_output_backpressure is False
     assert o2._task_output_backpressure_policy is None
+
+
+def test_output_backpressure_guard_gpu_handoff_short_circuits_stock_checks():
+    op = MagicMock(spec=PhysicalOperator)
+    resource_manager = MagicMock(spec=ResourceManager)
+    should_drain_output = MagicMock(return_value=True)
+    guard = OutputBackpressureGuard(
+        {op: MagicMock(spec=OpState)},
+        resource_manager,
+        gpu_handoff_should_drain_output=should_drain_output,
+    )
+
+    assert guard.should_unblock(op)
+    should_drain_output.assert_called_once_with(op)
+    resource_manager.get_downstream_eligible_ops.assert_not_called()
+
+
+@pytest.mark.parametrize("with_gpu_handoff_callback", [False, True])
+def test_output_backpressure_guard_gpu_handoff_false_uses_stock_checks(
+    with_gpu_handoff_callback,
+):
+    upstream = MagicMock(spec=PhysicalOperator)
+    downstream = MagicMock(spec=PhysicalOperator)
+    downstream.num_active_tasks.return_value = 1
+    topology = {
+        upstream: MagicMock(spec=OpState),
+        downstream: MagicMock(spec=OpState),
+    }
+    resource_manager = MagicMock(spec=ResourceManager)
+    resource_manager.get_downstream_eligible_ops.return_value = [downstream]
+    should_drain_output = (
+        MagicMock(return_value=False) if with_gpu_handoff_callback else None
+    )
+    guard = OutputBackpressureGuard(
+        topology,
+        resource_manager,
+        gpu_handoff_should_drain_output=should_drain_output,
+    )
+    guard._idle_detector.detect_idle = MagicMock(return_value=False)
+
+    assert not guard.should_unblock(upstream)
+    resource_manager.get_downstream_eligible_ops.assert_called_once_with(upstream)
+    guard._idle_detector.detect_idle.assert_called_once_with(upstream)
+    if should_drain_output is not None:
+        should_drain_output.assert_called_once_with(upstream)
+
+
+def test_gpu_handoff_guard_relaxes_zero_output_limit_only_for_drain_range():
+    draining = MagicMock(spec=PhysicalOperator)
+    dormant = MagicMock(spec=PhysicalOperator)
+    for op in (draining, dormant):
+        op.get_active_tasks.return_value = []
+        op.has_next.return_value = False
+    topology = {
+        draining: MagicMock(spec=OpState),
+        dormant: MagicMock(spec=OpState),
+    }
+    resource_manager = MagicMock(spec=ResourceManager)
+    resource_manager.get_downstream_eligible_ops.return_value = [dormant]
+    dormant.num_active_tasks.return_value = 1
+    should_drain_output = MagicMock(side_effect=lambda op: op is draining)
+    guard = OutputBackpressureGuard(
+        topology,
+        resource_manager,
+        gpu_handoff_should_drain_output=should_drain_output,
+    )
+    guard._idle_detector.detect_idle = MagicMock(return_value=False)
+
+    class ZeroLimitPolicy:
+        name = "ZeroLimit"
+
+        def max_task_output_bytes_to_read(self, op):
+            return 0
+
+    process_completed_tasks(
+        topology,
+        [ZeroLimitPolicy()],
+        max_errored_blocks=0,
+        output_backpressure_guard=guard,
+        metadata_fetcher=InlineMetadataFetcher(),
+    )
+
+    draining.notify_in_task_output_backpressure.assert_called_once_with(False, None)
+    dormant.notify_in_task_output_backpressure.assert_called_once_with(
+        True, "ZeroLimit"
+    )
+    assert should_drain_output.call_args_list == [
+        call(draining),
+        call(dormant),
+    ]
+
+
+def test_gpu_handoff_feature_off_uses_stock_topology_start(
+    ray_start_regular_shared, restore_data_context
+):
+    ctx = DataContext.get_current()
+    ctx._enable_gpu_handoff = False
+    dag = InputDataBuffer(ctx, input_data=[])
+    executor = StreamingExecutor(ctx)
+
+    with (
+        patch(
+            "ray.data._internal.execution.streaming_executor.build_streaming_topology",
+            wraps=build_streaming_topology,
+        ) as build,
+        patch(
+            "ray.data._internal.execution.gpu_handoff.create_gpu_handoff_policy"
+        ) as create_policy,
+        patch(
+            "ray.data._internal.execution.gpu_handoff._resolve_capacity"
+        ) as resolve_capacity,
+    ):
+        assert list(executor.execute(dag)) == []
+
+    assert build.call_args.kwargs == {}
+    create_policy.assert_not_called()
+    resolve_capacity.assert_not_called()
 
 
 def test_summary_str_backpressure_policies(ray_start_regular_shared):

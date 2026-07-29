@@ -228,16 +228,32 @@ class StreamingExecutor(Executor, threading.Thread):
                     ),
                 )
 
-        # Build and start the operator topology as separate phases so a partial
-        # startup can be rolled back as one transaction.
         self._block_ref_counter = BlockRefCounter()
-        self._topology = build_streaming_topology(
-            dag,
-            self._options,
-            self._block_ref_counter,
-            start_operators=False,
-        )
-        start_streaming_topology(self._topology, self._options, self._block_ref_counter)
+        self._gpu_handoff_policy = None
+        if not self._data_context._enable_gpu_handoff:
+            # Preserve the stock construction and startup path when disabled.
+            self._topology = build_streaming_topology(
+                dag,
+                self._options,
+                self._block_ref_counter,
+            )
+        else:
+            from ray.data._internal.execution.gpu_handoff import (
+                create_gpu_handoff_policy,
+            )
+
+            self._topology = build_streaming_topology(
+                dag,
+                self._options,
+                self._block_ref_counter,
+                start_operators=False,
+            )
+            self._gpu_handoff_policy = create_gpu_handoff_policy(
+                self._topology, self._options
+            )
+            start_streaming_topology(
+                self._topology, self._options, self._block_ref_counter
+            )
 
         self._resource_manager = ResourceManager(
             self._topology,
@@ -250,7 +266,13 @@ class StreamingExecutor(Executor, threading.Thread):
         # Constructed once per executor (not per scheduling iteration) so the
         # guard's idle-detection state accumulates across scheduling iterations.
         self._output_backpressure_guard = OutputBackpressureGuard(
-            self._topology, self._resource_manager
+            self._topology,
+            self._resource_manager,
+            gpu_handoff_should_drain_output=(
+                self._gpu_handoff_policy.should_drain_output
+                if self._gpu_handoff_policy is not None
+                else None
+            ),
         )
 
         # Setup progress manager
@@ -563,6 +585,8 @@ class StreamingExecutor(Executor, threading.Thread):
         self._actor_autoscaler.try_trigger_scaling()
 
         update_operator_states(topology)
+        if self._gpu_handoff_policy is not None:
+            self._gpu_handoff_policy.update()
         self._refresh_progress_manager(topology)
 
         self._update_stats_metrics(state=DatasetState.RUNNING.name)
