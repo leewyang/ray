@@ -979,6 +979,156 @@ def test_setting_initial_size_for_actor_pool():
     ray.shutdown()
 
 
+def _make_gpu_handoff_actor_op(
+    *,
+    context: Optional[DataContext] = None,
+    strategy: Optional[ActorPoolStrategy] = None,
+):
+    context = context or DataContext()
+    return MapOperator.create(
+        map_transformer=MagicMock(spec=MapTransformer),
+        input_op=InputDataBuffer(context, input_data=[]),
+        data_context=context,
+        compute_strategy=strategy
+        or ActorPoolStrategy(min_size=1, max_size=4, initial_size=2),
+        ray_remote_args={"num_cpus": 1, "num_gpus": 1},
+    )
+
+
+def test_gpu_handoff_pool_caps_scaling_and_preserves_minimum():
+    create_actor = MagicMock()
+    create_actor.side_effect = [
+        (MagicMock(), MagicMock(), ExecutionResources(cpu=1, gpu=1)) for _ in range(4)
+    ]
+    pool = _ActorPool(
+        create_actor_fn=create_actor,
+        config=AutoscalingActorConfig(
+            min_size=1,
+            max_size=4,
+            initial_size=2,
+            max_tasks_in_flight_per_actor=1,
+            max_actor_concurrency=1,
+            per_actor_resource_usage=ExecutionResources(cpu=1, gpu=1),
+        ),
+    )
+
+    pool._configure_gpu_handoff(effective_max=2, initially_admitted=False)
+    assert pool.max_size() == 2
+    assert pool.scale(ActorPoolScalingRequest.upscale(delta=4)) == 0
+    create_actor.assert_not_called()
+
+    pool._admit_gpu_handoff()
+    assert pool.scale(ActorPoolScalingRequest.upscale(delta=4)) == 2
+    assert pool.current_size() == 2
+    assert pool.scale(ActorPoolScalingRequest.upscale(delta=1)) == 0
+
+    assert pool.scale(ActorPoolScalingRequest.downscale(delta=-4, force=True)) == -1
+    assert pool.current_size() == pool.min_size() == 1
+    assert pool.scale(ActorPoolScalingRequest.downscale(delta=-1, force=True)) == 0
+
+    pool._release_gpu_handoff_resources()
+    assert pool.current_size() == 0
+    assert pool.scale(ActorPoolScalingRequest.upscale(delta=1)) == 0
+
+
+def test_gpu_handoff_waiting_operator_starts_without_actors_or_submission():
+    op = _make_gpu_handoff_actor_op()
+    op._configure_gpu_handoff(effective_max=2, initially_admitted=False)
+    op._actor_pool.scale = MagicMock()
+    op._actor_pool.can_schedule_task = MagicMock(return_value=True)
+    op._actor_pool.select_actors = MagicMock()
+    op._bundle_queue = MagicMock()
+    op._bundle_queue.has_next.return_value = True
+
+    with patch(
+        "ray.data._internal.execution.operators.actor_pool_map_operator.ray.remote"
+    ):
+        op.start(ExecutionOptions(), noop_counter())
+
+    op._actor_pool.scale.assert_not_called()
+    assert not op.can_add_input()
+    assert op._try_schedule_tasks_internal() == 0
+    op._actor_pool.select_actors.assert_not_called()
+
+
+def test_gpu_handoff_initial_admission_preserves_stock_initial_wait():
+    context = DataContext()
+    context.wait_for_min_actors_s = 5
+    op = _make_gpu_handoff_actor_op(context=context)
+    op._configure_gpu_handoff(effective_max=3, initially_admitted=True)
+    op._actor_pool.scale = MagicMock()
+    refs = [MagicMock(), MagicMock()]
+    op._actor_pool.get_pending_actor_refs = MagicMock(return_value=refs)
+
+    with (
+        patch(
+            "ray.data._internal.execution.operators.actor_pool_map_operator.ray.remote"
+        ),
+        patch(
+            "ray.data._internal.execution.operators.actor_pool_map_operator.ray.get"
+        ) as ray_get,
+    ):
+        op.start(ExecutionOptions(), noop_counter())
+
+    op._actor_pool.scale.assert_called_once_with(
+        ActorPoolScalingRequest(
+            delta=op._actor_pool.initial_size(),
+            reason="scaling to initial size",
+        )
+    )
+    ray_get.assert_called_once_with(refs, timeout=5)
+
+
+def test_gpu_handoff_delayed_admission_reuses_stock_initial_wait():
+    context = DataContext()
+    context.wait_for_min_actors_s = 10
+    op = _make_gpu_handoff_actor_op(context=context)
+    op._configure_gpu_handoff(effective_max=2, initially_admitted=False)
+    op._actor_pool.scale = MagicMock()
+    refs = [MagicMock(), MagicMock()]
+    op._actor_pool.get_pending_actor_refs = MagicMock(return_value=refs)
+
+    with patch(
+        "ray.data._internal.execution.operators.actor_pool_map_operator.ray.remote"
+    ):
+        op.start(ExecutionOptions(), noop_counter())
+
+    with patch(
+        "ray.data._internal.execution.operators.actor_pool_map_operator.ray.get"
+    ) as ray_get:
+        op._admit_gpu_handoff()
+
+    op._actor_pool.scale.assert_called_once_with(
+        ActorPoolScalingRequest(
+            delta=op._actor_pool.initial_size(),
+            reason="scaling to initial size",
+        )
+    )
+    ray_get.assert_called_once_with(refs, timeout=10)
+
+
+@pytest.mark.parametrize("already_finished, force", [(False, True), (True, False)])
+def test_gpu_handoff_release_only_force_kills_on_early_finish(already_finished, force):
+    op = _make_gpu_handoff_actor_op()
+    op._configure_gpu_handoff(effective_max=2, initially_admitted=True)
+    MapOperator.start(op, ExecutionOptions(), noop_counter())
+    op.has_execution_finished = MagicMock(return_value=already_finished)
+    if not already_finished:
+        op._data_tasks[0] = MagicMock()
+    op._cancel_active_tasks = MagicMock()
+    op._actor_pool._release_gpu_handoff_resources = MagicMock()
+
+    op.mark_execution_finished()
+    op._release_gpu_handoff_resources()
+
+    if already_finished:
+        op._cancel_active_tasks.assert_not_called()
+    else:
+        op._cancel_active_tasks.assert_called_once_with(force=False)
+        assert not op._data_tasks
+    op._actor_pool._release_gpu_handoff_resources.assert_called_once_with(force=force)
+
+
 def _create_bundle_with_single_row(row):
     block = pa.Table.from_pylist([row])
     block_ref = ray.put(block)

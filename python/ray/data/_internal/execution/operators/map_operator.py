@@ -621,6 +621,8 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
             task_index,
             output: RefBundle,
         ):
+            if getattr(self, "_gpu_handoff_force_release", False):
+                return
             # Since output is streamed, it should only contain one block.
             assert len(output) == 1
             self._metrics.on_task_output_generated(task_index, output)
@@ -635,6 +637,8 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
             task_exec_stats: Optional[TaskExecWorkerStats],
             task_exec_driver_stats: Optional[TaskExecDriverStats],
         ):
+            if getattr(self, "_gpu_handoff_force_release", False):
+                return
             # NOTE: `TaskExecStats` could be null in case there's no blocks
             #       emitted (current limitation, since it's emitted along with
             #       `BlockMetadata`)

@@ -187,6 +187,7 @@ class ActorPoolMapOperator(MapOperator):
         self._map_worker_cls = type(map_worker_cls_name, (_MapWorker,), {})
 
         self._actor_pool = self._create_actor_pool(compute_strategy)
+        self._gpu_handoff_force_release = False
         # A queue of bundles awaiting dispatch to actors.
         self._bundle_queue = create_bundle_queue()
         # Cached actor class.
@@ -276,33 +277,64 @@ class ActorPoolMapOperator(MapOperator):
         super().start(options, block_ref_counter)
 
         self._actor_cls = ray.remote(**self._ray_remote_args)(self._map_worker_cls)
+        if self._actor_pool._gpu_handoff_allows_task_submission():
+            self._start_initial_actors()
+
+    def _start_initial_actors(self) -> None:
         self._actor_pool.scale(
             ActorPoolScalingRequest(
                 delta=self._actor_pool.initial_size(), reason="scaling to initial size"
             )
         )
-
-        # If `wait_for_min_actors_s` is specified and is positive, then
-        # Actor Pool will block until min number of actors is provisioned.
-        #
-        # Otherwise, all actors will be provisioned asynchronously.
         if self.data_context.wait_for_min_actors_s > 0:
             refs = self._actor_pool.get_pending_actor_refs()
-
             logger.debug(
                 f"{self._name}: Waiting for {len(refs)} pool actors to start "
                 f"(for {self.data_context.wait_for_min_actors_s}s)..."
             )
-
             try:
-                timeout = self.data_context.wait_for_min_actors_s
-                ray.get(refs, timeout=timeout)
+                ray.get(refs, timeout=self.data_context.wait_for_min_actors_s)
             except ray.exceptions.GetTimeoutError:
                 raise ray.exceptions.GetTimeoutError(
                     "Timed out while starting actors. "
                     "This may mean that the cluster does not have "
                     "enough resources for the requested actor pool."
                 )
+
+    def _configure_gpu_handoff(
+        self, effective_max: int, initially_admitted: bool
+    ) -> None:
+        """Configure the private linear GPU-handoff lifecycle before startup."""
+        assert not self._started
+        self._actor_pool._configure_gpu_handoff(effective_max, initially_admitted)
+
+    def _admit_gpu_handoff(self) -> None:
+        """Provision a previously dormant pool using stock startup-wait semantics."""
+        assert self._started
+        self._actor_pool._admit_gpu_handoff()
+        self._start_initial_actors()
+
+    def _release_gpu_handoff_resources(self) -> bool:
+        """Release actors after execution finishes while preserving queued outputs."""
+        self._actor_pool._release_gpu_handoff_resources(
+            force=self._gpu_handoff_force_release
+        )
+        return True
+
+    def mark_execution_finished(self) -> None:
+        if self._actor_pool._gpu_handoff_max_size is None:
+            super().mark_execution_finished()
+            return
+        early_abort = not self.has_execution_finished()
+        super().mark_execution_finished()
+        if not early_abort:
+            return
+        self._gpu_handoff_force_release = True
+        try:
+            self._cancel_active_tasks(force=False)
+        finally:
+            self._data_tasks.clear()
+            self._metadata_tasks.clear()
 
     def can_add_input(self) -> bool:
         """NOTE: PLEASE READ CAREFULLY
@@ -315,7 +347,10 @@ class ActorPoolMapOperator(MapOperator):
             should be able to launch a task.
 
         """
-        return self._actor_pool.can_schedule_task()
+        return (
+            self._actor_pool._gpu_handoff_allows_task_submission()
+            and self._actor_pool.can_schedule_task()
+        )
 
     def _start_actor(
         self, labels: Dict[str, str], logical_actor_id: LogicalActorId
@@ -390,6 +425,9 @@ class ActorPoolMapOperator(MapOperator):
 
     def _try_schedule_tasks_internal(self) -> int:
         """Try to dispatch tasks from the internal queue. Returns the # of tasks submitted"""
+
+        if not self._actor_pool._gpu_handoff_allows_task_submission():
+            return 0
 
         num_submitted_tasks = 0
         while self._bundle_queue.has_next():
@@ -771,6 +809,8 @@ class _ActorPool(AutoscalingActorPool):
         self._create_actor_fn = create_actor_fn
         self._map_worker_cls_name = map_worker_cls_name
         self._debounce_period_s = debounce_period_s
+        self._gpu_handoff_max_size: Optional[int] = None
+        self._gpu_handoff_admitted = False
         # Timestamp of the last scale up action
         self._last_upscaled_at: Optional[float] = None
         self._last_downscaling_debounce_warning_ts: Optional[float] = None
@@ -810,7 +850,35 @@ class _ActorPool(AutoscalingActorPool):
     def map_worker_cls_name(self) -> str:
         return self._map_worker_cls_name
 
+    def _configure_gpu_handoff(
+        self, effective_max: int, initially_admitted: bool
+    ) -> None:
+        assert self._gpu_handoff_max_size is None
+        assert isinstance(effective_max, int) and not isinstance(effective_max, bool)
+        assert self.min_size() <= effective_max <= super().max_size()
+        self._gpu_handoff_max_size = effective_max
+        self._gpu_handoff_admitted = initially_admitted
+
+    def _admit_gpu_handoff(self) -> None:
+        assert self._gpu_handoff_max_size is not None
+        assert not self._gpu_handoff_admitted
+        self._gpu_handoff_admitted = True
+
+    def _release_gpu_handoff_resources(self, *, force: bool = False) -> None:
+        assert self._gpu_handoff_max_size is not None
+        self._gpu_handoff_admitted = False
+        self.shutdown(force=force)
+
+    def _gpu_handoff_allows_task_submission(self) -> bool:
+        return self._gpu_handoff_max_size is None or self._gpu_handoff_admitted
+
     # === Overriding methods of AutoscalingActorPool ===
+
+    @override
+    def max_size(self) -> int:
+        if self._gpu_handoff_max_size is not None:
+            return self._gpu_handoff_max_size
+        return super().max_size()
 
     @override
     def num_running_actors(self) -> int:
@@ -836,6 +904,27 @@ class _ActorPool(AutoscalingActorPool):
 
     @override
     def scale(self, req: ActorPoolScalingRequest) -> Optional[int]:
+        if self._gpu_handoff_max_size is not None:
+            if not self._gpu_handoff_admitted:
+                return 0
+            if req.delta > 0:
+                delta = min(
+                    req.delta,
+                    max(0, self._gpu_handoff_max_size - self.current_size()),
+                )
+            elif req.delta < 0:
+                removable = max(0, self.current_size() - self.min_size())
+                delta = -min(abs(req.delta), removable)
+            else:
+                delta = 0
+            if delta == 0:
+                return 0
+            req = ActorPoolScalingRequest(
+                delta=delta,
+                force=req.force,
+                reason=req.reason,
+            )
+
         # Verify request could be applied
         if not self._can_apply_request(req):
             return 0
