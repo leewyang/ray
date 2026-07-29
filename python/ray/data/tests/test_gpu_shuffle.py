@@ -227,6 +227,10 @@ class TestGPURankPool:
 
         assert len(pool.actors) == 3
         assert mock_actor_cls.options.call_count == 3
+        assert all(
+            actor_options.kwargs == {"num_gpus": 1, "scheduling_strategy": "SPREAD"}
+            for actor_options in mock_actor_cls.options.call_args_list
+        )
 
     def test_get_actor_for_block_round_robin(self):
         pool = self._make_pool(nranks=3)
@@ -260,6 +264,170 @@ class TestGPURankPool:
         mock_kill.assert_not_called()
         assert pool.actors == []
         assert pool.is_shutdown
+
+    def test_managed_activation_is_atomic_and_setup_timeout_starts_after_ready(self):
+        pool = self._make_pool(nranks=2, total_nparts=4)
+        placement = MagicMock(name="placement_group")
+        placement_ready_ref = MagicMock(name="placement_ready")
+        placement.ready.return_value = placement_ready_ref
+        actor_handles = [MagicMock(name=f"actor_{rank}") for rank in range(2)]
+        root_rank_ref = MagicMock(name="root_rank")
+        root_address_ref = MagicMock(name="root_address")
+        actor_handles[0].setup_root.options.return_value.remote.return_value = (
+            root_rank_ref,
+            root_address_ref,
+        )
+        worker_refs = [MagicMock(name=f"worker_{rank}") for rank in range(2)]
+        for actor, worker_ref in zip(actor_handles, worker_refs):
+            actor.setup_worker.remote.return_value = worker_ref
+
+        placement_ready = False
+
+        def ray_get(refs, **kwargs):
+            nonlocal placement_ready
+            if refs == [placement_ready_ref]:
+                actor_cls.options.assert_not_called()
+                placement_ready = True
+            else:
+                assert placement_ready
+
+        def clock():
+            assert placement_ready
+            return 10
+
+        with (
+            patch.object(
+                hash_shuffle, "placement_group", return_value=placement
+            ) as create_placement_group,
+            patch.object(hash_shuffle, "GPUShuffleActor") as actor_cls,
+            patch.object(hash_shuffle.ray, "get", side_effect=ray_get) as get,
+            patch.object(hash_shuffle.time, "perf_counter", side_effect=clock),
+        ):
+            actor_cls.options.return_value.remote.side_effect = actor_handles
+            pool.activate()
+
+        create_placement_group.assert_called_once_with(
+            bundles=[
+                {"CPU": 1, "GPU": 1},
+                {"CPU": 1, "GPU": 1},
+            ],
+            strategy="SPREAD",
+        )
+        assert get.call_count == 2
+        assert get.call_args_list[0].args == ([placement_ready_ref],)
+        assert get.call_args_list[0].kwargs == {}
+        assert get.call_args_list[1].kwargs == {"timeout": 60.0}
+        assert pool.is_ready
+        assert pool._pending_setup_refs == []
+        assert len(actor_cls.options.call_args_list) == 2
+        for rank, actor_options in enumerate(actor_cls.options.call_args_list):
+            assert actor_options.kwargs["num_cpus"] == 1
+            assert actor_options.kwargs["num_gpus"] == 1
+            strategy = actor_options.kwargs["scheduling_strategy"]
+            assert strategy.placement_group is placement
+            assert strategy.placement_group_bundle_index == rank
+            assert not strategy.placement_group_capture_child_tasks
+        for actor in actor_handles:
+            actor.setup_worker.remote.assert_called_once_with(root_address_ref)
+
+    def test_managed_setup_submission_failure_cleans_recorded_resources(self):
+        pool = self._make_pool(nranks=2)
+        placement = MagicMock()
+        placement_ready_ref = MagicMock()
+        placement.ready.return_value = placement_ready_ref
+        actors = [MagicMock(), MagicMock()]
+        root_refs = (MagicMock(), MagicMock())
+        actors[0].setup_root.options.return_value.remote.return_value = root_refs
+        worker_ref = MagicMock()
+        primary = RuntimeError("setup submission failed")
+        actors[0].setup_worker.remote.return_value = worker_ref
+        actors[1].setup_worker.remote.side_effect = primary
+
+        with (
+            patch.object(hash_shuffle, "placement_group", return_value=placement),
+            patch.object(hash_shuffle, "GPUShuffleActor") as actor_cls,
+            patch.object(hash_shuffle.ray, "get"),
+            patch.object(hash_shuffle.ray, "cancel") as cancel,
+            patch.object(hash_shuffle.ray, "kill") as kill,
+            patch.object(hash_shuffle, "remove_placement_group") as remove,
+            pytest.raises(RuntimeError, match="setup submission failed") as raised,
+        ):
+            actor_cls.options.return_value.remote.side_effect = actors
+            pool.activate()
+
+        assert raised.value is primary
+        assert [item.args[0] for item in cancel.call_args_list] == [
+            *root_refs,
+            worker_ref,
+        ]
+        assert [item.args[0] for item in kill.call_args_list] == actors
+        remove.assert_called_once_with(placement)
+        assert not pool.is_ready
+        assert not pool.owns_resources
+
+    def test_managed_failure_preserves_primary_and_retries_failed_cleanup(self):
+        pool = self._make_pool(nranks=2)
+        placement_ready_ref = MagicMock(name="placement_ready")
+        refs = [MagicMock(name=f"ref_{index}") for index in range(4)]
+        actors = [MagicMock(name=f"actor_{index}") for index in range(2)]
+        placement = MagicMock(name="placement_group")
+        placement.ready.return_value = placement_ready_ref
+        actors[0].setup_root.options.return_value.remote.return_value = tuple(refs[:2])
+        for actor, ref in zip(actors, refs[2:]):
+            actor.setup_worker.remote.return_value = ref
+        primary = RuntimeError("rank setup failed")
+        events = []
+
+        def cancel(ref, *, force):
+            events.append(("cancel", ref))
+            if ref is refs[0]:
+                raise RuntimeError("cancel failed")
+
+        def kill(actor):
+            events.append(("kill", actor))
+            if actor is actors[0]:
+                raise RuntimeError("kill failed")
+
+        def remove(group):
+            events.append(("remove", group))
+            raise RuntimeError("remove failed")
+
+        with (
+            patch.object(hash_shuffle, "placement_group", return_value=placement),
+            patch.object(hash_shuffle, "GPUShuffleActor") as actor_cls,
+            patch.object(hash_shuffle.ray, "get", side_effect=[None, primary]),
+            patch.object(hash_shuffle.ray, "cancel", side_effect=cancel),
+            patch.object(hash_shuffle.ray, "kill", side_effect=kill),
+            patch.object(hash_shuffle, "remove_placement_group", side_effect=remove),
+            pytest.raises(RuntimeError, match="rank setup failed") as raised,
+        ):
+            actor_cls.options.return_value.remote.side_effect = actors
+            pool.activate()
+
+        assert raised.value is primary
+        assert events == [
+            ("cancel", refs[0]),
+            ("cancel", refs[1]),
+            ("cancel", refs[2]),
+            ("cancel", refs[3]),
+            ("kill", actors[0]),
+            ("kill", actors[1]),
+            ("remove", placement),
+        ]
+        assert pool._pending_setup_refs == [refs[0]]
+        assert pool.actors == [actors[0]]
+        assert pool._placement_group is placement
+        assert not pool.is_ready
+
+        with (
+            patch.object(hash_shuffle.ray, "cancel"),
+            patch.object(hash_shuffle.ray, "kill"),
+            patch.object(hash_shuffle, "remove_placement_group"),
+        ):
+            pool.shutdown()
+
+        assert not pool.owns_resources
+        assert not pool.is_ready
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +520,105 @@ class TestGPUShuffleOperatorConstructor:
         assert op._extraction_tasks == {}
         assert not op._finalization_started
         assert len(op._output_queue) == 0
+
+    def test_feature_off_uses_stock_rank_start(self):
+        op = self._make_op(nranks=2, num_partitions=2)
+        with (
+            patch.object(op._rank_pool, "start") as legacy_start,
+            patch.object(op._rank_pool, "activate") as activate,
+        ):
+            op.start(op.data_context.execution_options, noop_counter())
+
+        legacy_start.assert_called_once_with()
+        activate.assert_not_called()
+
+    def test_managed_waiting_owner_starts_dormant(self):
+        op = self._make_op(nranks=2, num_partitions=2)
+        op._configure_gpu_handoff(initially_admitted=False)
+
+        with (
+            patch.object(op._rank_pool, "start") as legacy_start,
+            patch.object(op._rank_pool, "activate") as activate,
+        ):
+            op.start(op.data_context.execution_options, noop_counter())
+            legacy_start.assert_not_called()
+            activate.assert_not_called()
+            assert not op.can_add_input()
+
+            op._admit_gpu_handoff()
+            activate.assert_called_once_with()
+
+        assert not op.can_add_input()
+        op._rank_pool._ready = True
+        assert op.can_add_input()
+
+    def test_managed_initial_owner_activates_during_start(self):
+        op = self._make_op(nranks=2, num_partitions=2)
+        op._configure_gpu_handoff(initially_admitted=True)
+
+        with (
+            patch.object(op._rank_pool, "start") as legacy_start,
+            patch.object(op._rank_pool, "activate") as activate,
+        ):
+            op.start(op.data_context.execution_options, noop_counter())
+
+        legacy_start.assert_not_called()
+        activate.assert_called_once_with()
+
+    def test_managed_early_finished_waiting_owner_never_activates(self):
+        op = self._make_op(nranks=2, num_partitions=2)
+        op._configure_gpu_handoff(initially_admitted=False)
+
+        with patch.object(op._rank_pool, "activate") as activate:
+            op.mark_execution_finished()
+
+        activate.assert_not_called()
+        assert not op._rank_pool.owns_resources
+        assert op.has_completed()
+
+    def test_managed_natural_release_preserves_queued_output(self):
+        op = self._make_op(nranks=1, num_partitions=1)
+        op._configure_gpu_handoff(initially_admitted=True)
+        op._rank_pool._managed = True
+        op._rank_pool._ready = True
+        op._rank_pool._actors = [MagicMock()]
+        op._inputs_complete = True
+        op._finalization_started = True
+        bundle = _make_bundle()
+        op._output_queue.add(bundle, key=0)
+        op._output_queue.finalize(key=0)
+        op._reduce_metrics.on_output_queued(bundle)
+
+        with patch.object(hash_shuffle.ray, "kill"):
+            assert op._release_gpu_handoff_resources()
+
+        assert op.has_next()
+        assert op.get_next() is bundle
+
+    def test_managed_partial_release_closes_submission_gate(self):
+        op = self._make_op(nranks=1, num_partitions=1)
+        op._configure_gpu_handoff(initially_admitted=True)
+        op._rank_pool._managed = True
+        op._rank_pool._ready = True
+        op._rank_pool._actors = [MagicMock()]
+        op._rank_pool._placement_group = MagicMock()
+        op._inputs_complete = True
+
+        with (
+            patch.object(hash_shuffle.ray, "kill", side_effect=RuntimeError),
+            patch.object(
+                hash_shuffle,
+                "remove_placement_group",
+                side_effect=RuntimeError,
+            ),
+        ):
+            assert not op._release_gpu_handoff_resources()
+
+        assert not op.can_add_input()
+        assert not op._rank_pool.is_ready
+        assert not op._finalization_started
+        assert not op.has_next()
+        assert not op._finalization_started
 
 
 # ---------------------------------------------------------------------------

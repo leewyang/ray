@@ -38,6 +38,8 @@ from ray.data._internal.execution.operators.sub_progress import SubProgressBarMi
 from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data.block import Block, BlockAccessor, BlockStats, to_stats
 from ray.data.context import DataContext
+from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 if typing.TYPE_CHECKING:
     from ray.data._internal.execution.block_ref_counter import BlockRefCounter
@@ -231,6 +233,7 @@ class GPURankPool:
         actor_kwargs: Dict[str, Any],
         log_label: str,
         label_selector: Optional[Dict[str, str]] = None,
+        gpu_handoff_compatible: bool = False,
     ) -> None:
         self._nranks = nranks
         self._total_nparts = total_nparts
@@ -239,12 +242,28 @@ class GPURankPool:
         self._actor_kwargs = actor_kwargs
         self._log_label = log_label
         self._label_selector = label_selector
+        self._gpu_handoff_compatible = gpu_handoff_compatible
         self._actors: List[ActorHandle] = []
         self._shutdown: bool = False
+
+        self._managed = False
+        self._ready = False
+        self._placement_group = None
+        self._pending_setup_refs: List[ray.ObjectRef] = []
+
+    @property
+    def is_ready(self) -> bool:
+        return self._ready
 
     @property
     def is_shutdown(self) -> bool:
         return self._shutdown
+
+    @property
+    def owns_resources(self) -> bool:
+        return self._placement_group is not None or bool(
+            self._actors or self._pending_setup_refs
+        )
 
     @property
     def nranks(self) -> int:
@@ -255,6 +274,7 @@ class GPURankPool:
         return self._actors
 
     def start(self) -> None:
+        """Start the stock independent-SPREAD actor pool."""
         timeout = self._setup_timeout_s
         t_start = time.perf_counter()
 
@@ -322,17 +342,130 @@ class GPURankPool:
             t_done - t_root,
             t_done - t_start,
         )
+        self._ready = True
+
+    def activate(self) -> None:
+        """Start all managed ranks atomically after placement-group readiness."""
+        if self._ready or self._managed or self.owns_resources:
+            raise RuntimeError(f"{self._log_label} cannot be activated again")
+        assert not self._label_selector, (
+            "Managed rank-pool label selectors must be rejected during preflight"
+        )
+
+        self._managed = True
+        self._shutdown = False
+        try:
+            self._placement_group = placement_group(
+                bundles=[{"CPU": 1, "GPU": 1} for _ in range(self._nranks)],
+                strategy="SPREAD",
+            )
+            self._pending_setup_refs = [self._placement_group.ready()]
+            ray.get(list(self._pending_setup_refs))
+            self._pending_setup_refs.clear()
+            setup_started_at = time.perf_counter()
+
+            actor_cls = self._actor_cls_factory()
+            for rank in range(self._nranks):
+                strategy = PlacementGroupSchedulingStrategy(
+                    placement_group=self._placement_group,
+                    placement_group_bundle_index=rank,
+                    placement_group_capture_child_tasks=False,
+                )
+                self._actors.append(
+                    actor_cls.options(
+                        num_cpus=1,
+                        num_gpus=1,
+                        scheduling_strategy=strategy,
+                    ).remote(
+                        nranks=self._nranks,
+                        total_nparts=self._total_nparts,
+                        **self._actor_kwargs,
+                    )
+                )
+
+            root_rank_ref, root_address_ref = (
+                self._actors[0].setup_root.options(num_returns=2).remote()
+            )
+            self._pending_setup_refs = [root_rank_ref, root_address_ref]
+            for actor in self._actors:
+                self._pending_setup_refs.append(
+                    actor.setup_worker.remote(root_address_ref)
+                )
+            remaining = max(
+                0, self._setup_timeout_s - (time.perf_counter() - setup_started_at)
+            )
+            try:
+                ray.get(list(self._pending_setup_refs), timeout=remaining)
+            except ray.exceptions.GetTimeoutError:
+                raise TimeoutError(
+                    f"{self._log_label} rank setup did not complete within "
+                    f"{self._setup_timeout_s}s. Check GPU/network health."
+                )
+            self._pending_setup_refs.clear()
+            self._ready = True
+        except BaseException:
+            self.shutdown()
+            raise
 
     def get_actor_for_block(self, block_idx: int) -> ActorHandle:
         """Round-robin distribution of input blocks across ranks."""
+        if self._managed and not self._ready:
+            raise RuntimeError(f"{self._log_label} is not ready for input")
         return self._actors[block_idx % self._nranks]
 
     def shutdown(self, force: bool = False) -> None:
-        if force:
-            for actor in self._actors:
+        if not self._managed:
+            if force:
+                for actor in self._actors:
+                    ray.kill(actor)
+            self._actors.clear()
+            self._shutdown = True
+            self._ready = False
+            return
+
+        self._ready = False
+        self._cleanup_managed_resources()
+        if not self.owns_resources:
+            self._shutdown = True
+
+    def _cleanup_managed_resources(self) -> None:
+        remaining_refs = []
+        for ref in self._pending_setup_refs:
+            try:
+                ray.cancel(ref, force=False)
+            except BaseException:
+                remaining_refs.append(ref)
+                logger.warning(
+                    "%s: failed to cancel a rank setup operation.",
+                    self._log_label,
+                    exc_info=True,
+                )
+        self._pending_setup_refs = remaining_refs
+
+        remaining_actors = []
+        for actor in self._actors:
+            try:
                 ray.kill(actor)
-        self._actors.clear()
-        self._shutdown = True
+            except BaseException:
+                remaining_actors.append(actor)
+                logger.warning(
+                    "%s: failed to kill a rank actor.",
+                    self._log_label,
+                    exc_info=True,
+                )
+        self._actors = remaining_actors
+
+        if self._placement_group is not None:
+            try:
+                remove_placement_group(self._placement_group)
+            except BaseException:
+                logger.warning(
+                    "%s: failed to remove the rank placement group.",
+                    self._log_label,
+                    exc_info=True,
+                )
+            else:
+                self._placement_group = None
 
     def _wait_for_refs_with_timeout(
         self,
@@ -468,7 +601,10 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
             },
             log_label="GPUShufflePool",
             label_selector=data_context.execution_options.label_selector,
+            gpu_handoff_compatible=True,
         )
+        self._gpu_handoff_managed = False
+        self._gpu_handoff_admitted = False
 
         self._next_block_idx: int = 0
         self._insert_tasks: Dict[int, MetadataOpTask] = {}
@@ -496,7 +632,35 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         block_ref_counter: "BlockRefCounter",
     ) -> None:
         super().start(options, block_ref_counter)
-        self._rank_pool.start()
+        if not self._gpu_handoff_managed:
+            self._rank_pool.start()
+        elif self._gpu_handoff_admitted:
+            self._rank_pool.activate()
+
+    def _configure_gpu_handoff(self, initially_admitted: bool) -> None:
+        assert not self._started
+        assert type(self._rank_pool) is GPURankPool
+        self._gpu_handoff_managed = True
+        self._gpu_handoff_admitted = initially_admitted
+
+    def _admit_gpu_handoff(self) -> None:
+        assert self._gpu_handoff_managed
+        if self._gpu_handoff_admitted:
+            return
+        self._gpu_handoff_admitted = True
+        if self._started:
+            self._rank_pool.activate()
+
+    def _release_gpu_handoff_resources(self) -> bool:
+        assert self._gpu_handoff_managed
+        self._gpu_handoff_admitted = False
+        self._rank_pool.shutdown()
+        return not self._rank_pool.owns_resources
+
+    def can_add_input(self) -> bool:
+        if not self._gpu_handoff_managed:
+            return True
+        return self._gpu_handoff_admitted and self._rank_pool.is_ready
 
     def _add_input_inner(self, bundle: RefBundle, input_index: int) -> None:
         self._shuffle_metrics.on_input_received(bundle)
@@ -536,7 +700,11 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
 
     def _try_finalize(self) -> None:
         """Schedule extraction once all inserts have completed."""
-        if self._finalization_started or not self._is_inserting_done():
+        if (
+            self._finalization_started
+            or not self._is_inserting_done()
+            or (self._gpu_handoff_managed and not self._rank_pool.is_ready)
+        ):
             return
 
         self._finalization_started = True
@@ -618,8 +786,11 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         ) -> None:
             self._extraction_tasks.pop(rank, None)
             if not self._extraction_tasks:
-                # release GPU actors so downstream operators can acquire those GPUs
-                self._rank_pool.shutdown()
+                # Stock execution releases ranks as soon as extraction ends.
+                # Managed execution releases them from the policy's
+                # has_execution_finished() transition instead.
+                if not self._gpu_handoff_managed:
+                    self._rank_pool.shutdown()
 
         for rank_idx, actor in enumerate(self._rank_pool.actors):
             block_gen = actor.finish_and_extract.options(
@@ -661,15 +832,37 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         return list(self._insert_tasks.values()) + list(self._extraction_tasks.values())
 
     def has_completed(self) -> bool:
-        return (
+        stock_completed = (
             self._finalization_started
             and len(self._extraction_tasks) == 0
+            and super().has_completed()
+        )
+        if not self._gpu_handoff_managed:
+            return stock_completed
+        return (
+            (self._is_execution_marked_finished or self._finalization_started)
+            and not self._extraction_tasks
+            and not self._rank_pool.owns_resources
             and super().has_completed()
         )
 
     # ------------------------------------------------------------------
     # Shutdown
     # ------------------------------------------------------------------
+
+    def mark_execution_finished(self) -> None:
+        super().mark_execution_finished()
+        if not self._gpu_handoff_managed:
+            return
+        try:
+            self._cancel_active_tasks(force=False)
+        finally:
+            try:
+                self._rank_pool.shutdown()
+            finally:
+                self._insert_tasks.clear()
+                self._extraction_tasks.clear()
+                self._output_queue.clear()
 
     def _do_shutdown(self, force: bool = False) -> None:
         self._rank_pool.shutdown(force=True)
@@ -683,6 +876,10 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
 
     def current_logical_usage(self) -> ExecutionResources:
         pool = self._rank_pool
+        if self._gpu_handoff_managed:
+            if not pool.owns_resources:
+                return ExecutionResources.zero()
+            return ExecutionResources(cpu=pool.nranks, gpu=pool.nranks)
         if pool.is_shutdown:
             return ExecutionResources(gpu=0)
         gpus = len(pool.actors) or pool.nranks
@@ -690,9 +887,16 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
 
     @property
     def base_resource_usage(self) -> ExecutionResources:
+        if self._gpu_handoff_managed:
+            return ExecutionResources(
+                cpu=self._rank_pool.nranks,
+                gpu=self._rank_pool.nranks,
+            )
         return ExecutionResources(gpu=self._rank_pool.nranks)
 
     def incremental_resource_usage(self) -> ExecutionResources:
+        if self._gpu_handoff_managed:
+            return ExecutionResources.zero()
         return ExecutionResources(gpu=1)
 
     def get_actor_info(self) -> "ActorPoolInfo":

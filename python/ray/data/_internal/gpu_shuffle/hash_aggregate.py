@@ -1653,6 +1653,7 @@ class GPUHashAggregateOperator(GPUShuffleOperator):
             },
             log_label="GPUHashAggregatePool",
             label_selector=data_context.execution_options.label_selector,
+            gpu_handoff_compatible=True,
         )
 
         super().__init__(
