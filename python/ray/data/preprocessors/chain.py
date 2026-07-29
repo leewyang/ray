@@ -301,6 +301,7 @@ class Chain(SerializablePreprocessorBase):
                     columns=preprocessor.columns,
                     encode_lists=preprocessor.encode_lists,
                     output_columns=preprocessor.output_columns,
+                    min_evidence=preprocessor.min_evidence,
                     batch_size=gpu_batch_size,
                     num_gpus_per_worker=num_gpus_per_worker,
                     concurrency=concurrency,

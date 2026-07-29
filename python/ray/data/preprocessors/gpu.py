@@ -1737,6 +1737,7 @@ class GPUOrdinalEncoder(GPUPreprocessor):
         encoded_missing_value: Optional[Number] = None,
         output_dtype: Optional[Any] = None,
         encoded_value_offset: int = 0,
+        min_evidence: int = 1,
         batch_size: int = _DEFAULT_GPU_BATCH_SIZE,
         num_gpus_per_worker: float = 1,
         concurrency: Optional[int] = None,
@@ -1746,6 +1747,10 @@ class GPUOrdinalEncoder(GPUPreprocessor):
             num_gpus_per_worker=num_gpus_per_worker,
             concurrency=concurrency,
         )
+        if min_evidence < 1:
+            raise ValueError(
+                f"`min_evidence` must be a positive integer, got {min_evidence!r}."
+            )
         self._columns = columns
         self._encode_lists = encode_lists
         self._output_columns = Preprocessor._derive_and_validate_output_columns(
@@ -1755,6 +1760,7 @@ class GPUOrdinalEncoder(GPUPreprocessor):
         self._encoded_missing_value = encoded_missing_value
         self._output_dtype = output_dtype
         self._encoded_value_offset = encoded_value_offset
+        self._min_evidence = min_evidence
         self._gpu_maps: Dict[str, Dict[Any, int]] = {}
 
     @property
@@ -1784,6 +1790,10 @@ class GPUOrdinalEncoder(GPUPreprocessor):
     @property
     def encoded_value_offset(self) -> int:
         return self._encoded_value_offset
+
+    @property
+    def min_evidence(self) -> int:
+        return self._min_evidence
 
     def _supports_gpu_combined_fit(self) -> bool:
         return True
@@ -1818,9 +1828,14 @@ class GPUOrdinalEncoder(GPUPreprocessor):
 
         self.stats_ = {}
         for column in self._columns:
+            retained_values = (
+                value
+                for value, count in counters[column].items()
+                if count >= self._min_evidence
+            )
             self.stats_[f"unique_values({column})"] = {
                 value: index + self._encoded_value_offset
-                for index, value in enumerate(sorted(counters[column]))
+                for index, value in enumerate(sorted(retained_values))
             }
         self._gpu_maps = {}
 
@@ -1891,6 +1906,7 @@ class GPUOrdinalEncoder(GPUPreprocessor):
             "encoded_missing_value": self._encoded_missing_value,
             "output_dtype": self._output_dtype,
             "encoded_value_offset": self._encoded_value_offset,
+            "min_evidence": self._min_evidence,
         }
 
     def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
@@ -1902,6 +1918,7 @@ class GPUOrdinalEncoder(GPUPreprocessor):
         self._encoded_missing_value = fields.get("encoded_missing_value")
         self._output_dtype = fields.get("output_dtype")
         self._encoded_value_offset = fields.get("encoded_value_offset", 0)
+        self._min_evidence = fields.get("min_evidence", 1)
         self._gpu_maps = {}
 
     def __repr__(self) -> str:
@@ -1912,7 +1929,8 @@ class GPUOrdinalEncoder(GPUPreprocessor):
             f"unknown_value={self._unknown_value!r}, "
             f"encoded_missing_value={self._encoded_missing_value!r}, "
             f"output_dtype={self._output_dtype!r}, "
-            f"encoded_value_offset={self._encoded_value_offset!r})"
+            f"encoded_value_offset={self._encoded_value_offset!r}, "
+            f"min_evidence={self._min_evidence!r})"
         )
 
 

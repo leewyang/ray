@@ -1319,23 +1319,29 @@ class ValueCounter(AggregateFnV2):
         on: The name of the column to count values in. Must be provided.
         alias_name: Optional name for the resulting column. If not provided,
             defaults to "value_counter({column_name})".
+        ignore_nulls: Whether to ignore null values when counting values.
+            Defaults to True.
     """
 
     def __init__(
         self,
         on: str,
         alias_name: Optional[str] = None,
+        *,
+        ignore_nulls: bool = True,
     ):
         super().__init__(
             alias_name if alias_name else f"value_counter({str(on)})",
             on=on,
-            ignore_nulls=True,
+            ignore_nulls=ignore_nulls,
             zero_factory=lambda: {"values": [], "counts": []},
         )
 
     def aggregate_block(self, block: Block) -> Dict[str, List]:
-
-        col_accessor = BlockColumnAccessor.for_column(block[self._target_col_name])
+        column = block[self._target_col_name]
+        col_accessor = BlockColumnAccessor.for_column(column)
+        if self._ignore_nulls:
+            col_accessor = BlockColumnAccessor.for_column(col_accessor.dropna())
         return col_accessor.value_counts()
 
     def combine(
