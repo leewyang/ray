@@ -7,6 +7,44 @@ import pytest
 
 import ray
 import ray.cluster_utils
+from ray.actor import _actor_resources_from_options
+
+
+@pytest.mark.parametrize(
+    "actor_options,expected_resources,expected_method_cpu",
+    [
+        ({}, {"CPU": 0}, 1),
+        ({"num_cpus": None, "num_gpus": None}, {"CPU": 0}, 1),
+        ({"memory": 1024}, {"memory": 1024, "CPU": 0}, 1),
+        (
+            {"object_store_memory": 1024},
+            {"object_store_memory": 1024, "CPU": 0},
+            1,
+        ),
+        ({"num_cpus": 0}, {"CPU": 0}, 0),
+        ({"num_cpus": 0.5}, {"CPU": 0.5}, 0),
+        ({"num_gpus": 0}, {"GPU": 0, "CPU": 1}, 0),
+        ({"num_gpus": 0.25}, {"GPU": 0.25, "CPU": 1}, 0),
+        (
+            {"num_cpus": 0.5, "num_gpus": 1},
+            {"CPU": 0.5, "GPU": 1},
+            0,
+        ),
+        ({"resources": {"custom": 0}}, {"custom": 0, "CPU": 1}, 0),
+        (
+            {"accelerator_type": "L4"},
+            {"accelerator_type:L4": 0.001, "CPU": 1},
+            0,
+        ),
+    ],
+)
+def test_actor_resources_from_options(
+    actor_options, expected_resources, expected_method_cpu
+):
+    resources, actor_method_cpu = _actor_resources_from_options(actor_options)
+
+    assert resources == expected_resources
+    assert actor_method_cpu == expected_method_cpu
 
 
 def test_actor_deletion_with_gpus(shutdown_only):

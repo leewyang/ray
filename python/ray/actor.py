@@ -88,6 +88,28 @@ _T8 = TypeVar("_T8")
 _T9 = TypeVar("_T9")
 
 
+def _actor_resources_from_options(
+    actor_options: Dict[str, Any],
+) -> Tuple[Dict[str, Any], int]:
+    """Return an actor's lifetime resources and default per-method CPU.
+
+    Heap and object-store memory don't make an actor use the "resources
+    specified" CPU defaults. This preserves Core's historical behavior.
+    """
+    resources = ray._common.utils.resources_from_ray_options(actor_options)
+    if not set(resources).difference({"memory", "object_store_memory"}):
+        resources.setdefault(
+            "CPU", ray_constants.DEFAULT_ACTOR_CREATION_CPU_SIMPLE
+        )
+        actor_method_cpu = ray_constants.DEFAULT_ACTOR_METHOD_CPU_SIMPLE
+    else:
+        resources.setdefault(
+            "CPU", ray_constants.DEFAULT_ACTOR_CREATION_CPU_SPECIFIED
+        )
+        actor_method_cpu = ray_constants.DEFAULT_ACTOR_METHOD_CPU_SPECIFIED
+    return resources, actor_method_cpu
+
+
 class _RemoteMethodNoArgs(Generic[_Ret]):
     def remote(self) -> "ObjectRef[_Ret]":
         ...
@@ -2026,27 +2048,7 @@ class ActorClass(Generic[T]):
             )
             meta.last_export_cluster_and_job = worker.current_cluster_and_job
 
-        resources = ray._common.utils.resources_from_ray_options(actor_options)
-        # Set the actor's default resources if not already set. First three
-        # conditions are to check that no resources were specified in the
-        # decorator. Last three conditions are to check that no resources were
-        # specified when _remote() was called.
-        # TODO(suquark): In the original code, memory is not considered as resources,
-        # when deciding the default CPUs. It is strange, but we keep the original
-        # semantics in case that it breaks user applications & tests.
-        if not set(resources.keys()).difference({"memory", "object_store_memory"}):
-            # In the default case, actors acquire no resources for
-            # their lifetime, and actor methods will require 1 CPU.
-            resources.setdefault("CPU", ray_constants.DEFAULT_ACTOR_CREATION_CPU_SIMPLE)
-            actor_method_cpu = ray_constants.DEFAULT_ACTOR_METHOD_CPU_SIMPLE
-        else:
-            # If any resources are specified (here or in decorator), then
-            # all resources are acquired for the actor's lifetime and no
-            # resources are associated with methods.
-            resources.setdefault(
-                "CPU", ray_constants.DEFAULT_ACTOR_CREATION_CPU_SPECIFIED
-            )
-            actor_method_cpu = ray_constants.DEFAULT_ACTOR_METHOD_CPU_SPECIFIED
+        resources, actor_method_cpu = _actor_resources_from_options(actor_options)
 
         # If the actor methods require CPU resources, then set the required
         # placement resources. If actor_placement_resources is empty, then
