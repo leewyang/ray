@@ -12,12 +12,14 @@ import ray
 from ray._private.accelerators import NvidiaGPUAcceleratorManager
 from ray.data import ActorPoolStrategy
 from ray.data._internal.execution.block_ref_counter import BlockRefCounter
-from ray.data._internal.execution.gpu_shuffle_startup import plan_gpu_shuffle_startup
+from ray.data._internal.execution.gpu_shuffle_startup_policy import (
+    derive_gpu_shuffle_segments,
+)
 from ray.data._internal.execution.operators.task_pool_map_operator import (
     TaskPoolMapOperator,
 )
 from ray.data._internal.execution.streaming_executor_state import (
-    ExecutionSegments,
+    ExecutionSegmentSpec,
     build_streaming_topology,
 )
 from ray.data._internal.logical.optimizers import get_execution_plan
@@ -114,7 +116,7 @@ def _configure_gpu_shuffle(context: DataContext) -> None:
     context.wait_for_min_actors_s = -1
 
 
-def _startup_plan(dataset) -> Optional[ExecutionSegments]:
+def _startup_segment_spec(dataset) -> Optional[ExecutionSegmentSpec]:
     physical_plan, _ = get_execution_plan(dataset._logical_plan)
     context = DataContext.get_current()
     topology = build_streaming_topology(
@@ -123,7 +125,7 @@ def _startup_plan(dataset) -> Optional[ExecutionSegments]:
         BlockRefCounter(add_object_out_of_scope_callback=lambda *_: True),
         start_operators=False,
     )
-    return plan_gpu_shuffle_startup(topology, context.execution_options)
+    return derive_gpu_shuffle_segments(topology, context.execution_options)
 
 
 def _materialize_with_timeout(
@@ -200,7 +202,7 @@ def test_task_map_to_full_rank_shuffle_without_intermediate_materialize(
         )
         .repartition(keys=["id"], num_blocks=_GPU_SHUFFLE_RANKS)
     )
-    assert _startup_plan(dataset) is not None
+    assert _startup_segment_spec(dataset) is not None
 
     result, _ = _materialize_with_timeout(dataset)
 
@@ -237,7 +239,7 @@ def test_fixed_gpu_actors_around_full_rank_shuffle_complete_and_release(
             num_gpus=1,
         )
     )
-    assert _startup_plan(dataset) is not None
+    assert _startup_segment_spec(dataset) is not None
 
     result, _ = _materialize_with_timeout(dataset)
 
@@ -267,7 +269,7 @@ def test_low_object_store_prefix_spills_and_completes(
         )
         .repartition(keys=["id"], num_blocks=_GPU_SHUFFLE_RANKS)
     )
-    assert _startup_plan(dataset) is not None
+    assert _startup_segment_spec(dataset) is not None
 
     result, _ = _materialize_with_timeout(dataset)
 
@@ -309,13 +311,13 @@ def test_multiple_gpu_task_stages_drain_under_single_task_capacity(
         )
         .repartition(keys=["id"], num_blocks=_GPU_SHUFFLE_RANKS)
     )
-    plan = _startup_plan(dataset)
-    assert plan is not None
+    segment_spec = _startup_segment_spec(dataset)
+    assert segment_spec is not None
     gpu_task_requests = [
-        op.get_static_ray_remote_args_for_planning()["num_gpus"]
-        for op in plan[0]
+        op.get_static_ray_remote_args()["num_gpus"]
+        for op in segment_spec[0]
         if type(op) is TaskPoolMapOperator
-        and op.get_static_ray_remote_args_for_planning().get("num_gpus", 0) > 0
+        and op.get_static_ray_remote_args().get("num_gpus", 0) > 0
     ]
     assert gpu_task_requests == [4, 3]
 
@@ -350,8 +352,8 @@ def test_actor_pool_and_shuffle_fit_uses_stock_startup_with_overlap(
     )
 
     # Four persistent map actors plus four shuffle ranks fit on this cluster,
-    # so the planner must preserve stock concurrent startup.
-    assert _startup_plan(dataset) is None
+    # so the startup policy must preserve stock concurrent startup.
+    assert _startup_segment_spec(dataset) is None
 
     result, observed_full_gpu_use = _materialize_with_timeout(
         dataset,

@@ -937,8 +937,8 @@ class PhysicalOperator(Operator):
         self._started = True
 
     @property
-    def is_started(self) -> bool:
-        """Whether this operator has completed its base startup."""
+    def has_started(self) -> bool:
+        """Whether this operator has entered its startup lifecycle."""
         return self._started
 
     def can_add_input(self) -> bool:

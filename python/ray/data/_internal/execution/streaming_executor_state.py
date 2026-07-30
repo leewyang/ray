@@ -56,22 +56,23 @@ logger = logging.getLogger(__name__)
 # Holds the full execution state of the streaming topology. It's a dict mapping each
 # operator to tracked streaming exec state.
 Topology = Dict[PhysicalOperator, "OpState"]
-ExecutionSegments = Tuple[Tuple[PhysicalOperator, ...], ...]
+ExecutionSegmentSpec = Tuple[Tuple[PhysicalOperator, ...], ...]
 
 
-def validate_execution_segments(
-    segments: ExecutionSegments, topology: Topology
+def validate_execution_segment_spec(
+    segment_spec: ExecutionSegmentSpec, topology: Topology
 ) -> None:
     """Validate contiguous operator slices executed in order.
 
-    Each segment must have one terminal operator. Planners are responsible for
-    ensuring that non-final segments can be safely materialized and released.
+    Each segment must have one terminal operator. The policy deriving a segment
+    specification is responsible for proving that non-final segments can be safely
+    materialized and released.
     """
-    flattened = [op for segment in segments for op in segment]
+    flattened = [op for segment in segment_spec for op in segment]
     if flattened != list(topology):
         raise ValueError("Execution segments must partition the topology in order")
-    for segment in segments:
-        terminal_operator_from_topology(dict.fromkeys(segment))
+    for segment in segment_spec:
+        terminal_operator_from_topology({op: topology[op] for op in segment})
 
 
 # Maximum time `process_completed_tasks` will block in `ray.wait()` waiting for tasks to complete.
@@ -623,16 +624,16 @@ def start_streaming_topology(
     block_ref_counter: BlockRefCounter,
 ) -> None:
     """Start an already-built topology in deterministic topological order."""
-    started = []
+    startup_attempts = []
     try:
         for op in topology:
-            started.append(op)
+            startup_attempts.append(op)
             op.start(options, block_ref_counter)
     except BaseException:
         timer = Timer()
-        for op in reversed(started):
+        for op in reversed(startup_attempts):
             try:
-                if op.is_started:
+                if op.has_started:
                     op.shutdown(timer, force=True)
             except BaseException:
                 logger.exception("Failed to roll back operator %s", op)

@@ -719,9 +719,9 @@ py_test(
 )
 
 py_test(
-    name = "test_gpu_shuffle_startup",
+    name = "test_gpu_shuffle_startup_policy",
     size = "small",
-    srcs = ["tests/test_gpu_shuffle_startup.py"],
+    srcs = ["tests/test_gpu_shuffle_startup_policy.py"],
     tags = [
         "exclusive",
         "team:data",

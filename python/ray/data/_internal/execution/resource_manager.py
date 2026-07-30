@@ -63,29 +63,24 @@ _BLOCKING_MATERIALIZING_OPERATORS = (
 
 
 def terminal_operator_from_topology(topology: "Topology") -> PhysicalOperator:
-    """Return the executor sink: the unique op with no in-DAG downstream consumers.
-
-    ``build_streaming_topology`` is rooted at the same node passed to
-    ``StreamingExecutor``; that root is the only operator whose
-    ``output_dependencies`` is empty.
-    """
+    """Return the unique operator with no downstream dependency in ``topology``."""
     if not topology:
         raise ValueError("topology must be non-empty")
-    sinks = [
+    terminal_operators = [
         op
         for op in topology
         if not any(dep in topology for dep in op.output_dependencies)
     ]
-    if len(sinks) == 1:
-        return sinks[0]
-    if not sinks:
+    if len(terminal_operators) == 1:
+        return terminal_operators[0]
+    if not terminal_operators:
         raise ValueError(
             "No terminal operator found in topology (expected exactly one "
-            "operator with empty output_dependencies)"
+            "operator without downstream dependencies in the topology)"
         )
     raise ValueError(
         "Expected exactly one terminal operator in topology, found "
-        f"{len(sinks)}: {sinks!r}"
+        f"{len(terminal_operators)}: {terminal_operators!r}"
     )
 
 
@@ -116,7 +111,7 @@ class ResourceManager:
         block_ref_counter: BlockRefCounter,
         *,
         output_operator: Optional[PhysicalOperator] = None,
-        forced_materializing_op: Optional[PhysicalOperator] = None,
+        materialization_boundary: Optional[PhysicalOperator] = None,
     ):
         self._topology = topology
         self._options = options
@@ -150,7 +145,7 @@ class ResourceManager:
         self._output_operator = output_operator or terminal_operator_from_topology(
             topology
         )
-        self._forced_materializing_op = forced_materializing_op
+        self._materialization_boundary = materialization_boundary
 
         self._block_ref_counter = block_ref_counter
 
@@ -452,10 +447,10 @@ class ResourceManager:
 
     def should_force_drain_output(self, op: PhysicalOperator) -> bool:
         """Whether this temporary segment boundary must materialize all output."""
-        return op is self._forced_materializing_op
+        return op is self._materialization_boundary
 
-    def set_forced_materializing_op(self, op: Optional[PhysicalOperator]) -> None:
-        self._forced_materializing_op = op
+    def set_materialization_boundary(self, op: Optional[PhysicalOperator]) -> None:
+        self._materialization_boundary = op
 
     def _get_downstream_ineligible_ops(
         self, op: PhysicalOperator
@@ -545,7 +540,7 @@ class ResourceManager:
         """
 
         # Check if Op itself is a blocking, materializing operator
-        if op is self._forced_materializing_op or isinstance(
+        if op is self._materialization_boundary or isinstance(
             op, _BLOCKING_MATERIALIZING_OPERATORS
         ):
             return True

@@ -289,7 +289,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         self._on_start: Optional[Callable[[Optional["pa.Schema"]], None]] = on_start
         self._on_start_called = False
 
-    def get_static_ray_remote_args_for_planning(self) -> Optional[Dict[str, Any]]:
+    def get_static_ray_remote_args(self) -> Optional[Dict[str, Any]]:
         """Return base options when no user-supplied dynamic callback exists.
 
         Ray's physical optimizer may still add a framework-owned dynamic memory

@@ -17,7 +17,9 @@ from ray.data._internal.execution.backpressure_policy import (
 from ray.data._internal.execution.block_ref_counter import BlockRefCounter
 from ray.data._internal.execution.dataset_state import DatasetState
 from ray.data._internal.execution.execution_callback import ExecutionCallback
-from ray.data._internal.execution.gpu_shuffle_startup import plan_gpu_shuffle_startup
+from ray.data._internal.execution.gpu_shuffle_startup_policy import (
+    derive_gpu_shuffle_segments,
+)
 from ray.data._internal.execution.interfaces import (
     Executor,
     OutputIterator,
@@ -43,7 +45,7 @@ from ray.data._internal.execution.streaming_executor_state import (
     select_operator_to_run,
     start_streaming_topology,
     update_operator_states,
-    validate_execution_segments,
+    validate_execution_segment_spec,
 )
 from ray.data._internal.logging import (
     get_log_directory,
@@ -139,9 +141,11 @@ class StreamingExecutor(Executor, threading.Thread):
         # loop on a separate thread so that it doesn't become stalled between
         # generator `yield`s.
         self._topology: Optional[Topology] = None
-        self._active_topology: Optional[Topology] = None
-        self._execution_segments: List[Topology] = []
-        self._active_segment_index = 0
+        # Subset of the full topology published to scheduling and resource consumers.
+        # It grows as later segments start.
+        self._scheduling_topology: Optional[Topology] = None
+        self._segment_topologies: List[Topology] = []
+        self._current_segment_index = 0
         self._output_node: Optional[Tuple[PhysicalOperator, OpState]] = None
         self._backpressure_policies: List[BackpressurePolicy] = []
         self._op_schema: Dict[PhysicalOperator, Schema] = {}
@@ -241,36 +245,35 @@ class StreamingExecutor(Executor, threading.Thread):
             self._block_ref_counter,
             start_operators=False,
         )
-        planned_segments = plan_gpu_shuffle_startup(self._topology, self._options)
-        if planned_segments is None:
-            self._execution_segments = [self._topology]
-            self._active_topology = self._topology
+        segment_spec = derive_gpu_shuffle_segments(self._topology, self._options)
+        if segment_spec is None:
+            self._segment_topologies = [self._topology]
+            self._scheduling_topology = self._topology
         else:
-            validate_execution_segments(planned_segments, self._topology)
-            self._execution_segments = [
-                {op: self._topology[op] for op in segment}
-                for segment in planned_segments
+            validate_execution_segment_spec(segment_spec, self._topology)
+            self._segment_topologies = [
+                {op: self._topology[op] for op in segment} for segment in segment_spec
             ]
-            self._active_topology = dict(self._execution_segments[0])
+            self._scheduling_topology = dict(self._segment_topologies[0])
         start_streaming_topology(
-            self._active_topology, self._options, self._block_ref_counter
+            self._scheduling_topology, self._options, self._block_ref_counter
         )
 
-        producer = self._segment_output_to_materialize()
+        materialization_boundary = self._current_materialization_boundary()
         self._resource_manager = ResourceManager(
-            self._active_topology,
+            self._scheduling_topology,
             self._options,
             lambda: self._cluster_autoscaler.get_total_resources(),
             self._data_context,
             self._block_ref_counter,
             output_operator=dag,
-            forced_materializing_op=producer,
+            materialization_boundary=materialization_boundary,
         )
 
         # Constructed once per executor (not per scheduling iteration) so the
         # guard's idle-detection state accumulates across scheduling iterations.
         self._output_backpressure_guard = OutputBackpressureGuard(
-            self._active_topology,
+            self._scheduling_topology,
             self._resource_manager,
         )
 
@@ -284,16 +287,16 @@ class StreamingExecutor(Executor, threading.Thread):
         self._progress_manager.start()
 
         self._backpressure_policies = get_backpressure_policies(
-            self._data_context, self._active_topology, self._resource_manager
+            self._data_context, self._scheduling_topology, self._resource_manager
         )
         self._cluster_autoscaler = create_cluster_autoscaler(
-            self._active_topology,
+            self._scheduling_topology,
             self._resource_manager,
             self._data_context,
             execution_id=self._dataset_id,
         )
         self._actor_autoscaler = create_actor_autoscaler(
-            self._active_topology,
+            self._scheduling_topology,
             self._resource_manager,
             config=self._data_context.autoscaling_config,
         )
@@ -390,7 +393,7 @@ class StreamingExecutor(Executor, threading.Thread):
             timer = Timer()
 
             for op in self._topology.keys():
-                if op.is_started:
+                if op.has_started:
                     op.shutdown(timer, force=force)
 
             self._clear_topology_queues_post_shutdown(force, exception)
@@ -433,7 +436,7 @@ class StreamingExecutor(Executor, threading.Thread):
     ) -> None:
         """Drain topology queues after operator shutdown (releases block refs)."""
         for op, state in self._topology.items():
-            if op.is_started and isinstance(op, InternalQueueOperatorMixin):
+            if op.has_started and isinstance(op, InternalQueueOperatorMixin):
                 op.clear_internal_input_queue()
                 op.clear_internal_output_queue()
             # Input queues alias upstream output queues; clears the DAG except the sink.
@@ -461,7 +464,7 @@ class StreamingExecutor(Executor, threading.Thread):
                 # Use `perf_counter` rather than `process_time` to ensure we include
                 # time spent on IO, like RPCs to Ray Core.
                 t_start = time.perf_counter()
-                continue_sched = self._scheduling_loop_step(self._active_topology)
+                continue_sched = self._scheduling_loop_step(self._scheduling_topology)
 
                 sched_loop_duration = time.perf_counter() - t_start
 
@@ -476,7 +479,7 @@ class StreamingExecutor(Executor, threading.Thread):
                 if self._shutdown:
                     break
                 if not continue_sched:
-                    if self._maybe_start_next_segment():
+                    if self._advance_to_next_segment():
                         continue
                     break
         except Exception as e:
@@ -487,16 +490,17 @@ class StreamingExecutor(Executor, threading.Thread):
             _, state = self._output_node
             state.mark_finished(exc)
 
-    def _segment_output_to_materialize(self) -> Optional[PhysicalOperator]:
-        if self._active_segment_index + 1 == len(self._execution_segments):
+    def _current_materialization_boundary(self) -> Optional[PhysicalOperator]:
+        if self._current_segment_index + 1 == len(self._segment_topologies):
             return None
         return terminal_operator_from_topology(
-            self._execution_segments[self._active_segment_index]
+            self._segment_topologies[self._current_segment_index]
         )
 
-    def _maybe_start_next_segment(self) -> bool:
-        next_index = self._active_segment_index + 1
-        if next_index == len(self._execution_segments):
+    def _advance_to_next_segment(self) -> bool:
+        """Release the completed segment and start the next segment, if any."""
+        next_segment_index = self._current_segment_index + 1
+        if next_segment_index == len(self._segment_topologies):
             return False
 
         with self._shutdown_lock:
@@ -504,21 +508,21 @@ class StreamingExecutor(Executor, threading.Thread):
                 return False
 
             timer = Timer()
-            for op in reversed(self._execution_segments[self._active_segment_index]):
+            for op in reversed(self._segment_topologies[self._current_segment_index]):
                 op.shutdown(timer, force=False)
 
-            next_segment = self._execution_segments[next_index]
+            next_segment_topology = self._segment_topologies[next_segment_index]
             start_streaming_topology(
-                next_segment, self._options, self._block_ref_counter
+                next_segment_topology, self._options, self._block_ref_counter
             )
-            self._active_topology.update(next_segment)
-            self._active_segment_index = next_index
-            self._resource_manager.set_forced_materializing_op(
-                self._segment_output_to_materialize()
+            self._scheduling_topology.update(next_segment_topology)
+            self._current_segment_index = next_segment_index
+            self._resource_manager.set_materialization_boundary(
+                self._current_materialization_boundary()
             )
             self._backpressure_policies = get_backpressure_policies(
                 self._data_context,
-                self._active_topology,
+                self._scheduling_topology,
                 self._resource_manager,
             )
             return True

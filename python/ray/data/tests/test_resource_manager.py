@@ -735,7 +735,7 @@ class TestResourceManager:
             noop_counter(),
             start_operators=False,
         )
-        active_topology = {
+        scheduling_topology = {
             source: full_topology[source],
             boundary: full_topology[boundary],
         }
@@ -752,7 +752,7 @@ class TestResourceManager:
             op.pending_logical_usage = MagicMock(return_value=ExecutionResources.zero())
 
         resource_manager = ResourceManager(
-            active_topology,
+            scheduling_topology,
             ExecutionOptions(),
             lambda: ExecutionResources(cpu=4, object_store_memory=1_000),
             DataContext.get_current(),
@@ -767,15 +767,15 @@ class TestResourceManager:
         assert resource_manager.get_mem_op_outputs(boundary) == 20
         assert resource_manager.get_op_usage(boundary).object_store_memory == 30
 
-        # ResourceManager retains the mutable active topology. Once the suffix is
+        # ResourceManager retains the mutable scheduling topology. Once the suffix is
         # activated, the same manager charges prefetch to the full DAG output.
-        active_topology[output] = full_topology[output]
+        scheduling_topology[output] = full_topology[output]
         resource_manager.update_usages()
         assert resource_manager.get_mem_op_outputs(boundary) == 20
         assert resource_manager.get_mem_op_outputs(output) == 140
         assert resource_manager.get_op_usage(output).object_store_memory == 170
 
-    def test_segment_traversal_stops_at_active_topology_boundary(
+    def test_segment_traversal_stops_at_scheduling_topology_boundary(
         self, restore_data_context
     ):
         source = InputDataBuffer(DataContext.get_current(), [])
@@ -788,16 +788,16 @@ class TestResourceManager:
             noop_counter(),
             start_operators=False,
         )
-        active_topology = {
+        scheduling_topology = {
             source: full_topology[source],
             producer: full_topology[producer],
             passthrough: full_topology[passthrough],
         }
 
-        assert terminal_operator_from_topology(active_topology) is passthrough
+        assert terminal_operator_from_topology(scheduling_topology) is passthrough
 
         resource_manager = ResourceManager(
-            active_topology,
+            scheduling_topology,
             ExecutionOptions(),
             MagicMock(return_value=ExecutionResources.zero()),
             DataContext.get_current(),
@@ -811,7 +811,7 @@ class TestResourceManager:
         assert list(resource_manager.get_downstream_eligible_ops(producer)) == []
         assert not resource_manager.is_op_eligible(inactive)
 
-    def test_forced_materializer_has_unbounded_output_budget(
+    def test_materialization_boundary_has_unbounded_output_budget(
         self, restore_data_context
     ):
         source = InputDataBuffer(DataContext.get_current(), [])
@@ -828,7 +828,7 @@ class TestResourceManager:
             lambda: ExecutionResources(cpu=4, object_store_memory=1_000),
             DataContext.get_current(),
             BlockRefCounter(add_object_out_of_scope_callback=lambda *_: True),
-            forced_materializing_op=producer,
+            materialization_boundary=producer,
         )
 
         resource_manager.update_usages()
@@ -987,7 +987,7 @@ class TestResourceManager:
 class TestOutputBackpressureGuard:
     """Tests for OutputBackpressureGuard.should_unblock."""
 
-    def test_force_drain_unblocks_active_segment_boundary(
+    def test_force_drain_unblocks_materialization_boundary(
         self, restore_data_context
     ):
         source = InputDataBuffer(DataContext.get_current(), [])
@@ -999,12 +999,12 @@ class TestOutputBackpressureGuard:
             noop_counter(),
             start_operators=False,
         )
-        active_topology = {
+        scheduling_topology = {
             source: full_topology[source],
             producer: full_topology[producer],
         }
         resource_manager = ResourceManager(
-            active_topology,
+            scheduling_topology,
             ExecutionOptions(),
             MagicMock(return_value=ExecutionResources.zero()),
             DataContext.get_current(),
@@ -1013,10 +1013,10 @@ class TestOutputBackpressureGuard:
         )
 
         assert not resource_manager.should_force_drain_output(producer)
-        resource_manager.set_forced_materializing_op(producer)
+        resource_manager.set_materialization_boundary(producer)
         assert resource_manager.should_force_drain_output(producer)
         assert not resource_manager.should_force_drain_output(inactive)
-        guard = OutputBackpressureGuard(active_topology, resource_manager)
+        guard = OutputBackpressureGuard(scheduling_topology, resource_manager)
         assert guard.should_unblock(producer)
 
     def test_unblock_backpressure_terminal_operator(self, restore_data_context):

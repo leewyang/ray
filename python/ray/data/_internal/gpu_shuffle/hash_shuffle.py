@@ -256,12 +256,12 @@ class GPURankPool:
 
     def start(self) -> None:
         try:
-            self._start()
+            self._start_impl()
         except BaseException:
             self.shutdown(force=True)
             raise
 
-    def _start(self) -> None:
+    def _start_impl(self) -> None:
         timeout = self._setup_timeout_s
         t_start = time.perf_counter()
 
@@ -465,6 +465,7 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         self._num_partitions = target_num_partitions
         self._columns = columns
         self._should_sort = should_sort
+        self._uses_default_rank_pool = rank_pool is None
         self._rank_pool = rank_pool or GPURankPool(
             nranks=nranks,
             total_nparts=target_num_partitions,
@@ -509,10 +510,11 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         super().start(options, block_ref_counter)
         self._rank_pool.start()
 
-    def get_rank_pool_size_if_default(self) -> Optional[int]:
-        """Return the rank count when this operator uses the default rank pool."""
+    def get_default_rank_count(self) -> Optional[int]:
+        """Return the rank count when using the default operator and rank pool."""
         if (
             type(self) is not GPUShuffleOperator
+            or not self._uses_default_rank_pool
             or type(self._rank_pool) is not GPURankPool
         ):
             return None

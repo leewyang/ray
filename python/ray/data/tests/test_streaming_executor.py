@@ -66,7 +66,7 @@ from ray.data._internal.execution.streaming_executor_state import (
     select_operator_to_run,
     start_streaming_topology,
     update_operator_states,
-    validate_execution_segments,
+    validate_execution_segment_spec,
 )
 from ray.data._internal.execution.util import make_ref_bundles
 from ray.data._internal.logical.operators import (
@@ -168,10 +168,10 @@ def _make_segmented_lifecycle_executor(*segments):
         op._output_dependencies = (
             [] if index == len(operators) - 1 else [operators[index + 1]]
         )
-    executor._execution_segments = [dict.fromkeys(segment) for segment in segments]
-    executor._active_segment_index = 0
-    executor._active_topology = dict(executor._execution_segments[0])
-    return executor, executor._execution_segments
+    executor._segment_topologies = [dict.fromkeys(segment) for segment in segments]
+    executor._current_segment_index = 0
+    executor._scheduling_topology = dict(executor._segment_topologies[0])
+    return executor, executor._segment_topologies
 
 
 def _make_run_loop_executor(schedule_results):
@@ -180,7 +180,7 @@ def _make_run_loop_executor(schedule_results):
     executor._execution_started = False
     executor._shutdown = False
     executor._metadata_fetcher = MagicMock()
-    executor._active_topology = object()
+    executor._scheduling_topology = object()
     executor._scheduling_loop_step = MagicMock(side_effect=schedule_results)
     executor.update_metrics = MagicMock()
     executor._initial_stats = None
@@ -245,26 +245,26 @@ def test_build_then_start_streaming_topology_in_two_phases():
     o2.start.assert_called_once_with(options, block_ref_counter)
 
 
-def test_segmented_execution_plan_validates_structure():
+def test_execution_segment_spec_validates_structure():
     events = []
     first = [_SegmentLifecycleOperator("first", events)]
     second = [_SegmentLifecycleOperator("second", events)]
     _, segments = _make_segmented_lifecycle_executor(first, second)
     topology = {op: None for segment in segments for op in segment}
-    operator_segments = tuple(tuple(segment) for segment in segments)
+    segment_spec = tuple(tuple(segment) for segment in segments)
 
-    validate_execution_segments(operator_segments, topology)
+    validate_execution_segment_spec(segment_spec, topology)
 
     with pytest.raises(ValueError, match="partition the topology in order"):
-        validate_execution_segments(tuple(reversed(operator_segments)), topology)
+        validate_execution_segment_spec(tuple(reversed(segment_spec)), topology)
     with pytest.raises(ValueError, match="partition the topology in order"):
-        validate_execution_segments((), topology)
+        validate_execution_segment_spec((), topology)
 
     left = _SegmentLifecycleOperator("left", events)
     right = _SegmentLifecycleOperator("right", events)
     disconnected = dict.fromkeys([left, right])
     with pytest.raises(ValueError, match="exactly one terminal operator"):
-        validate_execution_segments((tuple(disconnected),), disconnected)
+        validate_execution_segment_spec((tuple(disconnected),), disconnected)
 
 
 def test_update_operator_states_treats_segment_boundary_as_terminal():
@@ -287,7 +287,7 @@ def test_update_operator_states_treats_segment_boundary_as_terminal():
     inactive.has_completed.assert_not_called()
 
 
-def test_execute_applies_generic_segment_plan(ray_start_regular_shared):
+def test_execute_applies_generic_segment_spec(ray_start_regular_shared):
     context = DataContext.get_current()
     source = InputDataBuffer(context, make_ref_bundles([[1], [2]]))
     producer = LimitOperator(2, source, context)
@@ -295,7 +295,7 @@ def test_execute_applies_generic_segment_plan(ray_start_regular_shared):
 
     with patch(
         "ray.data._internal.execution.streaming_executor."
-        "plan_gpu_shuffle_startup",
+        "derive_gpu_shuffle_segments",
         return_value=((source,), (producer,)),
     ):
         output = list(executor.execute(producer))
@@ -386,7 +386,7 @@ def test_segment_transition_releases_prefix_in_reverse_before_suffix_start():
         "get_backpressure_policies",
         return_value=[],
     ):
-        assert executor._maybe_start_next_segment()
+        assert executor._advance_to_next_segment()
 
     assert events == [
         "stop:prefix-2:False",
@@ -412,9 +412,9 @@ def test_segment_transition_supports_more_than_two_segments():
         "get_backpressure_policies",
         return_value=[],
     ):
-        assert executor._maybe_start_next_segment()
-        assert executor._maybe_start_next_segment()
-        assert not executor._maybe_start_next_segment()
+        assert executor._advance_to_next_segment()
+        assert executor._advance_to_next_segment()
+        assert not executor._advance_to_next_segment()
 
     assert events == [
         "stop:first:False",
@@ -422,9 +422,9 @@ def test_segment_transition_supports_more_than_two_segments():
         "stop:second:False",
         "start:third",
     ]
-    assert executor._active_segment_index == 2
-    assert list(executor._active_topology) == first + second + third
-    assert executor._resource_manager.set_forced_materializing_op.call_args_list == [
+    assert executor._current_segment_index == 2
+    assert list(executor._scheduling_topology) == first + second + third
+    assert executor._resource_manager.set_materialization_boundary.call_args_list == [
         unittest.mock.call(second[0]),
         unittest.mock.call(None),
     ]
@@ -440,7 +440,7 @@ def test_segment_suffix_is_published_only_after_transactional_start():
     executor, segments = _make_segmented_lifecycle_executor(prefix, suffix)
 
     def assert_suffix_unpublished():
-        assert all(op not in executor._active_topology for op in suffix)
+        assert all(op not in executor._scheduling_topology for op in suffix)
 
     for op in suffix:
         op._on_start = assert_suffix_unpublished
@@ -454,10 +454,10 @@ def test_segment_suffix_is_published_only_after_transactional_start():
         "get_backpressure_policies",
         return_value=[],
     ):
-        assert executor._maybe_start_next_segment()
+        assert executor._advance_to_next_segment()
 
-    assert all(op in executor._active_topology for op in suffix)
-    assert executor._active_segment_index == 1
+    assert all(op in executor._scheduling_topology for op in suffix)
+    assert executor._current_segment_index == 1
 
 
 def test_segment_suffix_failure_rolls_back_and_remains_unpublished():
@@ -479,7 +479,7 @@ def test_segment_suffix_failure_rolls_back_and_remains_unpublished():
         "get_backpressure_policies"
     ) as get_backpressure_policies:
         with pytest.raises(RuntimeError, match="suffix-failing start failed"):
-            executor._maybe_start_next_segment()
+            executor._advance_to_next_segment()
 
     assert events == [
         "stop:prefix:False",
@@ -488,9 +488,9 @@ def test_segment_suffix_failure_rolls_back_and_remains_unpublished():
         "stop:suffix-failing:True",
         "stop:suffix-1:True",
     ]
-    assert list(executor._active_topology) == prefix
-    assert executor._active_segment_index == 0
-    assert not suffix[-1].is_started
+    assert list(executor._scheduling_topology) == prefix
+    assert executor._current_segment_index == 0
+    assert not suffix[-1].has_started
     get_backpressure_policies.assert_not_called()
 
 
@@ -505,11 +505,11 @@ def test_segment_transition_is_skipped_after_cancellation_or_shutdown():
     events.clear()
     executor._shutdown = True
 
-    assert not executor._maybe_start_next_segment()
+    assert not executor._advance_to_next_segment()
     assert events == []
-    assert list(executor._active_topology) == prefix
-    assert executor._active_segment_index == 0
-    assert not suffix[0].is_started
+    assert list(executor._scheduling_topology) == prefix
+    assert executor._current_segment_index == 0
+    assert not suffix[0].has_started
 
 
 def test_segment_transition_serializes_cancellation_during_suffix_start():
@@ -537,7 +537,7 @@ def test_segment_transition_serializes_cancellation_during_suffix_start():
         "get_backpressure_policies",
         return_value=[],
     ):
-        transition = threading.Thread(target=executor._maybe_start_next_segment)
+        transition = threading.Thread(target=executor._advance_to_next_segment)
         transition.start()
         assert suffix_started.wait(timeout=5)
 
@@ -557,7 +557,7 @@ def test_segment_transition_serializes_cancellation_during_suffix_start():
 
     assert cancellation_acquired.is_set()
     assert executor._shutdown
-    assert executor._active_segment_index == 1
+    assert executor._current_segment_index == 1
 
 
 def test_shutdown_skips_never_started_operator_cleanup():
@@ -584,7 +584,7 @@ def test_shutdown_skips_never_started_operator_cleanup():
         started: started_state,
         never_started: never_started_state,
     }
-    executor._active_topology = dict(executor._topology)
+    executor._scheduling_topology = dict(executor._topology)
     executor._output_node = (started, started_state)
     executor._execution_started = True
     executor.join = MagicMock()
@@ -612,7 +612,7 @@ def test_shutdown_skips_never_started_operator_cleanup():
         "clear-input:started",
         "clear-output:started",
     ]
-    assert not never_started.is_started
+    assert not never_started.has_started
     assert not never_started._shutdown
 
 
@@ -624,42 +624,46 @@ def test_streaming_executor_initializes_segmented_lifecycle_state():
     ):
         executor = StreamingExecutor(DataContext(), dataset_id="lifecycle-init-test")
 
-    assert executor._active_topology is None
-    assert executor._execution_segments == []
-    assert executor._active_segment_index == 0
+    assert executor._scheduling_topology is None
+    assert executor._segment_topologies == []
+    assert executor._current_segment_index == 0
 
 
 def test_run_shutdown_breaks_before_segment_transition():
     executor, output_state = _make_run_loop_executor([False])
     executor._shutdown = True
-    executor._maybe_start_next_segment = MagicMock()
+    executor._advance_to_next_segment = MagicMock()
 
     executor.run()
 
     executor._metadata_fetcher.start.assert_called_once_with()
-    executor._scheduling_loop_step.assert_called_once_with(executor._active_topology)
-    executor._maybe_start_next_segment.assert_not_called()
+    executor._scheduling_loop_step.assert_called_once_with(
+        executor._scheduling_topology
+    )
+    executor._advance_to_next_segment.assert_not_called()
     output_state.mark_finished.assert_called_once_with(None)
 
 
 def test_run_completed_prefix_transitions_then_completes_suffix():
     executor, output_state = _make_run_loop_executor([False, False])
-    executor._maybe_start_next_segment = MagicMock(side_effect=[True, False])
+    executor._advance_to_next_segment = MagicMock(side_effect=[True, False])
 
     executor.run()
 
     assert executor._scheduling_loop_step.call_count == 2
-    assert executor._maybe_start_next_segment.call_count == 2
+    assert executor._advance_to_next_segment.call_count == 2
     output_state.mark_finished.assert_called_once_with(None)
 
 
 def test_run_without_another_segment_exits_after_completion():
     executor, output_state = _make_run_loop_executor([False])
-    executor._maybe_start_next_segment = MagicMock(return_value=False)
+    executor._advance_to_next_segment = MagicMock(return_value=False)
 
     executor.run()
 
-    executor._scheduling_loop_step.assert_called_once_with(executor._active_topology)
+    executor._scheduling_loop_step.assert_called_once_with(
+        executor._scheduling_topology
+    )
     output_state.mark_finished.assert_called_once_with(None)
 
 
