@@ -26,9 +26,11 @@ from ray.data._internal.execution.streaming_executor_state import (
 )
 from ray.data._internal.gpu_shuffle.hash_shuffle import GPUShuffleOperator
 
-# These strategies do not add placement constraints beyond aggregate CPU/GPU capacity.
+# Segmentation relies on aggregate CPU/GPU capacity being a complete feasibility
+# check; only these strategies preserve that assumption.
 _SUPPORTED_SCHEDULING_STRATEGIES = ("DEFAULT", "SPREAD")
-# The startup proof cannot model node or placement-group constraints.
+# These options add node or placement-group constraints absent from the aggregate
+# feasibility check, so their presence forces stock startup.
 _UNSUPPORTED_PLACEMENT_ARG_KEYS = {
     "fallback_strategy",
     "label_selector",
@@ -36,7 +38,8 @@ _UNSUPPORTED_PLACEMENT_ARG_KEYS = {
     "placement_group_bundle_index",
     "placement_group_capture_child_tasks",
 }
-# Actor identity, lifetime, and reuse options add ownership semantics not modeled here.
+# These actor options can alter identity, reuse, or lifetime, which breaks the
+# proof's assumption that each operator creates and owns its actors.
 _ACTOR_OWNERSHIP_ARG_KEYS = {"get_if_exists", "lifetime", "name", "namespace"}
 
 
