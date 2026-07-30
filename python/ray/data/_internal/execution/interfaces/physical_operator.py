@@ -929,9 +929,8 @@ class PhysicalOperator(Operator):
             block_ref_counter: The executor-wide shared counter for tracking
                 object-store memory.
 
-        Overrides that acquire external resources must call ``super().start()``
-        before doing so. This lets the executor roll back a partially started
-        topology if a later operator fails to start.
+        Overrides must call ``super().start()`` before acquiring resources so
+        partial startup can be rolled back.
         """
         self._block_ref_counter = block_ref_counter
         self._started = True

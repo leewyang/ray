@@ -1,8 +1,7 @@
 """Conservative GPU-shuffle startup segmentation policy."""
 
-import logging
 import sys
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import Dict, Optional
 
 import ray
 from ray._common.utils import resources_from_ray_options
@@ -20,15 +19,16 @@ from ray.data._internal.execution.operators.map_operator import MapOperator
 from ray.data._internal.execution.operators.task_pool_map_operator import (
     TaskPoolMapOperator,
 )
-from ray.data._internal.execution.streaming_executor_state import ExecutionSegmentSpec
+from ray.data._internal.execution.streaming_executor_state import (
+    ExecutionSegmentSpec,
+    Topology,
+    build_execution_segment_topologies,
+)
 from ray.data._internal.gpu_shuffle.hash_shuffle import GPUShuffleOperator
 
-if TYPE_CHECKING:
-    from ray.data._internal.execution.streaming_executor_state import Topology
-
-logger = logging.getLogger(__name__)
-
+# These strategies do not add placement constraints beyond aggregate CPU/GPU capacity.
 _SUPPORTED_SCHEDULING_STRATEGIES = ("DEFAULT", "SPREAD")
+# The startup proof cannot model node or placement-group constraints.
 _UNSUPPORTED_PLACEMENT_ARG_KEYS = {
     "fallback_strategy",
     "label_selector",
@@ -36,11 +36,8 @@ _UNSUPPORTED_PLACEMENT_ARG_KEYS = {
     "placement_group_bundle_index",
     "placement_group_capture_child_tasks",
 }
+# Actor identity, lifetime, and reuse options add ownership semantics not modeled here.
 _ACTOR_OWNERSHIP_ARG_KEYS = {"get_if_exists", "lifetime", "name", "namespace"}
-
-
-def _fallback_to_stock(reason: str) -> None:
-    logger.debug("Using stock GPU shuffle startup: %s", reason)
 
 
 def _is_linear_topology(operators: list[PhysicalOperator]) -> bool:
@@ -98,25 +95,35 @@ def _effective_capacity(options: ExecutionOptions) -> Optional[ExecutionResource
     )
 
 
-def derive_gpu_shuffle_segments(
-    topology: "Topology", options: ExecutionOptions
+def build_gpu_shuffle_segment_topologies(
+    topology: Topology, options: ExecutionOptions
+) -> list[Topology]:
+    """Return ready-to-start segments, or the stock topology on fallback."""
+    segment_spec = _derive_gpu_shuffle_segment_spec(topology, options)
+    if segment_spec is None:
+        return [topology]
+    return build_execution_segment_topologies(segment_spec, topology)
+
+
+def _derive_gpu_shuffle_segment_spec(
+    topology: Topology, options: ExecutionOptions
 ) -> Optional[ExecutionSegmentSpec]:
     """Return segments for a proven GPU producer/shuffle coexistence conflict."""
     operators = list(topology)
     if not _is_linear_topology(operators):
-        return _fallback_to_stock("topology is not linear")
+        return None
 
     gpu_shuffles = [op for op in operators if isinstance(op, GPUShuffleOperator)]
     if len(gpu_shuffles) != 1:
-        return _fallback_to_stock("expected exactly one GPU shuffle")
+        return None
     gpu_shuffle = gpu_shuffles[0]
     gpu_shuffle_index = operators.index(gpu_shuffle)
 
     rank_count = gpu_shuffle.get_default_rank_count()
     if rank_count is None:
-        return _fallback_to_stock("shuffle rank pool is custom")
+        return None
     if options.label_selector:
-        return _fallback_to_stock("execution has a label selector")
+        return None
 
     fixed_actor_resources = ExecutionResources.zero()
     max_task_resources = ExecutionResources.zero()
@@ -127,38 +134,35 @@ def derive_gpu_shuffle_segments(
         is_upstream = index < gpu_shuffle_index
         if type(op) not in (TaskPoolMapOperator, ActorPoolMapOperator):
             if is_upstream or type(op).start is not PhysicalOperator.start:
-                return _fallback_to_stock(f"unsupported operator {type(op).__name__}")
+                return None
             continue
         remote_args = op.get_static_ray_remote_args()
         resource_request = _get_supported_cpu_gpu_request(op, remote_args)
         if resource_request is None:
-            return _fallback_to_stock(
-                f"{op.name} has dynamic or unsupported remote options"
-            )
+            return None
         if not is_upstream:
             if (
                 type(op) is ActorPoolMapOperator
                 and op.data_context.wait_for_min_actors_s > 0
             ):
-                return _fallback_to_stock(f"{op.name} can block suffix startup")
+                return None
             continue
 
         if type(op) is ActorPoolMapOperator:
             actor_pool = op.get_autoscaling_actor_pools()[0]
-            min_size = actor_pool.min_size()
             initial_size = actor_pool.initial_size()
-            if min_size != initial_size or initial_size != actor_pool.max_size():
-                return _fallback_to_stock(f"{op.name} has an elastic actor pool")
-            actor_request = resource_request
-            if actor_request.gpu:
-                fixed_actor_resources = fixed_actor_resources.add(
-                    actor_request.scale(initial_size)
-                )
-            else:
-                return _fallback_to_stock("non-GPU actor is outside GPU-only scope")
+            if (
+                actor_pool.min_size() != initial_size
+                or initial_size != actor_pool.max_size()
+            ):
+                return None
+            if not resource_request.gpu:
+                return None
+            fixed_actor_resources = fixed_actor_resources.add(
+                resource_request.scale(initial_size)
+            )
         else:
-            task_resources = resource_request
-            max_task_resources = max_task_resources.max(task_resources)
+            max_task_resources = max_task_resources.max(resource_request)
 
     upstream_progress = fixed_actor_resources.add(max_task_resources)
     if not upstream_progress.gpu:
@@ -166,17 +170,14 @@ def derive_gpu_shuffle_segments(
 
     capacity = _effective_capacity(options)
     if capacity is None:
-        return _fallback_to_stock("effective capacity is unknown while autoscaling")
+        return None
 
     shuffle_resources = ExecutionResources(cpu=rank_count, gpu=rank_count)
     if not upstream_progress.satisfies_limit(capacity):
-        return _fallback_to_stock("upstream progress cannot fit independently")
+        return None
     if not shuffle_resources.satisfies_limit(capacity):
-        return _fallback_to_stock("shuffle rank gang cannot fit independently")
+        return None
     if upstream_progress.add(shuffle_resources).satisfies_limit(capacity):
         return None
 
-    return (
-        tuple(operators[:gpu_shuffle_index]),
-        tuple(operators[gpu_shuffle_index:]),
-    )
+    return tuple(operators[:gpu_shuffle_index]), tuple(operators[gpu_shuffle_index:])

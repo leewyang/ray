@@ -59,20 +59,20 @@ Topology = Dict[PhysicalOperator, "OpState"]
 ExecutionSegmentSpec = Tuple[Tuple[PhysicalOperator, ...], ...]
 
 
-def validate_execution_segment_spec(
+def build_execution_segment_topologies(
     segment_spec: ExecutionSegmentSpec, topology: Topology
-) -> None:
-    """Validate contiguous operator slices executed in order.
+) -> List[Topology]:
+    """Build validated contiguous topology slices executed in order.
 
-    Each segment must have one terminal operator. The policy deriving a segment
-    specification is responsible for proving that non-final segments can be safely
-    materialized and released.
+    The policy must prove that non-final segments can be materialized and released.
     """
     flattened = [op for segment in segment_spec for op in segment]
     if flattened != list(topology):
         raise ValueError("Execution segments must partition the topology in order")
-    for segment in segment_spec:
-        terminal_operator_from_topology({op: topology[op] for op in segment})
+    segments = [{op: topology[op] for op in segment} for segment in segment_spec]
+    for segment in segments:
+        terminal_operator_from_topology(segment)
+    return segments
 
 
 # Maximum time `process_completed_tasks` will block in `ray.wait()` waiting for tasks to complete.

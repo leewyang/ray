@@ -442,6 +442,8 @@ def test_configure_map_task_memory_rule(
 
     remote_args = new_plan.dag._get_dynamic_ray_remote_args()
     assert remote_args.get("memory") == expected_memory
+    # The framework-installed memory callback is not user-dynamic, so it keeps
+    # static remote arguments inspectable.
     if ray_remote_args_fn is None:
         assert new_plan.dag.get_static_ray_remote_args() == map_op._ray_remote_args
     else:

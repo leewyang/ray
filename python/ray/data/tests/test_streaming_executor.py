@@ -59,6 +59,7 @@ from ray.data._internal.execution.streaming_executor_state import (
     OpBufferQueue,
     OpState,
     OutputBackpressureGuard,
+    build_execution_segment_topologies,
     build_streaming_topology,
     format_op_state_summary,
     get_eligible_operators,
@@ -66,7 +67,6 @@ from ray.data._internal.execution.streaming_executor_state import (
     select_operator_to_run,
     start_streaming_topology,
     update_operator_states,
-    validate_execution_segment_spec,
 )
 from ray.data._internal.execution.util import make_ref_bundles
 from ray.data._internal.logical.operators import (
@@ -245,7 +245,7 @@ def test_build_then_start_streaming_topology_in_two_phases():
     o2.start.assert_called_once_with(options, block_ref_counter)
 
 
-def test_execution_segment_spec_validates_structure():
+def test_build_execution_segment_topologies_validates_structure():
     events = []
     first = [_SegmentLifecycleOperator("first", events)]
     second = [_SegmentLifecycleOperator("second", events)]
@@ -253,18 +253,18 @@ def test_execution_segment_spec_validates_structure():
     topology = {op: None for segment in segments for op in segment}
     segment_spec = tuple(tuple(segment) for segment in segments)
 
-    validate_execution_segment_spec(segment_spec, topology)
+    assert build_execution_segment_topologies(segment_spec, topology) == segments
 
     with pytest.raises(ValueError, match="partition the topology in order"):
-        validate_execution_segment_spec(tuple(reversed(segment_spec)), topology)
+        build_execution_segment_topologies(tuple(reversed(segment_spec)), topology)
     with pytest.raises(ValueError, match="partition the topology in order"):
-        validate_execution_segment_spec((), topology)
+        build_execution_segment_topologies((), topology)
 
     left = _SegmentLifecycleOperator("left", events)
     right = _SegmentLifecycleOperator("right", events)
     disconnected = dict.fromkeys([left, right])
     with pytest.raises(ValueError, match="exactly one terminal operator"):
-        validate_execution_segment_spec((tuple(disconnected),), disconnected)
+        build_execution_segment_topologies((tuple(disconnected),), disconnected)
 
 
 def test_update_operator_states_treats_segment_boundary_as_terminal():
@@ -293,10 +293,16 @@ def test_execute_applies_generic_segment_spec(ray_start_regular_shared):
     producer = LimitOperator(2, source, context)
     executor = StreamingExecutor(context)
 
+    def build_segments(topology, _options):
+        return [
+            {source: topology[source]},
+            {producer: topology[producer]},
+        ]
+
     with patch(
         "ray.data._internal.execution.streaming_executor."
-        "derive_gpu_shuffle_segments",
-        return_value=((source,), (producer,)),
+        "build_gpu_shuffle_segment_topologies",
+        side_effect=build_segments,
     ):
         output = list(executor.execute(producer))
 
@@ -382,8 +388,7 @@ def test_segment_transition_releases_prefix_in_reverse_before_suffix_start():
     events.clear()
 
     with patch(
-        "ray.data._internal.execution.streaming_executor."
-        "get_backpressure_policies",
+        "ray.data._internal.execution.streaming_executor." "get_backpressure_policies",
         return_value=[],
     ):
         assert executor._advance_to_next_segment()
@@ -408,8 +413,7 @@ def test_segment_transition_supports_more_than_two_segments():
     events.clear()
 
     with patch(
-        "ray.data._internal.execution.streaming_executor."
-        "get_backpressure_policies",
+        "ray.data._internal.execution.streaming_executor." "get_backpressure_policies",
         return_value=[],
     ):
         assert executor._advance_to_next_segment()
@@ -450,8 +454,7 @@ def test_segment_suffix_is_published_only_after_transactional_start():
     )
     events.clear()
     with patch(
-        "ray.data._internal.execution.streaming_executor."
-        "get_backpressure_policies",
+        "ray.data._internal.execution.streaming_executor." "get_backpressure_policies",
         return_value=[],
     ):
         assert executor._advance_to_next_segment()
@@ -475,8 +478,7 @@ def test_segment_suffix_failure_rolls_back_and_remains_unpublished():
     events.clear()
 
     with patch(
-        "ray.data._internal.execution.streaming_executor."
-        "get_backpressure_policies"
+        "ray.data._internal.execution.streaming_executor." "get_backpressure_policies"
     ) as get_backpressure_policies:
         with pytest.raises(RuntimeError, match="suffix-failing start failed"):
             executor._advance_to_next_segment()
@@ -524,17 +526,14 @@ def test_segment_transition_serializes_cancellation_during_suffix_start():
         assert release_suffix.wait(timeout=5)
 
     prefix = [_SegmentLifecycleOperator("prefix", events)]
-    suffix = [
-        _SegmentLifecycleOperator("suffix", events, on_start=block_suffix_start)
-    ]
+    suffix = [_SegmentLifecycleOperator("suffix", events, on_start=block_suffix_start)]
     executor, segments = _make_segmented_lifecycle_executor(prefix, suffix)
     start_streaming_topology(
         segments[0], executor._options, executor._block_ref_counter
     )
 
     with patch(
-        "ray.data._internal.execution.streaming_executor."
-        "get_backpressure_policies",
+        "ray.data._internal.execution.streaming_executor." "get_backpressure_policies",
         return_value=[],
     ):
         transition = threading.Thread(target=executor._advance_to_next_segment)
@@ -601,8 +600,7 @@ def test_shutdown_skips_never_started_operator_cleanup():
     executor._generate_stats = MagicMock(return_value=final_stats)
 
     with patch(
-        "ray.data._internal.execution.streaming_executor."
-        "unregister_dataset_logger",
+        "ray.data._internal.execution.streaming_executor." "unregister_dataset_logger",
         return_value=None,
     ):
         executor.shutdown(force=False)
@@ -614,19 +612,6 @@ def test_shutdown_skips_never_started_operator_cleanup():
     ]
     assert not never_started.has_started
     assert not never_started._shutdown
-
-
-def test_streaming_executor_initializes_segmented_lifecycle_state():
-    with patch(
-        "ray.data._internal.execution.streaming_executor."
-        "register_dataset_logger",
-        return_value=None,
-    ):
-        executor = StreamingExecutor(DataContext(), dataset_id="lifecycle-init-test")
-
-    assert executor._scheduling_topology is None
-    assert executor._segment_topologies == []
-    assert executor._current_segment_index == 0
 
 
 def test_run_shutdown_breaks_before_segment_transition():
@@ -652,18 +637,6 @@ def test_run_completed_prefix_transitions_then_completes_suffix():
 
     assert executor._scheduling_loop_step.call_count == 2
     assert executor._advance_to_next_segment.call_count == 2
-    output_state.mark_finished.assert_called_once_with(None)
-
-
-def test_run_without_another_segment_exits_after_completion():
-    executor, output_state = _make_run_loop_executor([False])
-    executor._advance_to_next_segment = MagicMock(return_value=False)
-
-    executor.run()
-
-    executor._scheduling_loop_step.assert_called_once_with(
-        executor._scheduling_topology
-    )
     output_state.mark_finished.assert_called_once_with(None)
 
 

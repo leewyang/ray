@@ -157,7 +157,7 @@ def _options(*, limits=None, excluded=None, label_selector=None):
     return options
 
 
-def _derive_segment_spec(topology, capacity, *, options=None):
+def _build_segment_topologies(topology, capacity, *, options=None):
     if options is None:
         options = _options()
     with patch.object(
@@ -165,7 +165,18 @@ def _derive_segment_spec(topology, capacity, *, options=None):
         "_effective_capacity",
         return_value=capacity,
     ):
-        return gpu_shuffle_startup_policy.derive_gpu_shuffle_segments(topology, options)
+        return gpu_shuffle_startup_policy.build_gpu_shuffle_segment_topologies(
+            topology, options
+        )
+
+
+def _uses_stock_startup(topology, capacity, *, options=None):
+    segments = _build_segment_topologies(
+        topology,
+        capacity,
+        options=options,
+    )
+    return len(segments) == 1 and segments[0] is topology
 
 
 def _supported_task_pipeline(*, task_resources=None, nranks=2):
@@ -177,98 +188,45 @@ def _supported_task_pipeline(*, task_resources=None, nranks=2):
     return input_op, producer, shuffle, _topology(input_op, producer, shuffle)
 
 
-def test_fallback_logs_reason():
-    with patch.object(gpu_shuffle_startup_policy.logger, "debug") as debug:
-        gpu_shuffle_startup_policy._fallback_to_stock("proof failed")
-
-    debug.assert_called_once_with("Using stock GPU shuffle startup: %s", "proof failed")
-
-
-def test_is_linear_topology_accepts_empty_and_well_formed_topologies():
-    assert gpu_shuffle_startup_policy._is_linear_topology([])
-
-    topology = _topology(
-        _input(),
-        _task({"num_gpus": 1}),
-        _shuffle(),
-    )
-    assert gpu_shuffle_startup_policy._is_linear_topology(list(topology))
-
-
-@pytest.mark.parametrize("broken_edge", ["input", "output"])
-def test_is_linear_topology_rejects_each_broken_edge_direction(broken_edge):
-    input_op = _input()
-    task = _task({"num_gpus": 1})
-    shuffle = _shuffle()
-    topology = _topology(input_op, task, shuffle)
-    if broken_edge == "input":
-        task._input_dependencies = []
-    else:
-        task._output_dependencies = []
-
-    assert not gpu_shuffle_startup_policy._is_linear_topology(list(topology))
-
-
 @pytest.mark.parametrize(
-    "remote_args",
+    ("operator_factory", "remote_args"),
     [
-        {"fallback_strategy": [{"label_selector": {"rack": "a"}}]},
-        {"label_selector": {"rack": "a"}},
-        {"placement_group": object()},
-        {"placement_group_bundle_index": 0},
-        {"placement_group_capture_child_tasks": False},
+        pytest.param(
+            _task,
+            {"fallback_strategy": [{"label_selector": {"rack": "a"}}]},
+            id="fallback-strategy",
+        ),
+        pytest.param(_task, {"label_selector": {"rack": "a"}}, id="label-selector"),
+        pytest.param(_task, {"placement_group": object()}, id="placement-group"),
+        pytest.param(
+            _task, {"placement_group_bundle_index": 0}, id="placement-group-bundle"
+        ),
+        pytest.param(
+            _task,
+            {"placement_group_capture_child_tasks": False},
+            id="capture-child-tasks",
+        ),
+        pytest.param(_actor, {"get_if_exists": True}, id="actor-reuse"),
+        pytest.param(_actor, {"lifetime": "detached"}, id="actor-lifetime"),
+        pytest.param(_actor, {"name": "worker"}, id="actor-name"),
+        pytest.param(_actor, {"namespace": "data"}, id="actor-namespace"),
+        pytest.param(_task, {"scheduling_strategy": None}, id="ambient-strategy"),
+        pytest.param(
+            _task,
+            {"scheduling_strategy": "NODE_AFFINITY"},
+            id="node-affinity",
+        ),
+        pytest.param(_task, {"accelerator_type": "A100"}, id="accelerator"),
+        pytest.param(_task, {"memory": 1}, id="memory"),
+        pytest.param(_task, {"object_store_memory": 1}, id="object-store-memory"),
+        pytest.param(_task, {"resources": {"custom": 1}}, id="custom-resource"),
+        pytest.param(_task, {"resources": {"CPU": 1}}, id="resource-cpu"),
     ],
 )
-def test_remote_semantics_reject_custom_placement(remote_args):
-    assert (
-        gpu_shuffle_startup_policy._get_supported_cpu_gpu_request(_task(), remote_args)
-        is None
-    )
-
-
-@pytest.mark.parametrize(
-    "remote_args",
-    [
-        {"get_if_exists": True},
-        {"lifetime": "detached"},
-        {"name": "worker"},
-        {"namespace": "data"},
-    ],
-)
-def test_remote_semantics_reject_actor_identity_or_lifetime(remote_args):
-    assert (
-        gpu_shuffle_startup_policy._get_supported_cpu_gpu_request(_actor(), remote_args)
-        is None
-    )
-
-
-def test_remote_semantics_allows_task_name():
+def test_static_request_rejects_unmodeled_remote_options(operator_factory, remote_args):
     assert (
         gpu_shuffle_startup_policy._get_supported_cpu_gpu_request(
-            _task(), {"name": "gpu-task"}
-        )
-        is not None
-    )
-
-
-@pytest.mark.parametrize(
-    "scheduling_strategy",
-    ["DEFAULT", "SPREAD"],
-)
-def test_remote_semantics_accepts_known_strategies(scheduling_strategy):
-    assert (
-        gpu_shuffle_startup_policy._get_supported_cpu_gpu_request(
-            _task(), {"scheduling_strategy": scheduling_strategy}
-        )
-        is not None
-    )
-
-
-@pytest.mark.parametrize("scheduling_strategy", [None, "NODE_AFFINITY"])
-def test_remote_semantics_rejects_ambient_or_unknown_strategy(scheduling_strategy):
-    assert (
-        gpu_shuffle_startup_policy._get_supported_cpu_gpu_request(
-            _task(), {"scheduling_strategy": scheduling_strategy}
+            operator_factory(), remote_args
         )
         is None
     )
@@ -286,23 +244,6 @@ def test_remote_semantics_rejects_context_placement(attribute):
 
 
 @pytest.mark.parametrize(
-    "remote_args",
-    [
-        {"accelerator_type": "A100"},
-        {"memory": 1},
-        {"object_store_memory": 1},
-        {"resources": {"custom": 1}},
-        {"resources": {"CPU": 1}},
-    ],
-)
-def test_cpu_gpu_resource_request_rejects_other_resources(remote_args):
-    assert (
-        gpu_shuffle_startup_policy._get_supported_cpu_gpu_request(_task(), remote_args)
-        is None
-    )
-
-
-@pytest.mark.parametrize(
     ("remote_args", "is_actor", "expected_cpu", "expected_gpu"),
     [
         ({"num_cpus": 2, "num_gpus": 3}, True, 2, 3),
@@ -312,9 +253,12 @@ def test_cpu_gpu_resource_request_rejects_other_resources(remote_args):
         ({}, False, 1, 0),
         ({"resources": {}}, False, 1, 0),
         ({"num_cpus": 0, "num_gpus": 2}, False, 0, 2),
+        ({"name": "gpu-task"}, False, 1, 0),
+        ({"scheduling_strategy": "DEFAULT"}, False, 1, 0),
+        ({"scheduling_strategy": "SPREAD"}, False, 1, 0),
     ],
 )
-def test_cpu_gpu_resource_request_applies_ray_cpu_defaults(
+def test_static_request_accepts_supported_cpu_gpu_options(
     remote_args, is_actor, expected_cpu, expected_gpu
 ):
     resources = gpu_shuffle_startup_policy._get_supported_cpu_gpu_request(
@@ -421,7 +365,9 @@ def test_policy_supports_statically_safe_suffix():
         _bare_operator(_PassthroughOperator, "Passthrough"),
     )
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=4, gpu=2)) is not None
+    assert (
+        len(_build_segment_topologies(topology, ExecutionResources(cpu=4, gpu=2))) == 2
+    )
 
 
 @pytest.mark.parametrize(
@@ -450,14 +396,14 @@ def test_policy_rejects_unproven_suffix_startup(suffix_op):
         suffix_op,
     )
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=4, gpu=2)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=4, gpu=2))
 
 
 def test_policy_rejects_nonlinear_topology():
     input_op, producer, shuffle, topology = _supported_task_pipeline()
     producer._output_dependencies = []
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=2, gpu=2)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=2, gpu=2))
 
 
 @pytest.mark.parametrize("shuffle_count", [0, 2])
@@ -466,7 +412,7 @@ def test_policy_requires_exactly_one_shuffle(shuffle_count):
     ops.extend(_shuffle(name=f"Shuffle{index}") for index in range(shuffle_count))
     topology = _topology(*ops)
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=4, gpu=4)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=4, gpu=4))
 
 
 @pytest.mark.parametrize(
@@ -483,20 +429,17 @@ def test_policy_rejects_custom_gpu_shuffle(customization):
         ),
     )
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=2, gpu=2)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=2, gpu=2))
 
 
 def test_policy_rejects_execution_label_selector():
     _, _, _, topology = _supported_task_pipeline()
     options = _options(label_selector={"rack": "gpu"})
 
-    assert (
-        _derive_segment_spec(
-            topology,
-            ExecutionResources(cpu=2, gpu=2),
-            options=options,
-        )
-        is None
+    assert _uses_stock_startup(
+        topology,
+        ExecutionResources(cpu=2, gpu=2),
+        options=options,
     )
 
 
@@ -507,7 +450,7 @@ def test_policy_rejects_non_map_prefix_operator():
         _shuffle(),
     )
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=2, gpu=2)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=2, gpu=2))
 
 
 def test_policy_rejects_custom_input_operator():
@@ -517,7 +460,7 @@ def test_policy_rejects_custom_input_operator():
         _shuffle(),
     )
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=2, gpu=2)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=2, gpu=2))
 
 
 @pytest.mark.parametrize(
@@ -533,7 +476,7 @@ def test_policy_rejects_custom_input_operator():
 def test_policy_rejects_unproven_upstream_options(producer):
     topology = _topology(_input(), producer, _shuffle())
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=2, gpu=2)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=2, gpu=2))
 
 
 @pytest.mark.parametrize("sizes", [(1, 2, 2), (1, 1, 2)])
@@ -544,7 +487,7 @@ def test_policy_rejects_each_elastic_actor_pool_shape(sizes):
         _shuffle(),
     )
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=4, gpu=4)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=4, gpu=4))
 
 
 def test_policy_rejects_unknown_map_subclass():
@@ -554,7 +497,7 @@ def test_policy_rejects_unknown_map_subclass():
         _shuffle(),
     )
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=2, gpu=2)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=2, gpu=2))
 
 
 def test_policy_keeps_stock_startup_for_cpu_only_task():
@@ -564,13 +507,13 @@ def test_policy_keeps_stock_startup_for_cpu_only_task():
         _shuffle(),
     )
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=2, gpu=2)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=2, gpu=2))
 
 
 def test_policy_keeps_stock_startup_for_materialized_input():
     topology = _topology(_input(), _shuffle())
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=2, gpu=2)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=2, gpu=2))
 
 
 @pytest.mark.parametrize(
@@ -585,7 +528,7 @@ def test_policy_rejects_mixed_non_gpu_actor(actor_args):
         _shuffle(),
     )
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=3, gpu=2)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=3, gpu=2))
 
 
 def test_policy_builds_boundary_for_fixed_fractional_gpu_actor_pool():
@@ -597,10 +540,9 @@ def test_policy_builds_boundary_for_fixed_fractional_gpu_actor_pool():
     shuffle = _shuffle(nranks=2)
     topology = _topology(input_op, producer, shuffle)
 
-    segment_spec = _derive_segment_spec(topology, ExecutionResources(cpu=4, gpu=2))
+    segments = _build_segment_topologies(topology, ExecutionResources(cpu=4, gpu=2))
 
-    assert segment_spec is not None
-    assert next(reversed(segment_spec[0])) is producer
+    assert list(segments[0]) == [input_op, producer]
 
 
 def test_policy_preserves_stock_overlap_for_four_plus_four_on_eight_gpus():
@@ -610,13 +552,13 @@ def test_policy_preserves_stock_overlap_for_four_plus_four_on_eight_gpus():
         _shuffle(nranks=4),
     )
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=8, gpu=8)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=8, gpu=8))
 
 
 def test_policy_rejects_unknown_capacity():
     _, _, _, topology = _supported_task_pipeline()
 
-    assert _derive_segment_spec(topology, None) is None
+    assert _uses_stock_startup(topology, None)
 
 
 def test_policy_rejects_upstream_progress_that_cannot_fit_independently():
@@ -624,30 +566,30 @@ def test_policy_rejects_upstream_progress_that_cannot_fit_independently():
         task_resources={"num_cpus": 3, "num_gpus": 1}
     )
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=2, gpu=2)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=2, gpu=2))
 
 
 def test_policy_rejects_shuffle_gang_that_cannot_fit_independently():
     _, _, _, topology = _supported_task_pipeline()
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=1, gpu=1)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=1, gpu=1))
 
 
 def test_policy_does_not_split_when_both_phases_fit_concurrently():
     _, _, _, topology = _supported_task_pipeline()
 
-    assert _derive_segment_spec(topology, ExecutionResources(cpu=3, gpu=3)) is None
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=3, gpu=3))
 
 
 def test_policy_builds_boundary_for_task_producer():
     input_op, producer, shuffle, topology = _supported_task_pipeline()
 
-    segment_spec = _derive_segment_spec(topology, ExecutionResources(cpu=2, gpu=2))
+    segments = _build_segment_topologies(topology, ExecutionResources(cpu=2, gpu=2))
 
-    assert segment_spec is not None
-    assert segment_spec[0] == (input_op, producer)
-    assert segment_spec[1] == (shuffle,)
-    assert next(reversed(segment_spec[0])) is producer
+    assert [list(segment) for segment in segments] == [
+        [input_op, producer],
+        [shuffle],
+    ]
 
 
 def test_policy_sums_fixed_gpu_actors_and_uses_largest_task_request():
@@ -673,10 +615,9 @@ def test_policy_sums_fixed_gpu_actors_and_uses_largest_task_request():
         shuffle,
     )
 
-    segment_spec = _derive_segment_spec(topology, ExecutionResources(cpu=3, gpu=3))
+    segments = _build_segment_topologies(topology, ExecutionResources(cpu=3, gpu=3))
 
-    assert segment_spec is not None
-    assert next(reversed(segment_spec[0])) is large_task
+    assert list(segments[0]) == [input_op, actor, small_task, large_task]
 
 
 if __name__ == "__main__":

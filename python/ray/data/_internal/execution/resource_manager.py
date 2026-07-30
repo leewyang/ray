@@ -63,24 +63,29 @@ _BLOCKING_MATERIALIZING_OPERATORS = (
 
 
 def terminal_operator_from_topology(topology: "Topology") -> PhysicalOperator:
-    """Return the unique operator with no downstream dependency in ``topology``."""
+    """Return the executor sink: the unique op with no in-DAG downstream consumers.
+
+    ``build_streaming_topology`` is rooted at the same node passed to
+    ``StreamingExecutor``; that root is the only operator whose
+    ``output_dependencies`` is empty.
+    """
     if not topology:
         raise ValueError("topology must be non-empty")
-    terminal_operators = [
+    sinks = [
         op
         for op in topology
         if not any(dep in topology for dep in op.output_dependencies)
     ]
-    if len(terminal_operators) == 1:
-        return terminal_operators[0]
-    if not terminal_operators:
+    if len(sinks) == 1:
+        return sinks[0]
+    if not sinks:
         raise ValueError(
             "No terminal operator found in topology (expected exactly one "
-            "operator without downstream dependencies in the topology)"
+            "operator with empty output_dependencies)"
         )
     raise ValueError(
         "Expected exactly one terminal operator in topology, found "
-        f"{len(terminal_operators)}: {terminal_operators!r}"
+        f"{len(sinks)}: {sinks!r}"
     )
 
 

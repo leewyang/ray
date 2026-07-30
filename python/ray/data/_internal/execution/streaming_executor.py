@@ -18,7 +18,7 @@ from ray.data._internal.execution.block_ref_counter import BlockRefCounter
 from ray.data._internal.execution.dataset_state import DatasetState
 from ray.data._internal.execution.execution_callback import ExecutionCallback
 from ray.data._internal.execution.gpu_shuffle_startup_policy import (
-    derive_gpu_shuffle_segments,
+    build_gpu_shuffle_segment_topologies,
 )
 from ray.data._internal.execution.interfaces import (
     Executor,
@@ -45,7 +45,6 @@ from ray.data._internal.execution.streaming_executor_state import (
     select_operator_to_run,
     start_streaming_topology,
     update_operator_states,
-    validate_execution_segment_spec,
 )
 from ray.data._internal.logging import (
     get_log_directory,
@@ -245,21 +244,14 @@ class StreamingExecutor(Executor, threading.Thread):
             self._block_ref_counter,
             start_operators=False,
         )
-        segment_spec = derive_gpu_shuffle_segments(self._topology, self._options)
-        if segment_spec is None:
-            self._segment_topologies = [self._topology]
-            self._scheduling_topology = self._topology
-        else:
-            validate_execution_segment_spec(segment_spec, self._topology)
-            self._segment_topologies = [
-                {op: self._topology[op] for op in segment} for segment in segment_spec
-            ]
-            self._scheduling_topology = dict(self._segment_topologies[0])
+        self._segment_topologies = build_gpu_shuffle_segment_topologies(
+            self._topology, self._options
+        )
+        self._scheduling_topology = dict(self._segment_topologies[0])
         start_streaming_topology(
             self._scheduling_topology, self._options, self._block_ref_counter
         )
 
-        materialization_boundary = self._current_materialization_boundary()
         self._resource_manager = ResourceManager(
             self._scheduling_topology,
             self._options,
@@ -267,7 +259,7 @@ class StreamingExecutor(Executor, threading.Thread):
             self._data_context,
             self._block_ref_counter,
             output_operator=dag,
-            materialization_boundary=materialization_boundary,
+            materialization_boundary=self._current_materialization_boundary(),
         )
 
         # Constructed once per executor (not per scheduling iteration) so the

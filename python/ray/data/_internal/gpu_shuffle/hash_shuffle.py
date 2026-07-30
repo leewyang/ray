@@ -278,13 +278,15 @@ class GPURankPool:
         }
         if self._label_selector:
             actor_options["label_selector"] = self._label_selector
+        # Retain each handle immediately so partial creation can be rolled back.
         for _ in range(self._nranks):
-            actor = actor_cls.options(**actor_options).remote(
-                nranks=self._nranks,
-                total_nparts=self._total_nparts,
-                **self._actor_kwargs,
+            self._actors.append(
+                actor_cls.options(**actor_options).remote(
+                    nranks=self._nranks,
+                    total_nparts=self._total_nparts,
+                    **self._actor_kwargs,
+                )
             )
-            self._actors.append(actor)
         t_actors = time.perf_counter()
         logger.info(
             "%s: %d actor(s) created in %.2fs.",
@@ -512,11 +514,7 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
 
     def get_default_rank_count(self) -> Optional[int]:
         """Return the rank count when using the default operator and rank pool."""
-        if (
-            type(self) is not GPUShuffleOperator
-            or not self._uses_default_rank_pool
-            or type(self._rank_pool) is not GPURankPool
-        ):
+        if type(self) is not GPUShuffleOperator or not self._uses_default_rank_pool:
             return None
         return self._rank_pool.nranks
 

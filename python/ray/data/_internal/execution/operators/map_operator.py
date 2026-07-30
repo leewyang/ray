@@ -251,8 +251,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         self._supports_fusion = supports_fusion
         self._map_task_kwargs = map_task_kwargs
         self._ray_remote_args = ray_remote_args
-        # The memory optimizer later wraps this callback internally. Preserve
-        # whether CPU, GPU, or scheduling can be changed by a user callback.
+        # Keep user callbacks distinct from optimizer-added memory callbacks.
         self._has_user_provided_ray_remote_args_fn = ray_remote_args_fn is not None
         self._ray_remote_args_fn = ray_remote_args_fn
         self._remote_args_for_metrics = copy.deepcopy(self._ray_remote_args)
@@ -290,11 +289,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         self._on_start_called = False
 
     def get_static_ray_remote_args(self) -> Optional[Dict[str, Any]]:
-        """Return base options when no user-supplied dynamic callback exists.
-
-        Ray's physical optimizer may still add a framework-owned dynamic memory
-        estimate. That callback cannot change CPU, GPU, or scheduling strategy.
-        """
+        """Return static options unless a user callback can change placement."""
         if self._has_user_provided_ray_remote_args_fn:
             return None
         return self._ray_remote_args.copy()
