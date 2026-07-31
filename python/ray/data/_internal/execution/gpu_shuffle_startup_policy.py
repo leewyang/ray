@@ -111,13 +111,16 @@ def build_gpu_shuffle_segment_topologies(
 def _derive_gpu_shuffle_segment_spec(
     topology: Topology, options: ExecutionOptions
 ) -> Optional[ExecutionSegmentSpec]:
-    """Return a two-segment split only when staged startup is necessary and safe.
+    """Return two execution segments when staged startup avoids a GPU deadlock.
 
-    The topology must be linear with exactly one stock GPU shuffle. Resource-bearing
-    operators must have statically supported CPU/GPU, placement, and actor-lifecycle
-    behavior, and upstream actor pools must be fixed-size GPU pools. The upstream
-    GPU work and shuffle rank gang must each fit capacity independently but not
-    concurrently. Otherwise, return None so the caller uses stock startup.
+    A split is returned only when all of these are true:
+
+    1. The pipeline is linear and has one standard GPU shuffle.
+    2. Ray knows how every operator starts and how many CPUs and GPUs it needs.
+    3. Any upstream actor pool has a fixed size and uses GPUs.
+    4. The upstream work and shuffle each fit separately, but not at the same time.
+
+    Return None otherwise, preserving the existing startup behavior.
     """
     operators = list(topology)
     if not _is_linear_topology(operators):
