@@ -20,7 +20,6 @@ from ray.data._internal.execution.operators.task_pool_map_operator import (
     TaskPoolMapOperator,
 )
 from ray.data._internal.execution.streaming_executor_state import (
-    ExecutionSegmentSpec,
     Topology,
     build_execution_segment_topologies,
 )
@@ -102,18 +101,20 @@ def build_gpu_shuffle_segment_topologies(
     topology: Topology, options: ExecutionOptions
 ) -> list[Topology]:
     """Return ready-to-start segments, or the stock topology on fallback."""
-    segment_spec = _derive_gpu_shuffle_segment_spec(topology, options)
-    if segment_spec is None:
+    operators = list(topology)
+    split_index = _derive_gpu_shuffle_split_index(operators, options)
+    if split_index is None:
         return [topology]
+    segment_spec = (tuple(operators[:split_index]), tuple(operators[split_index:]))
     return build_execution_segment_topologies(segment_spec, topology)
 
 
-def _derive_gpu_shuffle_segment_spec(
-    topology: Topology, options: ExecutionOptions
-) -> Optional[ExecutionSegmentSpec]:
-    """Return two execution segments when staged startup avoids a GPU deadlock.
+def _derive_gpu_shuffle_split_index(
+    operators: list[PhysicalOperator], options: ExecutionOptions
+) -> Optional[int]:
+    """Return the GPU shuffle index when staged startup avoids a GPU deadlock.
 
-    A split is returned only when all of these are true:
+    A split index is returned only when all of these are true:
 
     1. The pipeline is linear and has one standard GPU shuffle.
     2. Ray knows how every operator starts and how many CPUs and GPUs it needs.
@@ -122,7 +123,6 @@ def _derive_gpu_shuffle_segment_spec(
 
     Return None otherwise, preserving the existing startup behavior.
     """
-    operators = list(topology)
     if not _is_linear_topology(operators):
         return None
 
@@ -193,4 +193,4 @@ def _derive_gpu_shuffle_segment_spec(
     if upstream_progress.add(shuffle_resources).satisfies_limit(capacity):
         return None
 
-    return tuple(operators[:gpu_shuffle_index]), tuple(operators[gpu_shuffle_index:])
+    return gpu_shuffle_index
