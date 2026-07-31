@@ -31,10 +31,7 @@ from ray.data._internal.execution.operators.base_physical_operator import (
     InternalQueueOperatorMixin,
 )
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
-from ray.data._internal.execution.resource_manager import (
-    ResourceManager,
-    terminal_operator_from_topology,
-)
+from ray.data._internal.execution.resource_manager import ResourceManager
 from ray.data._internal.execution.streaming_executor_state import (
     OpState,
     OutputBackpressureGuard,
@@ -259,7 +256,6 @@ class StreamingExecutor(Executor, threading.Thread):
             self._data_context,
             self._block_ref_counter,
             output_operator=dag,
-            materialization_boundary=self._current_materialization_boundary(),
         )
 
         # Constructed once per executor (not per scheduling iteration) so the
@@ -482,13 +478,6 @@ class StreamingExecutor(Executor, threading.Thread):
             _, state = self._output_node
             state.mark_finished(exc)
 
-    def _current_materialization_boundary(self) -> Optional[PhysicalOperator]:
-        if self._current_segment_index + 1 == len(self._segment_topologies):
-            return None
-        return terminal_operator_from_topology(
-            self._segment_topologies[self._current_segment_index]
-        )
-
     def _advance_to_next_segment(self) -> bool:
         """Release the completed segment and start the next segment, if any."""
         next_segment_index = self._current_segment_index + 1
@@ -509,9 +498,6 @@ class StreamingExecutor(Executor, threading.Thread):
             )
             self._scheduling_topology.update(next_segment_topology)
             self._current_segment_index = next_segment_index
-            self._resource_manager.set_materialization_boundary(
-                self._current_materialization_boundary()
-            )
             self._backpressure_policies = get_backpressure_policies(
                 self._data_context,
                 self._scheduling_topology,

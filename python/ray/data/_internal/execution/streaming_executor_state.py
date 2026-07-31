@@ -53,8 +53,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Holds the full execution state of the streaming topology. It's a dict mapping each
-# operator to tracked streaming exec state.
+# Maps each operator to its streaming execution state. build_streaming_topology
+# inserts dependencies before consumers, so dict iteration is topological order.
 Topology = Dict[PhysicalOperator, "OpState"]
 ExecutionSegmentSpec = Tuple[Tuple[PhysicalOperator, ...], ...]
 
@@ -71,6 +71,7 @@ def build_execution_segment_topologies(
         raise ValueError("Execution segments must partition the topology in order")
     segments = [{op: topology[op] for op in segment} for segment in segment_spec]
     for segment in segments:
+        # Validate before startup; this raises unless there is exactly one terminal.
         terminal_operator_from_topology(segment)
     return segments
 

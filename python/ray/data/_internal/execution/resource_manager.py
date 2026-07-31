@@ -116,7 +116,6 @@ class ResourceManager:
         block_ref_counter: BlockRefCounter,
         *,
         output_operator: Optional[PhysicalOperator] = None,
-        materialization_boundary: Optional[PhysicalOperator] = None,
     ):
         self._topology = topology
         self._options = options
@@ -150,7 +149,6 @@ class ResourceManager:
         self._output_operator = output_operator or terminal_operator_from_topology(
             topology
         )
-        self._materialization_boundary = materialization_boundary
 
         self._block_ref_counter = block_ref_counter
 
@@ -451,11 +449,12 @@ class ResourceManager:
         )
 
     def should_force_drain_output(self, op: PhysicalOperator) -> bool:
-        """Whether this temporary segment boundary must materialize all output."""
-        return op is self._materialization_boundary
-
-    def set_materialization_boundary(self, op: Optional[PhysicalOperator]) -> None:
-        self._materialization_boundary = op
+        """Whether op is a temporary sink of the published topology."""
+        return (
+            op in self._topology
+            and op is not self._output_operator
+            and not any(dep in self._topology for dep in op.output_dependencies)
+        )
 
     def _get_downstream_ineligible_ops(
         self, op: PhysicalOperator
@@ -545,7 +544,7 @@ class ResourceManager:
         """
 
         # Check if Op itself is a blocking, materializing operator
-        if op is self._materialization_boundary or isinstance(
+        if self.should_force_drain_output(op) or isinstance(
             op, _BLOCKING_MATERIALIZING_OPERATORS
         ):
             return True

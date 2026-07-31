@@ -816,19 +816,24 @@ class TestResourceManager:
     ):
         source = InputDataBuffer(DataContext.get_current(), [])
         producer = mock_map_op(source, name="Producer")
-        topology = build_streaming_topology(
-            producer,
+        inactive = mock_map_op(producer, name="Inactive")
+        full_topology = build_streaming_topology(
+            inactive,
             ExecutionOptions(),
             noop_counter(),
             start_operators=False,
         )
+        scheduling_topology = {
+            source: full_topology[source],
+            producer: full_topology[producer],
+        }
         resource_manager = ResourceManager(
-            topology,
+            scheduling_topology,
             ExecutionOptions(),
             lambda: ExecutionResources(cpu=4, object_store_memory=1_000),
             DataContext.get_current(),
             BlockRefCounter(add_object_out_of_scope_callback=lambda *_: True),
-            materialization_boundary=producer,
+            output_operator=inactive,
         )
 
         resource_manager.update_usages()
@@ -987,9 +992,7 @@ class TestResourceManager:
 class TestOutputBackpressureGuard:
     """Tests for OutputBackpressureGuard.should_unblock."""
 
-    def test_force_drain_unblocks_materialization_boundary(
-        self, restore_data_context
-    ):
+    def test_force_drain_unblocks_materialization_boundary(self, restore_data_context):
         source = InputDataBuffer(DataContext.get_current(), [])
         producer = mock_map_op(source, name="Producer")
         inactive = mock_map_op(producer, name="Inactive")
@@ -1012,12 +1015,12 @@ class TestOutputBackpressureGuard:
             output_operator=inactive,
         )
 
-        assert not resource_manager.should_force_drain_output(producer)
-        resource_manager.set_materialization_boundary(producer)
         assert resource_manager.should_force_drain_output(producer)
         assert not resource_manager.should_force_drain_output(inactive)
         guard = OutputBackpressureGuard(scheduling_topology, resource_manager)
         assert guard.should_unblock(producer)
+        scheduling_topology[inactive] = full_topology[inactive]
+        assert not resource_manager.should_force_drain_output(producer)
 
     def test_unblock_backpressure_terminal_operator(self, restore_data_context):
         """Terminal operator (no downstream eligible ops) with no external

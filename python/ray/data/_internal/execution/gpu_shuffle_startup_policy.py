@@ -111,7 +111,14 @@ def build_gpu_shuffle_segment_topologies(
 def _derive_gpu_shuffle_segment_spec(
     topology: Topology, options: ExecutionOptions
 ) -> Optional[ExecutionSegmentSpec]:
-    """Return segments for a proven GPU producer/shuffle coexistence conflict."""
+    """Return a two-segment split only when staged startup is necessary and safe.
+
+    The topology must be linear with exactly one stock GPU shuffle. Resource-bearing
+    operators must have statically supported CPU/GPU, placement, and actor-lifecycle
+    behavior, and upstream actor pools must be fixed-size GPU pools. The upstream
+    GPU work and shuffle rank gang must each fit capacity independently but not
+    concurrently. Otherwise, return None so the caller uses stock startup.
+    """
     operators = list(topology)
     if not _is_linear_topology(operators):
         return None

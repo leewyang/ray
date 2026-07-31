@@ -428,10 +428,6 @@ def test_segment_transition_supports_more_than_two_segments():
     ]
     assert executor._current_segment_index == 2
     assert list(executor._scheduling_topology) == first + second + third
-    assert executor._resource_manager.set_materialization_boundary.call_args_list == [
-        unittest.mock.call(second[0]),
-        unittest.mock.call(None),
-    ]
 
 
 def test_segment_suffix_is_published_only_after_transactional_start():
