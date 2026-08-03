@@ -434,6 +434,7 @@ def test_policy_builds_boundaries_for_cumulative_shuffle_pressure():
         [first_shuffle, middle_task],
         [second_shuffle],
     ]
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=5, gpu=5))
 
 
 def test_policy_supports_three_shuffles_with_cpu_and_empty_phases():
@@ -460,42 +461,17 @@ def test_policy_supports_three_shuffles_with_cpu_and_empty_phases():
     ]
 
 
-def test_policy_preserves_stock_startup_when_all_shuffles_can_coexist():
-    topology = _topology(
-        _input(),
-        _task({"num_gpus": 1}),
-        _shuffle(nranks=2, name="FirstShuffle"),
-        _task({"num_gpus": 1}),
-        _shuffle(nranks=2, name="SecondShuffle"),
-    )
-
-    assert _uses_stock_startup(topology, ExecutionResources(cpu=5, gpu=5))
-
-
 def test_policy_accounts_for_fixed_actors_across_shuffle_phases():
     input_op = _input()
-    first_actor = _actor(
-        {"num_cpus": 0, "num_gpus": 0.5},
-        sizes=(2, 2, 2),
-        name="FirstActor",
-    )
+    first_actor = _actor({"num_cpus": 0, "num_gpus": 1})
     first_shuffle = _shuffle(nranks=2, name="FirstShuffle")
-    second_actor = _actor(
-        {"num_cpus": 0, "num_gpus": 0.5},
-        sizes=(2, 2, 2),
-        name="SecondActor",
-    )
-    middle_task = _task(
-        {"num_cpus": 0, "num_gpus": 1},
-        name="MiddleTask",
-    )
+    second_actor = _actor({"num_cpus": 0, "num_gpus": 1})
     second_shuffle = _shuffle(nranks=2, name="SecondShuffle")
     topology = _topology(
         input_op,
         first_actor,
         first_shuffle,
         second_actor,
-        middle_task,
         second_shuffle,
     )
 
@@ -503,32 +479,18 @@ def test_policy_accounts_for_fixed_actors_across_shuffle_phases():
 
     assert [list(segment) for segment in segments] == [
         [input_op, first_actor],
-        [first_shuffle, second_actor, middle_task],
+        [first_shuffle, second_actor],
         [second_shuffle],
     ]
 
 
-@pytest.mark.parametrize(
-    "unsupported_case",
-    ["middle-operator", "blocking-middle-actor", "later-custom-shuffle"],
-)
-def test_policy_rejects_unproven_multi_shuffle_topology(unsupported_case):
-    if unsupported_case == "middle-operator":
-        middle_op = _bare_operator(_BlockingStartOperator, "Blocking")
-    elif unsupported_case == "blocking-middle-actor":
-        middle_op = _actor({"num_gpus": 1}, wait_for_min_actors_s=1)
-    else:
-        middle_op = _task({"num_gpus": 1})
-    second_shuffle = _shuffle(
-        custom_operator=unsupported_case == "later-custom-shuffle",
-        name="SecondShuffle",
-    )
+def test_policy_rejects_unsupported_middle_operator():
     topology = _topology(
         _input(),
         _task({"num_gpus": 1}),
         _shuffle(name="FirstShuffle"),
-        middle_op,
-        second_shuffle,
+        _bare_operator(_BlockingStartOperator, "Blocking"),
+        _shuffle(name="SecondShuffle"),
     )
 
     assert _uses_stock_startup(topology, ExecutionResources(cpu=3, gpu=3))

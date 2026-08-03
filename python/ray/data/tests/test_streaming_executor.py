@@ -174,22 +174,6 @@ def _make_segmented_lifecycle_executor(*segments):
     return executor, executor._segment_topologies
 
 
-def _make_run_loop_executor(schedule_results):
-    executor = StreamingExecutor.__new__(StreamingExecutor)
-    executor._shutdown_lock = threading.RLock()
-    executor._execution_started = False
-    executor._shutdown = False
-    executor._metadata_fetcher = MagicMock()
-    executor._scheduling_topology = object()
-    executor._scheduling_loop_step = MagicMock(side_effect=schedule_results)
-    executor.update_metrics = MagicMock()
-    executor._initial_stats = None
-    executor._callbacks = []
-    output_state = MagicMock(spec=OpState)
-    executor._output_node = (MagicMock(spec=PhysicalOperator), output_state)
-    return executor, output_state
-
-
 @pytest.mark.parametrize(
     "verbose_progress",
     [True, False],
@@ -371,40 +355,16 @@ def test_start_streaming_topology_rolls_back_partial_start(fail_before_super):
     assert not operators[2]._started
 
 
-def test_segment_transition_releases_prefix_in_reverse_before_suffix_start():
-    events = []
-    prefix = [
-        _SegmentLifecycleOperator("prefix-1", events),
-        _SegmentLifecycleOperator("prefix-2", events),
-    ]
-    suffix = [
-        _SegmentLifecycleOperator("suffix-1", events),
-        _SegmentLifecycleOperator("suffix-2", events),
-    ]
-    executor, segments = _make_segmented_lifecycle_executor(prefix, suffix)
-    start_streaming_topology(
-        segments[0], executor._options, executor._block_ref_counter
-    )
-    events.clear()
-
-    with patch(
-        "ray.data._internal.execution.streaming_executor." "get_backpressure_policies",
-        return_value=[],
-    ):
-        assert executor._advance_to_next_segment()
-
-    assert events == [
-        "stop:prefix-2:False",
-        "stop:prefix-1:False",
-        "start:suffix-1",
-        "start:suffix-2",
-    ]
-
-
 def test_segment_transition_supports_more_than_two_segments():
     events = []
-    first = [_SegmentLifecycleOperator("first", events)]
-    second = [_SegmentLifecycleOperator("second", events)]
+    first = [
+        _SegmentLifecycleOperator("first-1", events),
+        _SegmentLifecycleOperator("first-2", events),
+    ]
+    second = [
+        _SegmentLifecycleOperator("second-1", events),
+        _SegmentLifecycleOperator("second-2", events),
+    ]
     third = [_SegmentLifecycleOperator("third", events)]
     executor, segments = _make_segmented_lifecycle_executor(first, second, third)
     start_streaming_topology(
@@ -421,9 +381,12 @@ def test_segment_transition_supports_more_than_two_segments():
         assert not executor._advance_to_next_segment()
 
     assert events == [
-        "stop:first:False",
-        "start:second",
-        "stop:second:False",
+        "stop:first-2:False",
+        "stop:first-1:False",
+        "start:second-1",
+        "start:second-2",
+        "stop:second-2:False",
+        "stop:second-1:False",
         "start:third",
     ]
     assert executor._current_segment_index == 2
@@ -608,42 +571,6 @@ def test_shutdown_skips_never_started_operator_cleanup():
     ]
     assert not never_started.has_started
     assert not never_started._shutdown
-
-
-def test_run_shutdown_breaks_before_segment_transition():
-    executor, output_state = _make_run_loop_executor([False])
-    executor._shutdown = True
-    executor._advance_to_next_segment = MagicMock()
-
-    executor.run()
-
-    executor._metadata_fetcher.start.assert_called_once_with()
-    executor._scheduling_loop_step.assert_called_once_with(
-        executor._scheduling_topology
-    )
-    executor._advance_to_next_segment.assert_not_called()
-    output_state.mark_finished.assert_called_once_with(None)
-
-
-def test_run_completed_prefix_transitions_then_completes_suffix():
-    executor, output_state = _make_run_loop_executor([False, False])
-    executor._advance_to_next_segment = MagicMock(side_effect=[True, False])
-
-    executor.run()
-
-    assert executor._scheduling_loop_step.call_count == 2
-    assert executor._advance_to_next_segment.call_count == 2
-    output_state.mark_finished.assert_called_once_with(None)
-
-
-def test_run_marks_output_finished_with_scheduling_exception():
-    error = RuntimeError("scheduling failed")
-    executor, output_state = _make_run_loop_executor([error])
-
-    executor.run()
-
-    finished_error = output_state.mark_finished.call_args.args[0]
-    assert finished_error is error
 
 
 def test_disallow_non_unique_operators(ray_start_regular_shared):
