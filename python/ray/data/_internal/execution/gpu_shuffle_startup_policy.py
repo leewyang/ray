@@ -149,7 +149,6 @@ def _derive_gpu_shuffle_split_indices(
     phase_count = len(shuffle_indices) + 1
     phase_actor_resources = [ExecutionResources.zero() for _ in range(phase_count)]
     phase_task_resources = [ExecutionResources.zero() for _ in range(phase_count)]
-    total_actor_resources = ExecutionResources.zero()
     phase_index = 0
 
     for index, op in enumerate(operators):
@@ -189,7 +188,6 @@ def _derive_gpu_shuffle_split_indices(
             phase_actor_resources[phase_index] = phase_actor_resources[phase_index].add(
                 actor_resources
             )
-            total_actor_resources = total_actor_resources.add(actor_resources)
         else:
             phase_task_resources[phase_index] = phase_task_resources[phase_index].max(
                 resource_request
@@ -199,19 +197,12 @@ def _derive_gpu_shuffle_split_indices(
     if capacity is None:
         return None
 
-    if len(shuffle_indices) == 1:
-        upstream_progress = phase_actor_resources[0].add(phase_task_resources[0])
-        shuffle_resource = shuffle_resources[0]
-        if not upstream_progress.gpu:
-            return None
-        if not upstream_progress.satisfies_limit(capacity):
-            return None
-        if not shuffle_resource.satisfies_limit(capacity):
-            return None
-        if upstream_progress.add(shuffle_resource).satisfies_limit(capacity):
-            return None
-        return shuffle_indices
+    if len(shuffle_indices) == 1 and not phase_actor_resources[0].add(
+        phase_task_resources[0]
+    ).gpu:
+        return None
 
+    total_actor_resources = ExecutionResources.combine_sum(phase_actor_resources)
     remaining_shuffle_resources = ExecutionResources.combine_sum(shuffle_resources)
     for phase_index, task_resources in enumerate(phase_task_resources):
         stock_progress = total_actor_resources.add(task_resources).add(
