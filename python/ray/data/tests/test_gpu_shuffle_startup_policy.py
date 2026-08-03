@@ -406,13 +406,150 @@ def test_policy_rejects_nonlinear_topology():
     assert _uses_stock_startup(topology, ExecutionResources(cpu=2, gpu=2))
 
 
-@pytest.mark.parametrize("shuffle_count", [0, 2])
-def test_policy_requires_exactly_one_shuffle(shuffle_count):
+def test_policy_requires_a_shuffle():
     ops = [_input(), _task({"num_gpus": 1})]
-    ops.extend(_shuffle(name=f"Shuffle{index}") for index in range(shuffle_count))
     topology = _topology(*ops)
 
     assert _uses_stock_startup(topology, ExecutionResources(cpu=4, gpu=4))
+
+
+def test_policy_builds_boundaries_for_cumulative_shuffle_pressure():
+    input_op = _input()
+    producer = _task({"num_gpus": 1}, name="Producer")
+    first_shuffle = _shuffle(nranks=2, name="FirstShuffle")
+    middle_task = _task({"num_gpus": 1}, name="MiddleTask")
+    second_shuffle = _shuffle(nranks=2, name="SecondShuffle")
+    topology = _topology(
+        input_op,
+        producer,
+        first_shuffle,
+        middle_task,
+        second_shuffle,
+    )
+
+    segments = _build_segment_topologies(topology, ExecutionResources(cpu=3, gpu=3))
+
+    assert [list(segment) for segment in segments] == [
+        [input_op, producer],
+        [first_shuffle, middle_task],
+        [second_shuffle],
+    ]
+
+
+def test_policy_supports_three_shuffles_with_cpu_and_empty_phases():
+    input_op = _input()
+    first_shuffle = _shuffle(nranks=1, name="FirstShuffle")
+    cpu_task = _task({"num_cpus": 1}, name="CpuTask")
+    second_shuffle = _shuffle(nranks=2, name="SecondShuffle")
+    third_shuffle = _shuffle(nranks=3, name="ThirdShuffle")
+    topology = _topology(
+        input_op,
+        first_shuffle,
+        cpu_task,
+        second_shuffle,
+        third_shuffle,
+    )
+
+    segments = _build_segment_topologies(topology, ExecutionResources(cpu=3, gpu=3))
+
+    assert [list(segment) for segment in segments] == [
+        [input_op],
+        [first_shuffle, cpu_task],
+        [second_shuffle],
+        [third_shuffle],
+    ]
+
+
+def test_policy_preserves_stock_startup_when_all_shuffles_can_coexist():
+    topology = _topology(
+        _input(),
+        _task({"num_gpus": 1}),
+        _shuffle(nranks=2, name="FirstShuffle"),
+        _task({"num_gpus": 1}),
+        _shuffle(nranks=2, name="SecondShuffle"),
+    )
+
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=5, gpu=5))
+
+
+def test_policy_accounts_for_fixed_actors_across_shuffle_phases():
+    input_op = _input()
+    first_actor = _actor(
+        {"num_cpus": 0, "num_gpus": 0.5},
+        sizes=(2, 2, 2),
+        name="FirstActor",
+    )
+    first_shuffle = _shuffle(nranks=2, name="FirstShuffle")
+    second_actor = _actor(
+        {"num_cpus": 0, "num_gpus": 0.5},
+        sizes=(2, 2, 2),
+        name="SecondActor",
+    )
+    middle_task = _task(
+        {"num_cpus": 0, "num_gpus": 1},
+        name="MiddleTask",
+    )
+    second_shuffle = _shuffle(nranks=2, name="SecondShuffle")
+    topology = _topology(
+        input_op,
+        first_actor,
+        first_shuffle,
+        second_actor,
+        middle_task,
+        second_shuffle,
+    )
+
+    segments = _build_segment_topologies(topology, ExecutionResources(cpu=4, gpu=5))
+
+    assert [list(segment) for segment in segments] == [
+        [input_op, first_actor],
+        [first_shuffle, second_actor, middle_task],
+        [second_shuffle],
+    ]
+
+
+@pytest.mark.parametrize(
+    "unsupported_case",
+    ["middle-operator", "blocking-middle-actor", "later-custom-shuffle"],
+)
+def test_policy_rejects_unproven_multi_shuffle_topology(unsupported_case):
+    if unsupported_case == "middle-operator":
+        middle_op = _bare_operator(_BlockingStartOperator, "Blocking")
+    elif unsupported_case == "blocking-middle-actor":
+        middle_op = _actor({"num_gpus": 1}, wait_for_min_actors_s=1)
+    else:
+        middle_op = _task({"num_gpus": 1})
+    second_shuffle = _shuffle(
+        custom_operator=unsupported_case == "later-custom-shuffle",
+        name="SecondShuffle",
+    )
+    topology = _topology(
+        _input(),
+        _task({"num_gpus": 1}),
+        _shuffle(name="FirstShuffle"),
+        middle_op,
+        second_shuffle,
+    )
+
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=3, gpu=3))
+
+
+@pytest.mark.parametrize(
+    ("middle_task_args", "second_rank_count"),
+    [({"num_gpus": 4}, 2), ({"num_gpus": 1}, 4)],
+)
+def test_policy_rejects_multi_shuffle_segment_that_cannot_fit(
+    middle_task_args, second_rank_count
+):
+    topology = _topology(
+        _input(),
+        _task({"num_gpus": 1}),
+        _shuffle(nranks=2, name="FirstShuffle"),
+        _task(middle_task_args),
+        _shuffle(nranks=second_rank_count, name="SecondShuffle"),
+    )
+
+    assert _uses_stock_startup(topology, ExecutionResources(cpu=3, gpu=3))
 
 
 @pytest.mark.parametrize(

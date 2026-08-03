@@ -102,66 +102,80 @@ def build_gpu_shuffle_segment_topologies(
 ) -> list[Topology]:
     """Return ready-to-start segments, or the stock topology on fallback."""
     operators = list(topology)
-    split_index = _derive_gpu_shuffle_split_index(operators, options)
-    if split_index is None:
+    split_indices = _derive_gpu_shuffle_split_indices(operators, options)
+    if split_indices is None:
         return [topology]
-    segment_spec = (tuple(operators[:split_index]), tuple(operators[split_index:]))
+    bounds = (0, *split_indices, len(operators))
+    segment_spec = tuple(
+        tuple(operators[start:end]) for start, end in zip(bounds, bounds[1:])
+    )
     return build_execution_segment_topologies(segment_spec, topology)
 
 
-def _derive_gpu_shuffle_split_index(
+def _derive_gpu_shuffle_split_indices(
     operators: list[PhysicalOperator], options: ExecutionOptions
-) -> Optional[int]:
-    """Return the GPU shuffle index when staged startup avoids a GPU deadlock.
+) -> Optional[tuple[int, ...]]:
+    """Return shuffle boundaries when staged startup avoids a GPU deadlock.
 
-    A split index is returned only when all of these are true:
+    Boundaries are returned only when all of these are true:
 
-    1. The pipeline is linear and has one standard GPU shuffle.
+    1. The pipeline is linear and contains standard GPU shuffles.
     2. Ray knows how every operator starts and how many CPUs and GPUs it needs.
-    3. Any upstream actor pool has a fixed size and uses GPUs.
-    4. The upstream work and shuffle each fit separately, but not at the same time.
+    3. Modeled actor pools have fixed sizes and use GPUs.
+    4. Every phase and shuffle gang fits alone, but stock cannot safely progress.
 
     Return None otherwise, preserving the existing startup behavior.
     """
     if not _is_linear_topology(operators):
         return None
 
-    gpu_shuffles = [op for op in operators if isinstance(op, GPUShuffleOperator)]
-    if len(gpu_shuffles) != 1:
-        return None
-    gpu_shuffle = gpu_shuffles[0]
-    gpu_shuffle_index = operators.index(gpu_shuffle)
-
-    rank_count = gpu_shuffle.get_default_rank_count()
-    if rank_count is None:
+    shuffle_indices = tuple(
+        index
+        for index, op in enumerate(operators)
+        if isinstance(op, GPUShuffleOperator)
+    )
+    if not shuffle_indices:
         return None
     if options.label_selector:
         return None
 
-    fixed_actor_resources = ExecutionResources.zero()
-    max_task_resources = ExecutionResources.zero()
+    shuffle_resources = []
+    for index in shuffle_indices:
+        rank_count = operators[index].get_default_rank_count()
+        if rank_count is None:
+            return None
+        shuffle_resources.append(ExecutionResources(cpu=rank_count, gpu=rank_count))
+
+    phase_count = len(shuffle_indices) + 1
+    phase_actor_resources = [ExecutionResources.zero() for _ in range(phase_count)]
+    phase_task_resources = [ExecutionResources.zero() for _ in range(phase_count)]
+    total_actor_resources = ExecutionResources.zero()
+    phase_index = 0
 
     for index, op in enumerate(operators):
-        if op is gpu_shuffle or (index == 0 and type(op) is InputDataBuffer):
+        if isinstance(op, GPUShuffleOperator):
+            phase_index += 1
             continue
-        is_upstream = index < gpu_shuffle_index
+        if index == 0 and type(op) is InputDataBuffer:
+            continue
         if type(op) not in (TaskPoolMapOperator, ActorPoolMapOperator):
-            if is_upstream or type(op).start is not PhysicalOperator.start:
+            if (
+                index < shuffle_indices[-1]
+                or type(op).start is not PhysicalOperator.start
+            ):
                 return None
             continue
         remote_args = op.get_static_ray_remote_args()
         resource_request = _get_supported_cpu_gpu_request(op, remote_args)
         if resource_request is None:
             return None
-        if not is_upstream:
-            if (
-                type(op) is ActorPoolMapOperator
-                and op.data_context.wait_for_min_actors_s > 0
-            ):
-                return None
+        is_actor = type(op) is ActorPoolMapOperator
+        if is_actor and phase_index and op.data_context.wait_for_min_actors_s > 0:
+            return None
+        if len(shuffle_indices) == 1 and phase_index == 1:
             continue
 
-        if type(op) is ActorPoolMapOperator:
+        if is_actor:
             actor_pool = op.get_autoscaling_actor_pools()[0]
             initial_size = actor_pool.initial_size()
             if (
@@ -171,26 +185,54 @@ def _derive_gpu_shuffle_split_index(
                 return None
             if not resource_request.gpu:
                 return None
-            fixed_actor_resources = fixed_actor_resources.add(
-                resource_request.scale(initial_size)
+            actor_resources = resource_request.scale(initial_size)
+            phase_actor_resources[phase_index] = phase_actor_resources[phase_index].add(
+                actor_resources
             )
+            total_actor_resources = total_actor_resources.add(actor_resources)
         else:
-            max_task_resources = max_task_resources.max(resource_request)
-
-    upstream_progress = fixed_actor_resources.add(max_task_resources)
-    if not upstream_progress.gpu:
-        return None
+            phase_task_resources[phase_index] = phase_task_resources[phase_index].max(
+                resource_request
+            )
 
     capacity = _effective_capacity(options)
     if capacity is None:
         return None
 
-    shuffle_resources = ExecutionResources(cpu=rank_count, gpu=rank_count)
-    if not upstream_progress.satisfies_limit(capacity):
-        return None
-    if not shuffle_resources.satisfies_limit(capacity):
-        return None
-    if upstream_progress.add(shuffle_resources).satisfies_limit(capacity):
+    if len(shuffle_indices) == 1:
+        upstream_progress = phase_actor_resources[0].add(phase_task_resources[0])
+        shuffle_resource = shuffle_resources[0]
+        if not upstream_progress.gpu:
+            return None
+        if not upstream_progress.satisfies_limit(capacity):
+            return None
+        if not shuffle_resource.satisfies_limit(capacity):
+            return None
+        if upstream_progress.add(shuffle_resource).satisfies_limit(capacity):
+            return None
+        return shuffle_indices
+
+    remaining_shuffle_resources = ExecutionResources.combine_sum(shuffle_resources)
+    for phase_index, task_resources in enumerate(phase_task_resources):
+        stock_progress = total_actor_resources.add(task_resources).add(
+            remaining_shuffle_resources
+        )
+        if not stock_progress.satisfies_limit(capacity):
+            break
+        if phase_index < len(shuffle_resources):
+            remaining_shuffle_resources = remaining_shuffle_resources.subtract(
+                shuffle_resources[phase_index]
+            )
+    else:
         return None
 
-    return gpu_shuffle_index
+    if any(
+        not actor_resources.add(task_resources).satisfies_limit(capacity)
+        for actor_resources, task_resources in zip(
+            phase_actor_resources, phase_task_resources
+        )
+    ) or any(
+        not resources.satisfies_limit(capacity) for resources in shuffle_resources
+    ):
+        return None
+    return shuffle_indices

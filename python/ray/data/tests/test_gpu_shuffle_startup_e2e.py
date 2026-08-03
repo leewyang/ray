@@ -40,6 +40,34 @@ def _identity_batch(batch: pa.Table) -> pa.Table:
     return batch
 
 
+def _make_dedup_bands(batch):
+    import cudf
+
+    normalized = batch["text"].str.strip().str.lower()
+    base = cudf.DataFrame({"doc_id": batch["doc_id"], "band_key": normalized})
+    bands = []
+    for band_id in range(2):
+        band = base.copy(deep=True)
+        band["band_id"] = band_id
+        bands.append(band[["doc_id", "band_id", "band_key"]])
+    return cudf.concat(bands, ignore_index=True)
+
+
+def _create_collision_edges(batch):
+    ids = batch[["doc_id"]].drop_duplicates().sort_values("doc_id")
+    edges = ids.rename(columns={"doc_id": "dst"})
+    edges["src"] = edges["dst"].min()
+    return edges[["src", "dst"]]
+
+
+def _local_distinct_edges(batch):
+    return batch.drop_duplicates(subset=["src", "dst"]).reset_index(drop=True)
+
+
+def _global_distinct_edge(batch):
+    return batch[["src", "dst"]].head(1).reset_index(drop=True)
+
+
 class _IdentityActor:
     def __call__(self, batch: pa.Table) -> pa.Table:
         return batch
@@ -207,6 +235,53 @@ def test_task_map_to_full_rank_shuffle_without_intermediate_materialize(
     result, _ = _materialize_with_timeout(dataset)
 
     _assert_exact_rows_and_partitions(result, num_rows)
+    _wait_for_gpu_release(gpu_cluster)
+
+
+@pytest.mark.parametrize(
+    "gpu_cluster",
+    [pytest.param((4, _DEFAULT_OBJECT_STORE_BYTES), id="4gpu")],
+    indirect=True,
+)
+def test_two_cudf_dedup_phases_without_materialize(gpu_cluster, isolated_data_context):
+    _configure_gpu_shuffle(isolated_data_context)
+    records = []
+    for doc_id in range(256):
+        cluster = doc_id // 4
+        canonical = f"duplicate cluster {cluster:03d}"
+        text = f" {canonical.upper()} " if doc_id % 2 else canonical
+        records.append({"doc_id": doc_id, "text": text})
+
+    dataset = (
+        ray.data.from_items(records, override_num_blocks=8)
+        .map_batches(
+            _make_dedup_bands,
+            batch_size=32,
+            batch_format="cudf",
+            num_gpus=1,
+        )
+        .groupby(
+            ["band_id", "band_key"],
+            num_partitions=_GPU_SHUFFLE_RANKS,
+        )
+        .map_groups(_create_collision_edges, batch_format="cudf", num_gpus=1)
+        .map_batches(
+            _local_distinct_edges,
+            batch_size=32,
+            batch_format="cudf",
+            num_gpus=1,
+        )
+        .groupby(["src", "dst"], num_partitions=_GPU_SHUFFLE_RANKS)
+        .map_groups(_global_distinct_edge, batch_format="cudf", num_gpus=1)
+    )
+    assert len(_startup_segment_topologies(dataset)) == 3
+
+    result, _ = _materialize_with_timeout(dataset)
+
+    actual = {(row["src"], row["dst"]) for row in result.take_all()}
+    expected = {(4 * (doc_id // 4), doc_id) for doc_id in range(256)}
+    assert actual == expected
+    assert result.count() == 256
     _wait_for_gpu_release(gpu_cluster)
 
 
