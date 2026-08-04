@@ -86,14 +86,14 @@ class _FusedCudfMapBatches:
 
 @dataclass(frozen=True)
 class _FusionSpec:
-    actor_size: int
+    actor_pool: ActorPoolStrategy = field(compare=False)
     batch_size: int
     min_rows_per_bundle: Optional[int]
     ray_remote_args: Mapping[str, Any] = field(compare=False)
 
     def compatible_with(self, other: "_FusionSpec") -> bool:
         if (
-            self.actor_size != other.actor_size
+            self.actor_pool != other.actor_pool
             or self.batch_size != other.batch_size
             or not _same_config_value(
                 self.min_rows_per_bundle,
@@ -337,10 +337,10 @@ class FuseCudfActorMapBatches(Rule):
         ):
             return None
 
-        actor_size = cls._fixed_actor_size(logical_op.compute)
+        actor_pool = cls._supported_actor_pool(logical_op.compute)
         remote_args = logical_op.ray_remote_args
         if (
-            actor_size is None
+            actor_pool is None
             or type(remote_args) is not dict
             or not remote_args.keys() <= _SUPPORTED_REMOTE_ARGS
         ):
@@ -353,29 +353,21 @@ class FuseCudfActorMapBatches(Rule):
             return None
 
         return _FusionSpec(
-            actor_size=actor_size,
+            actor_pool=actor_pool,
             batch_size=logical_op.batch_size,
             min_rows_per_bundle=logical_op.min_rows_per_bundled_input,
             ray_remote_args=remote_args,
         )
 
     @staticmethod
-    def _fixed_actor_size(compute: Any) -> Optional[int]:
-        if type(compute) is not ActorPoolStrategy:
-            return None
-        size = compute.min_size
+    def _supported_actor_pool(compute: Any) -> Optional[ActorPoolStrategy]:
         if (
-            type(size) is not int
-            or size <= 0
-            or type(compute.max_size) is not int
-            or type(compute.initial_size) is not int
-            or compute.max_size != size
-            or compute.initial_size != size
+            type(compute) is not ActorPoolStrategy
             or compute.enable_true_multi_threading is not False
             or compute.max_tasks_in_flight_per_actor is not None
         ):
             return None
-        return size
+        return compute
 
     @staticmethod
     def _set_fused_name(op: MapBatches, stages: Tuple[_CudfMapStage, ...]) -> None:

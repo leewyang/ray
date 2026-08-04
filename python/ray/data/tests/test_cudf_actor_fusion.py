@@ -379,6 +379,34 @@ def test_public_map_batches_api_fuses_at_physical_planning(monkeypatch, stage_cl
     assert [op.fn for op in physical.dag._logical_operators] == list(stage_classes)
 
 
+@pytest.mark.parametrize(
+    "actor_pool_kwargs",
+    [None, {"min_size": 1, "max_size": 4, "initial_size": 2}],
+    ids=["default-unbounded", "bounded"],
+)
+def test_matching_autoscaling_actor_pools_fuse(monkeypatch, actor_pool_kwargs):
+    context = DataContext.get_current()
+    previous = context.enable_cudf_actor_fusion
+    context.enable_cudf_actor_fusion = True
+    try:
+        dataset = _empty_dataset_from_current(monkeypatch)
+    finally:
+        context.enable_cudf_actor_fusion = previous
+
+    for stage_class in (_PlanA, _PlanB):
+        options = {"batch_format": "cudf", "batch_size": 8, "num_gpus": 1}
+        if actor_pool_kwargs is not None:
+            options["compute"] = ActorPoolStrategy(**actor_pool_kwargs)
+        dataset = dataset.map_batches(stage_class, **options)
+
+    physical, _ = get_execution_plan(dataset._logical_plan)
+
+    assert len(_actors(physical)) == 1
+    assert [stage.fn for stage in _stages(physical)] == [_PlanA, _PlanB]
+    expected = ActorPoolStrategy(**(actor_pool_kwargs or {}))
+    assert _fused_logical(physical).compute == expected
+
+
 @pytest.mark.parametrize("can_modify_num_rows", [False, True])
 def test_physical_contract_lineage_op_map_name_and_metadata(can_modify_num_rows):
     source = InputData([])
@@ -732,7 +760,6 @@ def test_descriptor_wrapped_async_and_generator_stages_remain_unfused(stage_clas
         {"zero_copy_batch": False},
         {"fn": lambda batch: batch, "compute": ActorPoolStrategy(size=2)},
         {"compute": TaskPoolStrategy()},
-        {"compute": ActorPoolStrategy(min_size=1, max_size=2)},
         {"compute": ActorPoolStrategy(size=2, max_tasks_in_flight_per_actor=2)},
         {"compute": ActorPoolStrategy(size=2, enable_true_multi_threading=True)},
         {"ray_remote_args": {}},
@@ -758,7 +785,6 @@ def test_descriptor_wrapped_async_and_generator_stages_remain_unfused(stage_clas
         "copying-batches",
         "function-udf",
         "task-pool",
-        "autoscaling-actors",
         "tasks-in-flight",
         "multithreaded-actor",
         "missing-gpu",
@@ -825,6 +851,10 @@ def test_context_settings_with_incompatible_runtime_semantics_prevent_fusion(
         (
             {"compute": ActorPoolStrategy(size=1)},
             {"compute": ActorPoolStrategy(size=2)},
+        ),
+        (
+            {"compute": ActorPoolStrategy(min_size=1, max_size=3, initial_size=1)},
+            {"compute": ActorPoolStrategy(min_size=1, max_size=3, initial_size=2)},
         ),
         (
             {"ray_remote_args": {"num_gpus": 1, "num_cpus": 1}},
@@ -909,6 +939,7 @@ def test_context_settings_with_incompatible_runtime_semantics_prevent_fusion(
     ids=[
         "batch-size",
         "actor-size",
+        "actor-autoscaling-initial-size",
         "cpu",
         "implicit-versus-explicit-cpu",
         "memory",

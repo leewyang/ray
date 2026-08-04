@@ -707,7 +707,8 @@ class DataContext:
             process, so stages share module, class, library, and CUDA process state.
             If Ray retries a fused task, the complete chain reruns. Actor-local state
             isn't rolled back when instances are reused, and earlier side effects can
-            repeat.
+            repeat. When matching autoscaling pools fuse, one pool scales the complete
+            chain instead of each stage scaling independently.
             Per-stage physical progress and timings collapse into one operator, while
             raw cuDF aliases, indexes, and device-native dtypes remain visible to the
             following stage. Device-to-host work inside a UDF, such as
