@@ -15,9 +15,8 @@ from ray.data._internal.logical.operators.map_operator import MapBatches
 from ray.data._internal.planner.plan_udf_map_op import create_udf_map_operator
 from ray.data.block import _is_cudf_dataframe
 
-
-# Actor identity, unsupported concurrency behavior, and unknown future options
-# remain unfused. This allowlist makes new Ray actor settings conservative by default.
+# Only allow actor options whose behavior fusion knows how to preserve. Any
+# new or unsupported option prevents fusion by default.
 _SUPPORTED_REMOTE_ARGS = frozenset(
     "_labels accelerator_type allow_out_of_order_execution enable_task_events "
     "fallback_strategy label_selector max_concurrency max_restarts "
@@ -29,12 +28,12 @@ _SUPPORTED_REMOTE_ARGS = frozenset(
 
 @dataclass(frozen=True)
 class _CudfMapStage:
-    """Serializable description of one callable-class UDF in a fused actor."""
+    """Serializable settings for one UDF stage in a fused actor."""
 
     fn: type
     label: str
-    # Keep arbitrary user arguments out of Ray's callable-class lookup hash and
-    # equality. They remain serialized here and are passed through unchanged.
+    # User arguments may be unhashable, so keep them out of equality and hashing.
+    # They are still serialized and passed through unchanged.
     fn_constructor_args: Iterable[Any] = field(default=(), compare=False, hash=False)
     fn_constructor_kwargs: Dict[str, Any] = field(
         default_factory=dict, compare=False, hash=False
@@ -44,13 +43,13 @@ class _CudfMapStage:
 
 
 class _FusedCudfMapBatches:
-    """Callable-class UDF that directly passes cuDF outputs between stages."""
+    """Run fused UDFs in order, passing each cuDF result directly to the next."""
 
     def __init__(self, stages: Tuple[_CudfMapStage, ...]):
         self.stages = tuple(stages)
         instances = []
-        # Each actor owns a distinct instance for every stage, including repeated
-        # uses of the same callable class.
+        # Create a separate UDF instance for every stage, even when the same class
+        # appears more than once.
         for stage in self.stages:
             try:
                 instance = stage.fn(
@@ -68,8 +67,8 @@ class _FusedCudfMapBatches:
     def __call__(self, batch: Any) -> Any:
         for stage, instance in zip(self.stages, self._instances):
             try:
-                # Pass the exact returned cuDF object onward. In particular, do not
-                # copy, normalize, convert, or rebatch between stages.
+                # Give the next stage exactly what this stage returned: no copy,
+                # conversion, normalization, or rebatching.
                 batch = instance(batch, *stage.fn_args, **stage.fn_kwargs)
             except Exception as exc:
                 raise RuntimeError(
@@ -108,7 +107,7 @@ class _FusionSpec:
 
 
 def _same_config_value(left: Any, right: Any) -> bool:
-    """Compare nested settings without accepting array-like equality results."""
+    """Compare nested settings without treating array-like equality as equal."""
 
     if type(left) is not type(right):
         return False
@@ -136,14 +135,19 @@ class FuseCudfActorMapBatches(Rule):
             return plan
 
         op_map = plan.op_map.copy()
-        # Count consumers in the original graph. Shared logical or physical nodes
-        # remain fusion barriers even as the rewrite replaces input edges.
+        # Count consumers before rewriting. If either graph says an operator is
+        # shared, stop fusion there because another branch may still need it.
         logical_consumer_counts = self._logical_consumer_counts(op_map)
         physical_consumer_counts = self._physical_consumer_counts(plan.dag)
         memo: Dict[PhysicalOperator, PhysicalOperator] = {}
         changed = False
 
-        def rewrite(op: PhysicalOperator) -> PhysicalOperator:
+        def rewrite_operator(op: PhysicalOperator) -> PhysicalOperator:
+            """Rewrite ``op`` and everything upstream, returning its replacement.
+
+            If a compatible cuDF actor-map chain ends here, replace it with one
+            fused operator. Otherwise, keep ``op`` and rewrite its inputs.
+            """
             nonlocal changed
             if op in memo:
                 return memo[op]
@@ -159,16 +163,16 @@ class FuseCudfActorMapBatches(Rule):
                 logical_run = tuple(op_map[stage_op] for stage_op in run)
                 fused_logical_op = self._create_fused_logical_op(logical_run)
                 ingress_physical_op = run[-1]
-                # Reuse the canonical planner construction path so actor-pool setup,
-                # cuDF boundary conversion, and execution options remain stock Ray.
+                # Build the replacement with Ray's normal map planner so actor setup,
+                # cuDF conversion, and execution settings keep their usual behavior.
                 fused_physical_op = create_udf_map_operator(
                     fused_logical_op,
-                    rewrite(ingress_physical_op.input_dependencies[0]),
+                    rewrite_operator(ingress_physical_op.input_dependencies[0]),
                     plan.context,
                     target_max_block_size_override=target_max_block_size,
                 )
-                # The composite is the planning node, but the original operators stay
-                # attached as physical lineage metadata for plan introspection.
+                # Execute the composite, but keep the original maps attached so plan
+                # inspection still shows where it came from.
                 fused_physical_op.set_logical_operators(*reversed(logical_run))
                 for stage_op in run:
                     op_map.pop(stage_op)
@@ -177,7 +181,9 @@ class FuseCudfActorMapBatches(Rule):
                 changed = True
                 return fused_physical_op
 
-            rewritten_inputs = [rewrite(child) for child in op.input_dependencies]
+            rewritten_inputs = [
+                rewrite_operator(child) for child in op.input_dependencies
+            ]
             if any(
                 rewritten is not original
                 for rewritten, original in zip(
@@ -189,7 +195,7 @@ class FuseCudfActorMapBatches(Rule):
             memo[op] = op
             return op
 
-        new_dag = rewrite(plan.dag)
+        new_dag = rewrite_operator(plan.dag)
         if not changed:
             return plan
         self._rebuild_output_dependencies(new_dag)
@@ -199,9 +205,9 @@ class FuseCudfActorMapBatches(Rule):
     def _context_allows_fusion(context: Any) -> bool:
         if getattr(context, "enable_cudf_actor_fusion", False) is not True:
             return False
-        # Stage-labelled wrapping changes exception types, so selective retry
-        # policies and original-exception mode cannot preserve stock behavior.
-        # Boolean retry-all or retry-none settings remain safe.
+        # Fusion wraps errors with the stage name, so original-exception mode and
+        # exception-specific retries would behave differently. Actors must also use
+        # the default task scheduling.
         return (
             context.raise_original_map_exception is False
             and context.max_tasks_in_flight_per_actor is None
@@ -217,7 +223,10 @@ class FuseCudfActorMapBatches(Rule):
         logical_consumer_counts: Mapping[LogicalOperator, int],
         physical_consumer_counts: Mapping[PhysicalOperator, int],
     ) -> Tuple[Tuple[PhysicalOperator, ...], Optional[int]]:
-        """Collect a maximal compatible run ordered downstream to upstream."""
+        """Walk upstream from ``op`` and collect the longest compatible chain.
+
+        The returned operators are ordered downstream to upstream.
+        """
 
         run_spec = cls._fusion_spec(op, op_map.get(op))
         run = [op]
@@ -231,8 +240,8 @@ class FuseCudfActorMapBatches(Rule):
             upstream_logical_op = op_map.get(upstream)
             upstream_spec = cls._fusion_spec(upstream, upstream_logical_op)
             upstream_target_size = upstream.target_max_block_size_override
-            # Require a single consumer in both representations so replacement
-            # cannot absorb an operator that is still needed elsewhere.
+            # A shared upstream operator is a fusion boundary. Both graphs must
+            # agree that only this chain uses it.
             if (
                 logical_consumer_counts.get(upstream_logical_op, 0) != 1
                 or physical_consumer_counts.get(upstream, 0) != 1
@@ -256,8 +265,9 @@ class FuseCudfActorMapBatches(Rule):
         cls,
         logical_run: Tuple[MapBatches, ...],
     ) -> MapBatches:
-        """Create the private composite for a downstream-to-upstream run."""
+        """Build one composite ``MapBatches`` from a downstream-first run."""
 
+        # The traversal found stages backward, so restore execution order.
         stages = tuple(
             cls._stage_from_op(stage_op, stage_index)
             for stage_index, stage_op in enumerate(reversed(logical_run), start=1)
@@ -376,8 +386,8 @@ class FuseCudfActorMapBatches(Rule):
 
     @staticmethod
     def _stage_from_op(op: MapBatches, stage_index: int) -> _CudfMapStage:
-        # Preserve user containers without copying or iterating here. They are
-        # unpacked only when the fused actor constructs or invokes each stage.
+        # Keep the user's argument containers untouched. The fused actor unpacks
+        # them only when it constructs or calls the stage.
         return _CudfMapStage(
             fn=op.fn,
             label=f"{stage_index}: {op.name}",
@@ -393,8 +403,8 @@ class FuseCudfActorMapBatches(Rule):
 
     @staticmethod
     def _rebuild_output_dependencies(root: PhysicalOperator) -> None:
-        # Input edges are rewritten in place; rebuild their reverse edges once after
-        # the complete traversal so the physical DAG stays internally consistent.
+        # Rewriting changes each operator's inputs. Rebuild the matching output
+        # links once the whole DAG is finished.
         operators = set(root.post_order_iter())
         for op in operators:
             op._output_dependencies = []
