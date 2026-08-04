@@ -2,6 +2,7 @@
 
 from .combine_shuffles import CombineShuffles
 from .common_subexpr_elimination import CommonSubExprElimination
+from .cudf_actor_fusion import FuseCudfActorMapBatches
 from .configure_map_task_memory import (
     ConfigureMapTaskMemoryRule,
     ConfigureMapTaskMemoryUsingOutputSize,
@@ -22,6 +23,7 @@ __all__ = [
     "CommonSubExprElimination",
     "ConfigureMapTaskMemoryRule",
     "ConfigureMapTaskMemoryUsingOutputSize",
+    "FuseCudfActorMapBatches",
     "FuseOperators",
     "InheritTargetMaxBlockSizeRule",
     "LimitPushdownRule",

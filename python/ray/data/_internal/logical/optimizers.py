@@ -16,6 +16,7 @@ from ray.data._internal.logical.rules import (
     CombineShuffles,
     CommonSubExprElimination,
     ConfigureMapTaskMemoryUsingOutputSize,
+    FuseCudfActorMapBatches,
     FuseOperators,
     InheritTargetMaxBlockSizeRule,
     LimitPushdownRule,
@@ -40,6 +41,7 @@ _PHYSICAL_RULESET = Ruleset(
     [
         InheritTargetMaxBlockSizeRule,
         SetReadParallelismRule,
+        FuseCudfActorMapBatches,
         FuseOperators,
         ConfigureMapTaskMemoryUsingOutputSize,
     ]

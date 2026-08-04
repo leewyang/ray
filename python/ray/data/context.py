@@ -79,6 +79,8 @@ DEFAULT_BATCH_TO_BLOCK_ARROW_FORMAT = env_bool(
     "RAY_DATA_DEFAULT_BATCH_TO_BLOCK_ARROW_FORMAT", True
 )
 
+DEFAULT_ENABLE_CUDF_ACTOR_FUSION = False
+
 DEFAULT_READ_OP_MIN_NUM_BLOCKS = 200
 
 DEFAULT_USE_DATASOURCE_V2 = env_bool("RAY_DATA_USE_DATASOURCE_V2", True)
@@ -695,6 +697,24 @@ class DataContext:
             assign multi-dimensional arrays into columns or rely on numpy-only
             operations (e.g. ``%``) that Arrow-backed columns do not implement.
         batch_to_block_arrow_format: Whether to convert Pandas batches to Arrow blocks by default when calling `BlockAccessor.batch_to_block`.
+        enable_cudf_actor_fusion: Whether to fuse compatible consecutive actor-based
+            ``map_batches(batch_format="cudf")`` calls. Fused stages directly pass
+            each cuDF output to the next stage without intermediate rebatching or
+            Arrow conversion. The first stage controls ingress batching, and each
+            exact result--including an empty frame--becomes the next stage's input.
+            Every stage must synchronously return one ``cudf.DataFrame`` or the fused
+            task fails. Each fused worker actor holds all stage objects in one Python
+            process, so stages share module, class, library, and CUDA process state.
+            If Ray retries a fused task, the complete chain reruns. Actor-local state
+            isn't rolled back when instances are reused, and earlier side effects can
+            repeat.
+            Per-stage physical progress and timings collapse into one operator, while
+            raw cuDF aliases, indexes, and device-native dtypes remain visible to the
+            following stage. Device-to-host work inside a UDF, such as
+            ``to_pandas()``, remains the user's responsibility and can't be detected.
+            This setting applies to every compatible maximal run in datasets created
+            from this context; incompatible operators act as barriers. This option is
+            disabled by default.
         gpu_shuffle_num_actors: Number of GPU actors (ranks) for GPU shuffle. Defaults
             to total GPUs available in the cluster.
         gpu_shuffle_rmm_pool_size: RMM GPU memory pool size for each rank. ``"auto"``
@@ -906,6 +926,8 @@ class DataContext:
     )
 
     batch_to_block_arrow_format: bool = DEFAULT_BATCH_TO_BLOCK_ARROW_FORMAT
+
+    enable_cudf_actor_fusion: bool = DEFAULT_ENABLE_CUDF_ACTOR_FUSION
 
     _checkpoint_config: Optional[CheckpointConfig] = None
 
