@@ -42,21 +42,26 @@ _SUPPORTED_REMOTE_ARGS = frozenset(
 
 
 @dataclass(frozen=True)
-class _CudfMapStage:
-    """Payload for one user UDF stage, serialized to each fused actor.
+class _CudfMapStageSpec:
+    """Recipe for rebuilding and calling one original ``map_batches`` UDF.
 
-    The optimizer stores user arguments unchanged; Ray's normal serializer decides
-    whether they can be sent to actors.
+    For a ``Clean -> Normalize`` chain, the optimizer creates one spec for ``Clean``
+    and one for ``Normalize``. Each fused actor receives those specs, constructs one
+    UDF instance from each ``fn`` and its constructor arguments, then calls the
+    instances in order with the stored call arguments. This class only carries data;
+    it never runs the UDF.
     """
 
+    # The user's callable class and the stage name shown in errors.
     fn: type
     label: str
-    # User arguments may be unhashable or implement unusual equality. They still
-    # travel with the stage, but are not part of dataclass equality or hashing.
+    # Arguments used once when each actor constructs this stage's UDF instance.
+    # User values may be unhashable, so they are stored but excluded from equality.
     fn_constructor_args: Iterable[Any] = field(default=(), compare=False, hash=False)
     fn_constructor_kwargs: Dict[str, Any] = field(
         default_factory=dict, compare=False, hash=False
     )
+    # Additional arguments passed every time this stage processes a batch.
     fn_args: Iterable[Any] = field(default=(), compare=False, hash=False)
     fn_kwargs: Dict[str, Any] = field(default_factory=dict, compare=False, hash=False)
 
@@ -69,7 +74,7 @@ class _FusedCudfMapBatches:
     DataFrame.
     """
 
-    def __init__(self, stages: Tuple[_CudfMapStage, ...]):
+    def __init__(self, stages: Tuple[_CudfMapStageSpec, ...]):
         self.stages = tuple(stages)
         instances = []
         # Create a separate UDF instance for every stage, even when the same class
@@ -476,17 +481,17 @@ class FuseCudfActorMapBatches(Rule):
         return compute
 
     @staticmethod
-    def _set_fused_name(op: MapBatches, stages: Tuple[_CudfMapStage, ...]) -> None:
+    def _set_fused_name(op: MapBatches, stages: Tuple[_CudfMapStageSpec, ...]) -> None:
         names = "->".join(stage.fn.__name__ for stage in stages)
         # MapBatches is frozen; _name affects display only.
         object.__setattr__(op, "_name", f"MapBatches({names})")
 
     @staticmethod
-    def _stage_from_op(op: MapBatches, stage_index: int) -> _CudfMapStage:
+    def _stage_from_op(op: MapBatches, stage_index: int) -> _CudfMapStageSpec:
         # Keep the user's argument containers untouched. The fused actor unpacks
         # them only when it constructs or calls the stage. The numbered label lets
         # constructor and runtime errors identify the exact stage.
-        return _CudfMapStage(
+        return _CudfMapStageSpec(
             fn=op.fn,
             label=f"{stage_index}: {op.name}",
             fn_constructor_args=(

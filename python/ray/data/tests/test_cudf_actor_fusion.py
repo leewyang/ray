@@ -20,7 +20,7 @@ from ray.data._internal.logical.optimizers import LogicalOptimizer, get_executio
 from ray.data._internal.logical.rules import cudf_actor_fusion
 from ray.data._internal.logical.rules.cudf_actor_fusion import (
     FuseCudfActorMapBatches,
-    _CudfMapStage,
+    _CudfMapStageSpec,
     _FusedCudfMapBatches,
 )
 from ray.data._internal.planner import create_planner
@@ -548,8 +548,8 @@ def test_direct_fusion_passes_row_changing_frames_without_rebatching(fake_cudf):
     seen = []
     runner = _FusedCudfMapBatches(
         (
-            _CudfMapStage(_KeepEvenRows, "keep-even"),
-            _CudfMapStage(
+            _CudfMapStageSpec(_KeepEvenRows, "keep-even"),
+            _CudfMapStageSpec(
                 _ObserveAndDuplicateRows,
                 "duplicate",
                 fn_constructor_args=(seen,),
@@ -568,12 +568,12 @@ def test_empty_frame_is_passed_through_every_stage(fake_cudf):
     empty = _FakeFrame([])
     runner = _FusedCudfMapBatches(
         (
-            _CudfMapStage(
+            _CudfMapStageSpec(
                 _RecordIdentity,
                 "first",
                 fn_constructor_args=(calls, "first"),
             ),
-            _CudfMapStage(
+            _CudfMapStageSpec(
                 _RecordIdentity,
                 "second",
                 fn_constructor_args=(calls, "second"),
@@ -653,12 +653,12 @@ def test_repeated_classes_construct_distinct_stage_instances(fake_cudf):
     instances = []
     runner = _FusedCudfMapBatches(
         (
-            _CudfMapStage(
+            _CudfMapStageSpec(
                 _StatefulStage,
                 "plus-one",
                 fn_constructor_args=(instances, 1),
             ),
-            _CudfMapStage(
+            _CudfMapStageSpec(
                 _StatefulStage,
                 "plus-ten",
                 fn_constructor_args=(instances, 10),
@@ -707,7 +707,7 @@ def test_single_stage_run_remains_unfused():
 def test_wrong_stage_types_and_generator_outputs_are_rejected(
     fake_cudf, stage_class, label
 ):
-    runner = _FusedCudfMapBatches((_CudfMapStage(stage_class, label),))
+    runner = _FusedCudfMapBatches((_CudfMapStageSpec(stage_class, label),))
 
     with pytest.raises(TypeError, match="expected cudf\\.DataFrame") as error:
         runner(_FakeFrame([1]))
@@ -716,7 +716,7 @@ def test_wrong_stage_types_and_generator_outputs_are_rejected(
 
 
 def test_stage_exceptions_are_labeled_and_chained(fake_cudf):
-    runner = _FusedCudfMapBatches((_CudfMapStage(_RaiseFromStage, "explode"),))
+    runner = _FusedCudfMapBatches((_CudfMapStageSpec(_RaiseFromStage, "explode"),))
 
     with pytest.raises(RuntimeError, match="stage 'explode' failed") as error:
         runner(_FakeFrame([1]))
@@ -729,7 +729,9 @@ def test_constructor_exceptions_are_labeled_and_chained():
     with pytest.raises(
         RuntimeError, match="stage 'construct' failed during construction"
     ) as error:
-        _FusedCudfMapBatches((_CudfMapStage(_RaiseDuringConstruction, "construct"),))
+        _FusedCudfMapBatches(
+            (_CudfMapStageSpec(_RaiseDuringConstruction, "construct"),)
+        )
 
     assert isinstance(error.value.__cause__, ValueError)
     assert str(error.value.__cause__) == "constructor exploded"
