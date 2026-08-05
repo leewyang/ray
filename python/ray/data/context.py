@@ -698,17 +698,13 @@ class DataContext:
             operations (e.g. ``%``) that Arrow-backed columns do not implement.
         batch_to_block_arrow_format: Whether to convert Pandas batches to Arrow blocks by default when calling `BlockAccessor.batch_to_block`.
         enable_cudf_actor_fusion: Whether to fuse compatible consecutive actor-based
-            ``map_batches(batch_format="cudf")`` calls. Fusion runs every stage for a
-            batch in the same actor and gives the next stage the exact cuDF DataFrame
-            returned by the previous one, without Arrow conversion or rebatching. The
-            first stage controls the input batch size, and every stage must
-            synchronously return one ``cudf.DataFrame``. Each actor holds all stage
-            objects and their GPU state at once. A retry reruns the whole chain and can
-            repeat side effects; actor state is not rolled back. Matching autoscaling
-            pools become one pool for the whole chain. Ray reports one physical
-            operator, so per-stage progress and timing are not available. The next
-            stage can see aliases, indexes, and device-native dtypes from the previous
-            result. Ray cannot detect device-to-host work inside a UDF, such as
+            ``map_batches(batch_format="cudf")`` calls. Each stage runs in the same
+            actor and passes its exact cuDF result to the next stage without Arrow
+            conversion or rebatching. The first stage controls the input batch size,
+            and every stage must synchronously return one ``cudf.DataFrame``. Each
+            actor holds all stage objects and GPU state; retries rerun the full chain,
+            and Ray reports one physical operator instead of per-stage progress and
+            timing. Ray cannot detect device-to-host work inside a UDF, such as
             ``to_pandas()``. This setting is off by default and applies independently
             to each compatible run in datasets created from this context.
         gpu_shuffle_num_actors: Number of GPU actors (ranks) for GPU shuffle. Defaults

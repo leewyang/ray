@@ -300,7 +300,7 @@ def create_udf_map_operator(
     *,
     target_max_block_size_override: Optional[int] = None,
 ) -> MapOperator:
-    """Create the physical map operator for one logical UDF map."""
+    """Lower one logical UDF map onto its already-planned physical input."""
 
     output_block_size_option = OutputBlockSizeOption.of(
         target_max_block_size=data_context.target_max_block_size,

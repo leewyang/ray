@@ -20,7 +20,7 @@ from ray.data._internal.logical.optimizers import LogicalOptimizer, get_executio
 from ray.data._internal.logical.rules import cudf_actor_fusion
 from ray.data._internal.logical.rules.cudf_actor_fusion import (
     FuseCudfActorMapBatches,
-    _CudfMapStageDefinition,
+    _CudfMapStage,
     _FusedCudfMapBatches,
 )
 from ray.data._internal.planner import create_planner
@@ -39,59 +39,59 @@ class _FakeFrame:
         return len(self.rows)
 
 
-class _PlanA:
+class _Udf1:
     def __call__(self, batch):
         return batch
 
 
-class _PlanB:
+class _Udf2:
     def __call__(self, batch):
         return batch
 
 
-class _PlanC:
+class _Udf3:
     def __call__(self, batch):
         return batch
 
 
-class _PlanD:
+class _Udf4:
     def __call__(self, batch):
         return batch
 
 
-class _PlanE:
+class _Udf5:
     def __call__(self, batch):
         return batch
 
 
-class _AsyncPlanStage:
+class _AsyncUdf:
     async def __call__(self, batch):
         return batch
 
 
-class _AsyncGeneratorPlanStage:
+class _AsyncGeneratorUdf:
     async def __call__(self, batch):
         yield batch
 
 
-class _GeneratorPlanStage:
+class _GeneratorUdf:
     def __call__(self, batch):
         yield batch
 
 
-class _StaticAsyncPlanStage:
+class _StaticAsyncUdf:
     @staticmethod
     async def __call__(batch):
         return batch
 
 
-class _ClassGeneratorPlanStage:
+class _ClassGeneratorUdf:
     @classmethod
     def __call__(cls, batch):
         yield batch
 
 
-def _task_plan_stage(batch):
+def _task_udf(batch):
     return batch
 
 
@@ -212,9 +212,9 @@ def fake_cudf(monkeypatch):
     )
 
 
-def _actor_map(
+def _make_actor_map(
     input_op,
-    fn=_PlanA,
+    fn=_Udf1,
     *,
     batch_size=8,
     batch_format="cudf",
@@ -257,47 +257,55 @@ def _actor_map(
     )
 
 
-def _chain(*stage_classes, **kwargs):
+def _make_actor_map_chain(*udf_classes, **kwargs):
     current = InputData([])
     operators = []
-    for stage_class in stage_classes:
-        current = _actor_map(current, stage_class, **kwargs)
+    for udf_class in udf_classes:
+        current = _make_actor_map(current, udf_class, **kwargs)
         operators.append(current)
     return current, operators
 
 
-def _context(*, enabled):
+def _fusion_context(*, enabled):
     context = DataContext.get_current().copy()
     context.enable_cudf_actor_fusion = enabled
     return context
 
 
-def _raw_physical_plan(root, *, enabled=True, context=None):
+def _create_unoptimized_physical_plan(root, *, enabled=True, context=None):
     if context is None:
-        context = _context(enabled=enabled)
+        context = _fusion_context(enabled=enabled)
     plan, _ = create_planner().plan(LogicalPlan(root, context))
     return plan
 
 
-def _apply(root, *, enabled=True, context=None):
+def _apply_fusion_rule(root, *, enabled=True, context=None):
     return FuseCudfActorMapBatches().apply(
-        _raw_physical_plan(root, enabled=enabled, context=context)
+        _create_unoptimized_physical_plan(root, enabled=enabled, context=context)
     )
 
 
-def _reachable(root):
+def _all_physical_operators(root):
     return list(root.post_order_iter())
 
 
-def _actors(plan):
-    return [op for op in _reachable(plan.dag) if isinstance(op, ActorPoolMapOperator)]
+def _actor_map_operators(plan):
+    return [
+        op
+        for op in _all_physical_operators(plan.dag)
+        if isinstance(op, ActorPoolMapOperator)
+    ]
 
 
-def _tasks(plan):
-    return [op for op in _reachable(plan.dag) if isinstance(op, TaskPoolMapOperator)]
+def _task_map_operators(plan):
+    return [
+        op
+        for op in _all_physical_operators(plan.dag)
+        if isinstance(op, TaskPoolMapOperator)
+    ]
 
 
-def _fused_logical(plan, physical_op=None):
+def _fused_logical_map(plan, physical_op=None):
     if physical_op is None:
         physical_op = plan.dag
     logical_op = plan.op_map[physical_op]
@@ -306,13 +314,13 @@ def _fused_logical(plan, physical_op=None):
     return logical_op
 
 
-def _stages(plan, physical_op=None):
-    logical_op = _fused_logical(plan, physical_op)
+def _fused_stages(plan, physical_op=None):
+    logical_op = _fused_logical_map(plan, physical_op)
     assert logical_op.fn_constructor_args is not None
     return logical_op.fn_constructor_args[0]
 
 
-def _empty_dataset_from_current(monkeypatch):
+def _empty_dataset_with_current_context(monkeypatch):
     monkeypatch.setattr(
         _StatsManager,
         "gen_dataset_id_from_stats_actor",
@@ -326,38 +334,43 @@ def _empty_dataset_from_current(monkeypatch):
     )
 
 
+# Physical planning
+
+
 def test_default_disabled_and_logical_plan_is_never_rewritten():
     assert DEFAULT_ENABLE_CUDF_ACTOR_FUSION is False
     assert DataContext().enable_cudf_actor_fusion is False
-    root, operators = _chain(_PlanA, _PlanB)
+    root, operators = _make_actor_map_chain(_Udf1, _Udf2)
 
-    optimized = LogicalOptimizer().optimize(LogicalPlan(root, _context(enabled=True)))
+    optimized = LogicalOptimizer().optimize(
+        LogicalPlan(root, _fusion_context(enabled=True))
+    )
     assert optimized.dag is root
-    assert root.fn is _PlanB
+    assert root.fn is _Udf2
     assert root.input_dependencies[0] is operators[0]
 
-    disabled = _raw_physical_plan(root, enabled=False)
+    disabled = _create_unoptimized_physical_plan(root, enabled=False)
     assert FuseCudfActorMapBatches().apply(disabled) is disabled
-    assert len(_actors(disabled)) == 2
+    assert len(_actor_map_operators(disabled)) == 2
 
-    logical_plan = LogicalPlan(root, _context(enabled=True))
+    logical_plan = LogicalPlan(root, _fusion_context(enabled=True))
     physical, _ = get_execution_plan(logical_plan)
     assert logical_plan.dag is root
     assert root.input_dependencies[0] is operators[0]
-    assert len(_actors(physical)) == 1
+    assert len(_actor_map_operators(physical)) == 1
 
 
 @pytest.mark.parametrize(
-    "stage_classes",
-    [(_PlanA, _PlanB), (_PlanA, _PlanB, _PlanC)],
-    ids=["two-stages", "three-stages"],
+    "udf_classes",
+    [(_Udf1, _Udf2), (_Udf1, _Udf2, _Udf3)],
+    ids=["two-udfs", "three-udfs"],
 )
-def test_public_map_batches_api_fuses_at_physical_planning(monkeypatch, stage_classes):
+def test_public_map_batches_api_fuses_at_physical_planning(monkeypatch, udf_classes):
     context = DataContext.get_current()
     previous = context.enable_cudf_actor_fusion
     context.enable_cudf_actor_fusion = True
     try:
-        dataset = _empty_dataset_from_current(monkeypatch)
+        dataset = _empty_dataset_with_current_context(monkeypatch)
     finally:
         context.enable_cudf_actor_fusion = previous
 
@@ -367,16 +380,16 @@ def test_public_map_batches_api_fuses_at_physical_planning(monkeypatch, stage_cl
         "compute": ray.data.ActorPoolStrategy(size=4),
         "num_gpus": 1,
     }
-    for stage_class in stage_classes:
-        dataset = dataset.map_batches(stage_class, **options)
+    for udf_class in udf_classes:
+        dataset = dataset.map_batches(udf_class, **options)
 
     logical_root = dataset._logical_plan.dag
     physical, _ = get_execution_plan(dataset._logical_plan)
 
-    assert logical_root.fn is stage_classes[-1]
+    assert logical_root.fn is udf_classes[-1]
     assert dataset._logical_plan.dag is logical_root
-    assert len(_actors(physical)) == 1
-    assert [op.fn for op in physical.dag._logical_operators] == list(stage_classes)
+    assert len(_actor_map_operators(physical)) == 1
+    assert [op.fn for op in physical.dag._logical_operators] == list(udf_classes)
 
 
 @pytest.mark.parametrize(
@@ -389,52 +402,52 @@ def test_matching_autoscaling_actor_pools_fuse(monkeypatch, actor_pool_kwargs):
     previous = context.enable_cudf_actor_fusion
     context.enable_cudf_actor_fusion = True
     try:
-        dataset = _empty_dataset_from_current(monkeypatch)
+        dataset = _empty_dataset_with_current_context(monkeypatch)
     finally:
         context.enable_cudf_actor_fusion = previous
 
-    for stage_class in (_PlanA, _PlanB):
+    for udf_class in (_Udf1, _Udf2):
         options = {"batch_format": "cudf", "batch_size": 8, "num_gpus": 1}
         if actor_pool_kwargs is not None:
             options["compute"] = ActorPoolStrategy(**actor_pool_kwargs)
-        dataset = dataset.map_batches(stage_class, **options)
+        dataset = dataset.map_batches(udf_class, **options)
 
     physical, _ = get_execution_plan(dataset._logical_plan)
 
-    assert len(_actors(physical)) == 1
-    assert [stage.udf_class for stage in _stages(physical)] == [_PlanA, _PlanB]
+    assert len(_actor_map_operators(physical)) == 1
+    assert [stage.udf_class for stage in _fused_stages(physical)] == [_Udf1, _Udf2]
     expected = ActorPoolStrategy(**(actor_pool_kwargs or {}))
-    assert _fused_logical(physical).compute == expected
+    assert _fused_logical_map(physical).compute == expected
 
 
 @pytest.mark.parametrize("can_modify_num_rows", [False, True])
 def test_physical_contract_lineage_op_map_name_and_metadata(can_modify_num_rows):
     source = InputData([])
-    first = _actor_map(source, _PlanA)
-    second = _actor_map(
+    first = _make_actor_map(source, _Udf1)
+    second = _make_actor_map(
         first,
-        _PlanB,
+        _Udf2,
         can_modify_num_rows=can_modify_num_rows,
     )
-    third = _actor_map(second, _PlanC)
-    raw = _raw_physical_plan(third)
+    third = _make_actor_map(second, _Udf3)
+    raw = _create_unoptimized_physical_plan(third)
 
-    assert len(_actors(raw)) == 3
+    assert len(_actor_map_operators(raw)) == 3
     fused = FuseCudfActorMapBatches().apply(raw)
     actor = fused.dag
-    fused_logical = _fused_logical(fused)
+    fused_logical = _fused_logical_map(fused)
 
     assert isinstance(actor, ActorPoolMapOperator)
-    assert len(_actors(fused)) == 1
-    assert [stage.udf_class for stage in _stages(fused)] == [_PlanA, _PlanB, _PlanC]
-    assert actor.name == "MapBatches(_PlanA->_PlanB->_PlanC)"
+    assert len(_actor_map_operators(fused)) == 1
+    assert [stage.udf_class for stage in _fused_stages(fused)] == [_Udf1, _Udf2, _Udf3]
+    assert actor.name == "MapBatches(_Udf1->_Udf2->_Udf3)"
     assert fused_logical.name == actor.name
     assert fused_logical.can_modify_num_rows is can_modify_num_rows
     assert fused_logical.batch_size == first.batch_size
     assert fused_logical.compute == first.compute
     assert actor._logical_operators == [first, second, third]
-    assert set(fused.op_map) == set(_reachable(actor))
-    assert all(op not in fused.op_map for op in _actors(raw))
+    assert set(fused.op_map) == set(_all_physical_operators(actor))
+    assert all(op not in fused.op_map for op in _actor_map_operators(raw))
     assert actor.input_dependencies[0].output_dependencies == [actor]
     transform_fns = actor.get_map_transformer().get_transform_fns()
     assert sum(isinstance(fn, BatchMapTransformFn) for fn in transform_fns) == 1
@@ -442,8 +455,8 @@ def test_physical_contract_lineage_op_map_name_and_metadata(can_modify_num_rows)
 
 @pytest.mark.parametrize("override_stage", ["upstream", "downstream"])
 def test_single_target_max_block_size_override_is_preserved(override_stage):
-    root, _ = _chain(_PlanA, _PlanB)
-    raw = _raw_physical_plan(root)
+    root, _ = _make_actor_map_chain(_Udf1, _Udf2)
+    raw = _create_unoptimized_physical_plan(root)
     downstream = raw.dag
     upstream = downstream.input_dependencies[0]
     overridden = upstream if override_stage == "upstream" else downstream
@@ -451,13 +464,13 @@ def test_single_target_max_block_size_override_is_preserved(override_stage):
 
     fused = FuseCudfActorMapBatches().apply(raw)
 
-    assert len(_actors(fused)) == 1
+    assert len(_actor_map_operators(fused)) == 1
     assert fused.dag.target_max_block_size_override == 1024
 
 
 def test_conflicting_target_max_block_size_overrides_prevent_fusion():
-    root, _ = _chain(_PlanA, _PlanB)
-    raw = _raw_physical_plan(root)
+    root, _ = _make_actor_map_chain(_Udf1, _Udf2)
+    raw = _create_unoptimized_physical_plan(root)
     downstream = raw.dag
     upstream = downstream.input_dependencies[0]
     upstream.override_target_max_block_size(1024)
@@ -466,15 +479,15 @@ def test_conflicting_target_max_block_size_overrides_prevent_fusion():
     result = FuseCudfActorMapBatches().apply(raw)
 
     assert result is raw
-    assert len(_actors(result)) == 2
+    assert len(_actor_map_operators(result)) == 2
 
 
 @pytest.mark.parametrize("unsupported_stage", ["upstream", "downstream"])
 def test_physical_operator_that_disallows_fusion_prevents_cudf_fusion(
     unsupported_stage,
 ):
-    root, _ = _chain(_PlanA, _PlanB)
-    raw = _raw_physical_plan(root)
+    root, _ = _make_actor_map_chain(_Udf1, _Udf2)
+    raw = _create_unoptimized_physical_plan(root)
     downstream = raw.dag
     upstream = downstream.input_dependencies[0]
     unsupported = upstream if unsupported_stage == "upstream" else downstream
@@ -483,12 +496,12 @@ def test_physical_operator_that_disallows_fusion_prevents_cudf_fusion(
     result = FuseCudfActorMapBatches().apply(raw)
 
     assert result is raw
-    assert len(_actors(result)) == 2
+    assert len(_actor_map_operators(result)) == 2
 
 
 def test_rule_is_idempotent_and_replanning_does_not_mutate_logical_chain():
-    root, operators = _chain(_PlanA, _PlanB, _PlanC)
-    logical_plan = LogicalPlan(root, _context(enabled=True))
+    root, operators = _make_actor_map_chain(_Udf1, _Udf2, _Udf3)
+    logical_plan = LogicalPlan(root, _fusion_context(enabled=True))
     raw, _ = create_planner().plan(logical_plan)
 
     fused = FuseCudfActorMapBatches().apply(raw)
@@ -501,7 +514,7 @@ def test_rule_is_idempotent_and_replanning_does_not_mutate_logical_chain():
     assert root.input_dependencies[0] is operators[1]
     assert operators[1].input_dependencies[0] is operators[0]
     for physical in (first_physical, second_physical):
-        assert len(_actors(physical)) == 1
+        assert len(_actor_map_operators(physical)) == 1
         assert physical.dag._logical_operators == operators
         transform_fns = physical.dag.get_map_transformer().get_transform_fns()
         assert sum(isinstance(fn, BatchMapTransformFn) for fn in transform_fns) == 1
@@ -509,16 +522,16 @@ def test_rule_is_idempotent_and_replanning_does_not_mutate_logical_chain():
 
 def test_stock_task_to_actor_fusion_still_runs_after_cudf_fusion():
     source = InputData([])
-    task = _actor_map(source, _task_plan_stage, compute=TaskPoolStrategy())
-    first = _actor_map(task, _PlanA)
-    second = _actor_map(first, _PlanB)
+    task = _make_actor_map(source, _task_udf, compute=TaskPoolStrategy())
+    first = _make_actor_map(task, _Udf1)
+    second = _make_actor_map(first, _Udf2)
 
-    physical, _ = get_execution_plan(LogicalPlan(second, _context(enabled=True)))
+    physical, _ = get_execution_plan(LogicalPlan(second, _fusion_context(enabled=True)))
 
-    assert len(_actors(physical)) == 1
-    assert not _tasks(physical)
+    assert len(_actor_map_operators(physical)) == 1
+    assert not _task_map_operators(physical)
     assert physical.dag._logical_operators == [task, first, second]
-    assert set(physical.op_map) == set(_reachable(physical.dag))
+    assert set(physical.op_map) == set(_all_physical_operators(physical.dag))
 
 
 def test_dataset_creation_captures_fusion_setting(monkeypatch):
@@ -526,7 +539,7 @@ def test_dataset_creation_captures_fusion_setting(monkeypatch):
     previous = context.enable_cudf_actor_fusion
     try:
         context.enable_cudf_actor_fusion = True
-        captured = _empty_dataset_from_current(monkeypatch)
+        captured = _empty_dataset_with_current_context(monkeypatch)
         context.enable_cudf_actor_fusion = False
 
         options = {
@@ -535,21 +548,24 @@ def test_dataset_creation_captures_fusion_setting(monkeypatch):
             "compute": ray.data.ActorPoolStrategy(size=1),
             "num_gpus": 1,
         }
-        dataset = captured.map_batches(_PlanA, **options).map_batches(_PlanB, **options)
+        dataset = captured.map_batches(_Udf1, **options).map_batches(_Udf2, **options)
         physical, _ = get_execution_plan(dataset._logical_plan)
     finally:
         context.enable_cudf_actor_fusion = previous
 
     assert captured.context.enable_cudf_actor_fusion is True
-    assert len(_actors(physical)) == 1
+    assert len(_actor_map_operators(physical)) == 1
+
+
+# Fused actor execution
 
 
 def test_direct_fusion_passes_row_changing_frames_without_rebatching(fake_cudf):
     seen = []
     runner = _FusedCudfMapBatches(
         (
-            _CudfMapStageDefinition(_KeepEvenRows, "keep-even"),
-            _CudfMapStageDefinition(
+            _CudfMapStage(_KeepEvenRows, "keep-even"),
+            _CudfMapStage(
                 _ObserveAndDuplicateRows,
                 "duplicate",
                 constructor_args=(seen,),
@@ -568,12 +584,12 @@ def test_empty_frame_is_passed_through_every_stage(fake_cudf):
     empty = _FakeFrame([])
     runner = _FusedCudfMapBatches(
         (
-            _CudfMapStageDefinition(
+            _CudfMapStage(
                 _RecordIdentity,
                 "first",
                 constructor_args=(calls, "first"),
             ),
-            _CudfMapStageDefinition(
+            _CudfMapStage(
                 _RecordIdentity,
                 "second",
                 constructor_args=(calls, "second"),
@@ -589,7 +605,7 @@ def test_empty_frame_is_passed_through_every_stage(fake_cudf):
 
 def test_constructor_and_call_arguments_survive_physical_fusion(fake_cudf):
     source = InputData([])
-    first = _actor_map(
+    first = _make_actor_map(
         source,
         _ConfiguredStage,
         fn_constructor_args=(2,),
@@ -597,7 +613,7 @@ def test_constructor_and_call_arguments_survive_physical_fusion(fake_cudf):
         fn_args=(4,),
         fn_kwargs={"bias": 5},
     )
-    second = _actor_map(
+    second = _make_actor_map(
         first,
         _ConfiguredStage,
         fn_constructor_args=(-1,),
@@ -606,8 +622,8 @@ def test_constructor_and_call_arguments_survive_physical_fusion(fake_cudf):
         fn_kwargs={"bias": 0},
     )
 
-    fused = _apply(second)
-    stages = _stages(fused)
+    fused = _apply_fusion_rule(second)
+    stages = _fused_stages(fused)
 
     assert stages[0].constructor_args == (2,)
     assert stages[0].constructor_kwargs == {"scale": 3}
@@ -624,7 +640,7 @@ def test_argument_iterables_are_preserved_until_actor_execution(fake_cudf):
     constructor_kwargs = {"scale": 3}
     call_kwargs = {"bias": 5}
     source = InputData([])
-    first = _actor_map(
+    first = _make_actor_map(
         source,
         _ConfiguredStage,
         fn_constructor_args=constructor_args,
@@ -632,9 +648,9 @@ def test_argument_iterables_are_preserved_until_actor_execution(fake_cudf):
         fn_args=call_args,
         fn_kwargs=call_kwargs,
     )
-    second = _actor_map(first, _PlanB)
+    second = _make_actor_map(first, _Udf2)
 
-    stages = _stages(_apply(second))
+    stages = _fused_stages(_apply_fusion_rule(second))
 
     assert constructor_args.iterations == 0
     assert call_args.iterations == 0
@@ -653,12 +669,12 @@ def test_repeated_classes_construct_distinct_stage_instances(fake_cudf):
     instances = []
     runner = _FusedCudfMapBatches(
         (
-            _CudfMapStageDefinition(
+            _CudfMapStage(
                 _StatefulStage,
                 "plus-one",
                 constructor_args=(instances, 1),
             ),
-            _CudfMapStageDefinition(
+            _CudfMapStage(
                 _StatefulStage,
                 "plus-ten",
                 constructor_args=(instances, 10),
@@ -675,27 +691,27 @@ def test_repeated_classes_construct_distinct_stage_instances(fake_cudf):
 
 
 def test_repeated_classes_have_distinct_stage_labels():
-    root, _ = _chain(_PlanA, _PlanA)
+    root, _ = _make_actor_map_chain(_Udf1, _Udf1)
 
-    labels = [stage.error_label for stage in _stages(_apply(root))]
+    labels = [stage.error_label for stage in _fused_stages(_apply_fusion_rule(root))]
 
     assert labels == [
-        "1: MapBatches(_PlanA)",
-        "2: MapBatches(_PlanA)",
+        "1: MapBatches(_Udf1)",
+        "2: MapBatches(_Udf1)",
     ]
 
 
 def test_single_stage_run_remains_unfused():
-    single = _actor_map(InputData([]), _PlanA)
-    raw = _raw_physical_plan(single)
+    single = _make_actor_map(InputData([]), _Udf1)
+    raw = _create_unoptimized_physical_plan(single)
 
     assert FuseCudfActorMapBatches().apply(raw) is raw
-    assert len(_actors(raw)) == 1
+    assert len(_actor_map_operators(raw)) == 1
     assert raw.op_map[raw.dag] is single
 
 
 @pytest.mark.parametrize(
-    ("stage_class", "label"),
+    ("udf_class", "label"),
     [
         (_WrongOutput, "wrong-output"),
         (_GeneratorOutput, "generator-output"),
@@ -705,9 +721,9 @@ def test_single_stage_run_remains_unfused():
     ],
 )
 def test_wrong_stage_types_and_generator_outputs_are_rejected(
-    fake_cudf, stage_class, label
+    fake_cudf, udf_class, label
 ):
-    runner = _FusedCudfMapBatches((_CudfMapStageDefinition(stage_class, label),))
+    runner = _FusedCudfMapBatches((_CudfMapStage(udf_class, label),))
 
     with pytest.raises(TypeError, match="expected cudf\\.DataFrame") as error:
         runner(_FakeFrame([1]))
@@ -716,9 +732,7 @@ def test_wrong_stage_types_and_generator_outputs_are_rejected(
 
 
 def test_stage_exceptions_are_labeled_and_chained(fake_cudf):
-    runner = _FusedCudfMapBatches(
-        (_CudfMapStageDefinition(_RaiseFromStage, "explode"),)
-    )
+    runner = _FusedCudfMapBatches((_CudfMapStage(_RaiseFromStage, "explode"),))
 
     with pytest.raises(RuntimeError, match="stage 'explode' failed") as error:
         runner(_FakeFrame([1]))
@@ -731,27 +745,28 @@ def test_constructor_exceptions_are_labeled_and_chained():
     with pytest.raises(
         RuntimeError, match="stage 'construct' failed during construction"
     ) as error:
-        _FusedCudfMapBatches(
-            (_CudfMapStageDefinition(_RaiseDuringConstruction, "construct"),)
-        )
+        _FusedCudfMapBatches((_CudfMapStage(_RaiseDuringConstruction, "construct"),))
 
     assert isinstance(error.value.__cause__, ValueError)
     assert str(error.value.__cause__) == "constructor exploded"
 
 
+# Fusion eligibility and compatibility
+
+
 @pytest.mark.parametrize(
-    "stage_class",
-    [_GeneratorPlanStage, _StaticAsyncPlanStage, _ClassGeneratorPlanStage],
+    "udf_class",
+    [_GeneratorUdf, _StaticAsyncUdf, _ClassGeneratorUdf],
     ids=["generator", "staticmethod-async", "classmethod-generator"],
 )
-def test_descriptor_wrapped_async_and_generator_stages_remain_unfused(stage_class):
+def test_descriptor_wrapped_async_and_generator_stages_remain_unfused(udf_class):
     source = InputData([])
-    upstream = _actor_map(source, _PlanA)
-    unsupported = _actor_map(upstream, stage_class)
+    upstream = _make_actor_map(source, _Udf1)
+    unsupported = _make_actor_map(upstream, udf_class)
 
-    result = _apply(unsupported)
+    result = _apply_fusion_rule(unsupported)
 
-    assert len(_actors(result)) == 2
+    assert len(_actor_map_operators(result)) == 2
     assert result.op_map[result.dag] is unsupported
 
 
@@ -779,8 +794,8 @@ def test_descriptor_wrapped_async_and_generator_stages_remain_unfused(stage_clas
         {"ray_remote_args": {"num_gpus": 1, "max_pending_calls": 1}},
         {"ray_remote_args_fn": lambda: {"num_gpus": 1}},
         {"per_block_limit": 1},
-        {"fn": _AsyncPlanStage},
-        {"fn": _AsyncGeneratorPlanStage},
+        {"fn": _AsyncUdf},
+        {"fn": _AsyncGeneratorUdf},
     ],
     ids=[
         "non-cudf",
@@ -810,12 +825,14 @@ def test_descriptor_wrapped_async_and_generator_stages_remain_unfused(stage_clas
 )
 def test_ineligible_map_breaks_a_fusion_run(overrides):
     source = InputData([])
-    upstream = _actor_map(source, _PlanA)
-    downstream = _actor_map(upstream, **overrides)
+    upstream = _make_actor_map(source, _Udf1)
+    downstream = _make_actor_map(upstream, **overrides)
 
-    result = _apply(downstream)
+    result = _apply_fusion_rule(downstream)
 
-    assert len(_actors(result)) == 2 or isinstance(result.dag, TaskPoolMapOperator)
+    assert len(_actor_map_operators(result)) == 2 or isinstance(
+        result.dag, TaskPoolMapOperator
+    )
     assert result.op_map[result.dag] is downstream
 
 
@@ -837,15 +854,15 @@ def test_ineligible_map_breaks_a_fusion_run(overrides):
 def test_context_settings_with_incompatible_runtime_semantics_prevent_fusion(
     setting, value
 ):
-    root, _ = _chain(_PlanA, _PlanB)
-    context = _context(enabled=True)
+    root, _ = _make_actor_map_chain(_Udf1, _Udf2)
+    context = _fusion_context(enabled=True)
     setattr(context, setting, value)
-    raw = _raw_physical_plan(root, context=context)
+    raw = _create_unoptimized_physical_plan(root, context=context)
 
     result = FuseCudfActorMapBatches().apply(raw)
 
     assert result is raw
-    assert len(_actors(result)) == 2
+    assert len(_actor_map_operators(result)) == 2
 
 
 @pytest.mark.parametrize(
@@ -961,12 +978,12 @@ def test_individually_eligible_but_incompatible_maps_do_not_fuse(
     upstream_overrides, downstream_overrides
 ):
     source = InputData([])
-    upstream = _actor_map(source, _PlanA, **upstream_overrides)
-    downstream = _actor_map(upstream, _PlanB, **downstream_overrides)
+    upstream = _make_actor_map(source, _Udf1, **upstream_overrides)
+    downstream = _make_actor_map(upstream, _Udf2, **downstream_overrides)
 
-    result = _apply(downstream)
+    result = _apply_fusion_rule(downstream)
 
-    assert len(_actors(result)) == 2
+    assert len(_actor_map_operators(result)) == 2
     assert result.op_map[result.dag] is downstream
 
 
@@ -979,106 +996,109 @@ def test_identical_raw_remote_args_are_preserved():
         "max_concurrency": 1,
         "runtime_env": {"env_vars": {"MODE": "test"}},
     }
-    upstream = _actor_map(source, _PlanA, ray_remote_args=remote_args)
-    downstream = _actor_map(
+    upstream = _make_actor_map(source, _Udf1, ray_remote_args=remote_args)
+    downstream = _make_actor_map(
         upstream,
-        _PlanB,
+        _Udf2,
         ray_remote_args=dict(remote_args),
     )
 
-    fused = _apply(downstream)
-    fused_logical = _fused_logical(fused)
+    fused = _apply_fusion_rule(downstream)
+    fused_logical = _fused_logical_map(fused)
 
-    assert [stage.udf_class for stage in _stages(fused)] == [_PlanA, _PlanB]
+    assert [stage.udf_class for stage in _fused_stages(fused)] == [_Udf1, _Udf2]
     assert fused_logical.ray_remote_args == remote_args
+
+
+# Fusion boundaries
 
 
 def test_cpu_barrier_keeps_two_composite_regions_separate():
     source = InputData([])
-    first = _actor_map(source, _PlanA)
-    second = _actor_map(first, _PlanB)
+    first = _make_actor_map(source, _Udf1)
+    second = _make_actor_map(first, _Udf2)
     barrier = MapRows(lambda row: row, input_dependencies=[second])
-    third = _actor_map(barrier, _PlanC)
-    fourth = _actor_map(third, _PlanD)
+    third = _make_actor_map(barrier, _Udf3)
+    fourth = _make_actor_map(third, _Udf4)
 
-    result = _apply(fourth)
+    result = _apply_fusion_rule(fourth)
     downstream = result.dag
     barrier_physical = downstream.input_dependencies[0]
     upstream = barrier_physical.input_dependencies[0]
 
-    assert [stage.udf_class for stage in _stages(result, downstream)] == [
-        _PlanC,
-        _PlanD,
+    assert [stage.udf_class for stage in _fused_stages(result, downstream)] == [
+        _Udf3,
+        _Udf4,
     ]
     assert isinstance(barrier_physical, TaskPoolMapOperator)
-    assert [stage.udf_class for stage in _stages(result, upstream)] == [
-        _PlanA,
-        _PlanB,
+    assert [stage.udf_class for stage in _fused_stages(result, upstream)] == [
+        _Udf1,
+        _Udf2,
     ]
-    assert len(_actors(result)) == 2
+    assert len(_actor_map_operators(result)) == 2
 
 
 def test_non_cudf_actor_barrier_keeps_two_composite_regions_separate():
     source = InputData([])
-    first = _actor_map(source, _PlanA)
-    second = _actor_map(first, _PlanB)
-    barrier = _actor_map(second, _PlanC, batch_format="pandas")
-    third = _actor_map(barrier, _PlanD)
-    fourth = _actor_map(third, _PlanE)
+    first = _make_actor_map(source, _Udf1)
+    second = _make_actor_map(first, _Udf2)
+    barrier = _make_actor_map(second, _Udf3, batch_format="pandas")
+    third = _make_actor_map(barrier, _Udf4)
+    fourth = _make_actor_map(third, _Udf5)
 
-    result = _apply(fourth)
+    result = _apply_fusion_rule(fourth)
     downstream = result.dag
     barrier_physical = downstream.input_dependencies[0]
     upstream = barrier_physical.input_dependencies[0]
 
-    assert [stage.udf_class for stage in _stages(result, downstream)] == [
-        _PlanD,
-        _PlanE,
+    assert [stage.udf_class for stage in _fused_stages(result, downstream)] == [
+        _Udf4,
+        _Udf5,
     ]
     assert result.op_map[barrier_physical] is barrier
-    assert [stage.udf_class for stage in _stages(result, upstream)] == [
-        _PlanA,
-        _PlanB,
+    assert [stage.udf_class for stage in _fused_stages(result, upstream)] == [
+        _Udf1,
+        _Udf2,
     ]
-    assert len(_actors(result)) == 3
+    assert len(_actor_map_operators(result)) == 3
 
 
 def test_shared_logical_branch_is_not_absorbed_despite_separate_physical_copies():
     source = InputData([])
-    shared = _actor_map(source, _PlanA)
-    left_first = _actor_map(shared, _PlanB)
-    left = _actor_map(left_first, _PlanC)
-    right_first = _actor_map(shared, _PlanD)
-    right = _actor_map(right_first, _PlanE)
+    shared = _make_actor_map(source, _Udf1)
+    left_first = _make_actor_map(shared, _Udf2)
+    left = _make_actor_map(left_first, _Udf3)
+    right_first = _make_actor_map(shared, _Udf4)
+    right = _make_actor_map(right_first, _Udf5)
 
-    result = _apply(Union([left, right]))
+    result = _apply_fusion_rule(Union([left, right]))
     left_fused, right_fused = result.dag.input_dependencies
     left_shared = left_fused.input_dependencies[0]
     right_shared = right_fused.input_dependencies[0]
 
     assert isinstance(result.dag, UnionOperator)
-    assert [stage.udf_class for stage in _stages(result, left_fused)] == [
-        _PlanB,
-        _PlanC,
+    assert [stage.udf_class for stage in _fused_stages(result, left_fused)] == [
+        _Udf2,
+        _Udf3,
     ]
-    assert [stage.udf_class for stage in _stages(result, right_fused)] == [
-        _PlanD,
-        _PlanE,
+    assert [stage.udf_class for stage in _fused_stages(result, right_fused)] == [
+        _Udf4,
+        _Udf5,
     ]
     assert left_shared is not right_shared
     assert result.op_map[left_shared] is shared
     assert result.op_map[right_shared] is shared
     assert left_shared._logical_operators == [shared]
     assert right_shared._logical_operators == [shared]
-    assert len(_actors(result)) == 4
-    assert set(result.op_map) == set(_reachable(result.dag))
+    assert len(_actor_map_operators(result)) == 4
+    assert set(result.op_map) == set(_all_physical_operators(result.dag))
 
 
 def test_udf_arguments_with_unusable_repr_can_be_physically_planned():
     source = InputData([])
-    first = _actor_map(source, _PlanA, fn_args=(_ReprBomb(),))
-    second = _actor_map(first, _PlanB)
+    first = _make_actor_map(source, _Udf1, fn_args=(_ReprBomb(),))
+    second = _make_actor_map(first, _Udf2)
 
-    physical, _ = get_execution_plan(LogicalPlan(second, _context(enabled=True)))
+    physical, _ = get_execution_plan(LogicalPlan(second, _fusion_context(enabled=True)))
 
-    assert len(_actors(physical)) == 1
+    assert len(_actor_map_operators(physical)) == 1
