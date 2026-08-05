@@ -3,16 +3,17 @@
 This rule receives a ``PhysicalPlan``; it does not rewrite the Dataset's logical
 plan. For example, it changes the executable DAG from::
 
-    Input -> MapBatches(Clean) -> MapBatches(Filter) -> MapBatches(Normalize)
+    Input -> MapBatches(Udf1) -> MapBatches(Udf2) -> MapBatches(Udf3)
 
 to::
 
-    Input -> MapBatches(Clean->Filter->Normalize)
+    Input -> MapBatches(Udf1->Udf2->Udf3)
 
 The replacement is still a normal Ray ``ActorPoolMapOperator``. The rule creates a
-synthetic logical ``MapBatches``, then asks Ray's existing map planner to build the
-physical operator. Inside each actor, the composite instantiates the user UDF objects
-and passes each returned cuDF DataFrame directly to the next stage.
+temporary logical ``MapBatches`` describing the combined UDFs, then asks Ray's
+existing map planner to build the physical operator. Inside each actor, the composite
+instantiates the user UDF objects and passes each returned cuDF DataFrame directly to
+the next stage.
 """
 
 import inspect
@@ -42,91 +43,100 @@ _SUPPORTED_REMOTE_ARGS = frozenset(
 
 
 @dataclass(frozen=True)
-class _CudfMapStageSpec:
-    """Recipe for rebuilding and calling one original ``map_batches`` UDF.
+class _CudfMapStageDefinition:
+    """Store everything a fused actor needs for one user-defined function (UDF).
 
-    For a ``Clean -> Normalize`` chain, the optimizer creates one spec for ``Clean``
-    and one for ``Normalize``. Each fused actor receives those specs, constructs one
-    UDF instance from each ``fn`` and its constructor arguments, then calls the
-    instances in order with the stored call arguments. This class only carries data;
-    it never runs the UDF.
+    For a ``Udf1 -> Udf2`` chain, the optimizer creates one definition for ``Udf1``
+    and another for ``Udf2``. Each definition stores the callable class supplied to
+    ``map_batches``, the arguments needed to construct it, the arguments passed on
+    every batch, and a name for error messages. ``_FusedCudfMapBatches`` reads these
+    definitions inside each actor. This class only stores data; it never calls user
+    code.
     """
 
     # The user's callable class and the stage name shown in errors.
-    fn: type
-    label: str
+    udf_class: type
+    error_label: str
     # Arguments used once when each actor constructs this stage's UDF instance.
     # User values may be unhashable, so they are stored but excluded from equality.
-    fn_constructor_args: Iterable[Any] = field(default=(), compare=False, hash=False)
-    fn_constructor_kwargs: Dict[str, Any] = field(
+    constructor_args: Iterable[Any] = field(default=(), compare=False, hash=False)
+    constructor_kwargs: Dict[str, Any] = field(
         default_factory=dict, compare=False, hash=False
     )
     # Additional arguments passed every time this stage processes a batch.
-    fn_args: Iterable[Any] = field(default=(), compare=False, hash=False)
-    fn_kwargs: Dict[str, Any] = field(default_factory=dict, compare=False, hash=False)
+    call_args: Iterable[Any] = field(default=(), compare=False, hash=False)
+    call_kwargs: Dict[str, Any] = field(default_factory=dict, compare=False, hash=False)
 
 
 class _FusedCudfMapBatches:
-    """The private callable class used by the replacement ``MapBatches``.
+    """Run all UDFs in a fused chain inside one Ray actor.
 
-    Ray creates one instance of this class per pool actor. It owns one instance of
-    every user UDF and requires each stage to synchronously return one cuDF
-    DataFrame.
+    For ``Udf1 -> Udf2``, Ray creates one instance of this class in every pool actor.
+    Its constructor uses the stage definitions above to create separate ``Udf1`` and
+    ``Udf2`` objects. For each input batch, ``__call__`` runs ``Udf1`` and passes the
+    exact returned cuDF DataFrame to ``Udf2``. This is the class that runs user code;
+    the stage-definition class above only stores the information it needs.
     """
 
-    def __init__(self, stages: Tuple[_CudfMapStageSpec, ...]):
-        self.stages = tuple(stages)
+    def __init__(self, stage_definitions: Tuple[_CudfMapStageDefinition, ...]):
+        self._stage_definitions = tuple(stage_definitions)
         instances = []
         # Create a separate UDF instance for every stage, even when the same class
         # appears more than once.
-        for stage in self.stages:
+        for stage in self._stage_definitions:
             try:
-                instance = stage.fn(
-                    *stage.fn_constructor_args,
-                    **stage.fn_constructor_kwargs,
+                instance = stage.udf_class(
+                    *stage.constructor_args,
+                    **stage.constructor_kwargs,
                 )
             except Exception as exc:
                 raise RuntimeError(
-                    f"Fused cuDF map_batches stage {stage.label!r} failed "
+                    f"Fused cuDF map_batches stage {stage.error_label!r} failed "
                     "during construction."
                 ) from exc
             instances.append(instance)
         self._instances = tuple(instances)
 
     def __call__(self, batch: Any) -> Any:
-        for stage, instance in zip(self.stages, self._instances):
+        for stage, instance in zip(self._stage_definitions, self._instances):
             try:
                 # The surrounding BatchMapTransformFn handles ingress batching and
                 # format conversion, then final output shaping. Between stages, pass
                 # the exact returned object: no copy, conversion, normalization, or
                 # rebatching.
-                batch = instance(batch, *stage.fn_args, **stage.fn_kwargs)
+                batch = instance(batch, *stage.call_args, **stage.call_kwargs)
             except Exception as exc:
                 raise RuntimeError(
-                    f"Fused cuDF map_batches stage {stage.label!r} failed."
+                    f"Fused cuDF map_batches stage {stage.error_label!r} failed."
                 ) from exc
             if not _is_cudf_dataframe(batch):
                 output_type = f"{type(batch).__module__}.{type(batch).__qualname__}"
                 raise TypeError(
-                    f"Fused cuDF map_batches stage {stage.label!r} returned "
+                    f"Fused cuDF map_batches stage {stage.error_label!r} returned "
                     f"{output_type}; expected cudf.DataFrame."
                 )
         return batch
 
 
 @dataclass(frozen=True)
-class _FusionSpec:
-    """Execution settings that must agree across a fused chain.
+class _CudfMapFusionSettings:
+    """Store the settings used to decide whether two UDF maps can be fused.
 
-    Explicit compatibility handles actor options with unusual equality behavior.
+    The optimizer creates one of these objects for each ``MapBatches`` that might be
+    fused. ``compatible_with`` checks that two maps use the same actor-pool strategy,
+    batch size, minimum rows grouped into an input task, and Ray actor options. This
+    class only compares settings; it does not create actors or run UDFs.
     """
 
+    # How Ray creates and scales the actors that execute this map.
     actor_pool: ActorPoolStrategy = field(compare=False)
+    # How input rows are grouped before one actor call.
     batch_size: int
     min_rows_per_bundle: Optional[int]
+    # CPU, GPU, memory, scheduling, retry, and other Ray actor options.
     ray_remote_args: Mapping[str, Any] = field(compare=False)
 
-    def compatible_with(self, other: "_FusionSpec") -> bool:
+    def compatible_with(self, other: "_CudfMapFusionSettings") -> bool:
         if (
             self.actor_pool != other.actor_pool
             or self.batch_size != other.batch_size
@@ -169,7 +179,15 @@ def _same_config_value(left: Any, right: Any) -> bool:
 
 
 class FuseCudfActorMapBatches(Rule):
-    """Fuse maximal linear runs of compatible actor-based cuDF ``MapBatches``."""
+    """Replace compatible cuDF actor maps with one executable actor-map operator.
+
+    For ``Input -> Udf1 -> Udf2 -> Output``, ``apply`` checks that the UDF maps form
+    a linear chain, do not cross a shared upstream node, and use compatible settings.
+    It then creates their stage definitions, asks Ray's normal planner to build one
+    ``MapBatches(Udf1->Udf2)``, and reconnects ``Input`` and ``Output`` around that
+    replacement. This optimizer rule runs while Ray builds the physical plan; it
+    never processes a user batch itself.
+    """
 
     def apply(self, plan: PhysicalPlan) -> PhysicalPlan:
         if not self._context_allows_fusion(plan.context):
@@ -215,8 +233,8 @@ class FuseCudfActorMapBatches(Rule):
                     logical_chain_downstream_first
                 )
                 first_stage_physical_op = fusible_chain[-1]
-                # Lower the synthetic logical node with Ray's normal map planner so
-                # actor setup, cuDF conversion, and execution settings stay stock.
+                # Lower the temporary combined MapBatches with Ray's normal planner
+                # so actor setup, cuDF conversion, and execution settings stay stock.
                 fused_physical_op = create_udf_map_operator(
                     fused_logical_op,
                     rewrite_operator(first_stage_physical_op.input_dependencies[0]),
@@ -296,17 +314,17 @@ class FuseCudfActorMapBatches(Rule):
         singleton, which the caller leaves unfused.
         """
 
-        chain_spec = cls._fusion_spec(op, op_map.get(op))
+        chain_settings = cls._get_fusion_settings(op, op_map.get(op))
         chain = [op]
         upstream_cursor = op
         effective_target_size = op.target_max_block_size_override
-        if chain_spec is None:
+        if chain_settings is None:
             return tuple(chain), effective_target_size
 
         while len(upstream_cursor.input_dependencies) == 1:
             upstream = upstream_cursor.input_dependencies[0]
             upstream_logical_op = op_map.get(upstream)
-            upstream_spec = cls._fusion_spec(upstream, upstream_logical_op)
+            upstream_settings = cls._get_fusion_settings(upstream, upstream_logical_op)
             upstream_target_size = upstream.target_max_block_size_override
             upstream_is_shared = (
                 logical_consumer_counts.get(upstream_logical_op, 0) != 1
@@ -321,8 +339,8 @@ class FuseCudfActorMapBatches(Rule):
             # shared upstream map could remove work still needed by another branch.
             if (
                 upstream_is_shared
-                or upstream_spec is None
-                or not chain_spec.compatible_with(upstream_spec)
+                or upstream_settings is None
+                or not chain_settings.compatible_with(upstream_settings)
                 or block_sizes_conflict
             ):
                 break
@@ -337,11 +355,11 @@ class FuseCudfActorMapBatches(Rule):
         cls,
         logical_chain_downstream_first: Tuple[MapBatches, ...],
     ) -> MapBatches:
-        """Build a synthetic ``MapBatches`` from a downstream-first chain."""
+        """Build a temporary logical ``MapBatches`` for a downstream-first chain."""
 
         # The traversal found stages backward, so restore execution order.
-        stages = tuple(
-            cls._stage_from_op(stage_op, stage_index)
+        stage_definitions = tuple(
+            cls._stage_definition_from_op(stage_op, stage_index)
             for stage_index, stage_op in enumerate(
                 reversed(logical_chain_downstream_first), start=1
             )
@@ -360,12 +378,12 @@ class FuseCudfActorMapBatches(Rule):
             batch_size=ingress_logical_op.batch_size,
             batch_format="cudf",
             zero_copy_batch=True,
-            fn_constructor_args=(stages,),
+            fn_constructor_args=(stage_definitions,),
             min_rows_per_bundled_input=ingress_logical_op.min_rows_per_bundled_input,
             compute=ingress_logical_op.compute,
             ray_remote_args=dict(ingress_logical_op.ray_remote_args),
         )
-        cls._set_fused_name(fused_logical_op, stages)
+        cls._set_fused_name(fused_logical_op, stage_definitions)
         return fused_logical_op
 
     @staticmethod
@@ -389,11 +407,11 @@ class FuseCudfActorMapBatches(Rule):
         return counts
 
     @classmethod
-    def _fusion_spec(
+    def _get_fusion_settings(
         cls,
         physical_op: PhysicalOperator,
         logical_op: Optional[LogicalOperator],
-    ) -> Optional[_FusionSpec]:
+    ) -> Optional[_CudfMapFusionSettings]:
         """Return compatibility settings, or ``None`` for a fusion boundary.
 
         Eligibility is deliberately allowlisted. If the rule cannot prove that an
@@ -445,7 +463,8 @@ class FuseCudfActorMapBatches(Rule):
         actor_pool = cls._supported_actor_pool(logical_op.compute)
         remote_args = logical_op.ray_remote_args
         # Unknown remote options opt out. Supported options are compared exactly
-        # against the chain's anchor spec through _FusionSpec.compatible_with().
+        # against the chain's settings through
+        # _CudfMapFusionSettings.compatible_with().
         if (
             actor_pool is None
             or type(remote_args) is not dict
@@ -461,7 +480,7 @@ class FuseCudfActorMapBatches(Rule):
         if type(num_gpus) not in (int, float) or num_gpus != 1:
             return None
 
-        return _FusionSpec(
+        return _CudfMapFusionSettings(
             actor_pool=actor_pool,
             batch_size=logical_op.batch_size,
             min_rows_per_bundle=logical_op.min_rows_per_bundled_input,
@@ -481,27 +500,32 @@ class FuseCudfActorMapBatches(Rule):
         return compute
 
     @staticmethod
-    def _set_fused_name(op: MapBatches, stages: Tuple[_CudfMapStageSpec, ...]) -> None:
-        names = "->".join(stage.fn.__name__ for stage in stages)
+    def _set_fused_name(
+        op: MapBatches,
+        stage_definitions: Tuple[_CudfMapStageDefinition, ...],
+    ) -> None:
+        names = "->".join(stage.udf_class.__name__ for stage in stage_definitions)
         # MapBatches is frozen; _name affects display only.
         object.__setattr__(op, "_name", f"MapBatches({names})")
 
     @staticmethod
-    def _stage_from_op(op: MapBatches, stage_index: int) -> _CudfMapStageSpec:
+    def _stage_definition_from_op(
+        op: MapBatches, stage_index: int
+    ) -> _CudfMapStageDefinition:
         # Keep the user's argument containers untouched. The fused actor unpacks
         # them only when it constructs or calls the stage. The numbered label lets
         # constructor and runtime errors identify the exact stage.
-        return _CudfMapStageSpec(
-            fn=op.fn,
-            label=f"{stage_index}: {op.name}",
-            fn_constructor_args=(
+        return _CudfMapStageDefinition(
+            udf_class=op.fn,
+            error_label=f"{stage_index}: {op.name}",
+            constructor_args=(
                 () if op.fn_constructor_args is None else op.fn_constructor_args
             ),
-            fn_constructor_kwargs=(
+            constructor_kwargs=(
                 {} if op.fn_constructor_kwargs is None else op.fn_constructor_kwargs
             ),
-            fn_args=() if op.fn_args is None else op.fn_args,
-            fn_kwargs={} if op.fn_kwargs is None else op.fn_kwargs,
+            call_args=() if op.fn_args is None else op.fn_args,
+            call_kwargs={} if op.fn_kwargs is None else op.fn_kwargs,
         )
 
     @staticmethod
