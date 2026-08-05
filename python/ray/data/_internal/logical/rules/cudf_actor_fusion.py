@@ -1,4 +1,19 @@
-"""Physical fusion for consecutive actor-based cuDF ``map_batches`` UDFs."""
+"""Fuse consecutive actor-based cuDF ``map_batches`` after physical planning.
+
+This rule receives a ``PhysicalPlan``; it does not rewrite the Dataset's logical
+plan. For example, it changes the executable DAG from::
+
+    Input -> MapBatches(Clean) -> MapBatches(Filter) -> MapBatches(Normalize)
+
+to::
+
+    Input -> MapBatches(Clean->Filter->Normalize)
+
+The replacement is still a normal Ray ``ActorPoolMapOperator``. The rule creates a
+synthetic logical ``MapBatches``, then asks Ray's existing map planner to build the
+physical operator. Inside each actor, the composite instantiates the user UDF objects
+and passes each returned cuDF DataFrame directly to the next stage.
+"""
 
 import inspect
 from collections.abc import Iterable, Mapping
@@ -28,12 +43,16 @@ _SUPPORTED_REMOTE_ARGS = frozenset(
 
 @dataclass(frozen=True)
 class _CudfMapStage:
-    """Serializable settings for one UDF stage in a fused actor."""
+    """Payload for one user UDF stage, serialized to each fused actor.
+
+    The optimizer stores user arguments unchanged; Ray's normal serializer decides
+    whether they can be sent to actors.
+    """
 
     fn: type
     label: str
-    # User arguments may be unhashable, so keep them out of equality and hashing.
-    # They are still serialized and passed through unchanged.
+    # User arguments may be unhashable or implement unusual equality. They still
+    # travel with the stage, but are not part of dataclass equality or hashing.
     fn_constructor_args: Iterable[Any] = field(default=(), compare=False, hash=False)
     fn_constructor_kwargs: Dict[str, Any] = field(
         default_factory=dict, compare=False, hash=False
@@ -43,7 +62,12 @@ class _CudfMapStage:
 
 
 class _FusedCudfMapBatches:
-    """Run fused UDFs in order, passing each cuDF result directly to the next."""
+    """The private callable class used by the replacement ``MapBatches``.
+
+    Ray creates one instance of this class per pool actor. It owns one instance of
+    every user UDF and requires each stage to synchronously return one cuDF
+    DataFrame.
+    """
 
     def __init__(self, stages: Tuple[_CudfMapStage, ...]):
         self.stages = tuple(stages)
@@ -67,8 +91,10 @@ class _FusedCudfMapBatches:
     def __call__(self, batch: Any) -> Any:
         for stage, instance in zip(self.stages, self._instances):
             try:
-                # Give the next stage exactly what this stage returned: no copy,
-                # conversion, normalization, or rebatching.
+                # The surrounding BatchMapTransformFn handles ingress batching and
+                # format conversion, then final output shaping. Between stages, pass
+                # the exact returned object: no copy, conversion, normalization, or
+                # rebatching.
                 batch = instance(batch, *stage.fn_args, **stage.fn_kwargs)
             except Exception as exc:
                 raise RuntimeError(
@@ -85,6 +111,11 @@ class _FusedCudfMapBatches:
 
 @dataclass(frozen=True)
 class _FusionSpec:
+    """Execution settings that must agree across a fused chain.
+
+    Explicit compatibility handles actor options with unusual equality behavior.
+    """
+
     actor_pool: ActorPoolStrategy = field(compare=False)
     batch_size: int
     min_rows_per_bundle: Optional[int]
@@ -107,7 +138,12 @@ class _FusionSpec:
 
 
 def _same_config_value(left: Any, right: Any) -> bool:
-    """Compare nested settings without treating array-like equality as equal."""
+    """Compare execution settings conservatively and without type coercion.
+
+    Mappings, lists, and tuples are compared recursively. Values such as
+    ``True`` and ``1`` must not compare as the same resource setting. Only a plain
+    boolean equality result is accepted; array-like results are incompatible.
+    """
 
     if type(left) is not type(right):
         return False
@@ -135,12 +171,17 @@ class FuseCudfActorMapBatches(Rule):
             return plan
 
         op_map = plan.op_map.copy()
-        # Count consumers before rewriting. If either graph says an operator is
-        # shared, stop fusion there because another branch may still need it.
+        # ``op_map`` records the logical origin of each physical node. Count
+        # consumers in both representations before rewriting, and never absorb an
+        # upstream node that another branch still consumes. The logical check is
+        # needed because the logical and physical DAGs can represent sharing
+        # differently after planning.
         logical_consumer_counts = self._logical_consumer_counts(op_map)
         physical_consumer_counts = self._physical_consumer_counts(plan.dag)
-        memo: Dict[PhysicalOperator, PhysicalOperator] = {}
-        changed = False
+        # A physical plan is a DAG, not necessarily a tree. Memoization rewrites a
+        # shared node once and gives every consumer the same replacement.
+        rewritten_operators: Dict[PhysicalOperator, PhysicalOperator] = {}
+        did_fuse = False
 
         def rewrite_operator(op: PhysicalOperator) -> PhysicalOperator:
             """Rewrite ``op`` and everything upstream, returning its replacement.
@@ -148,37 +189,45 @@ class FuseCudfActorMapBatches(Rule):
             If a compatible cuDF actor-map chain ends here, replace it with one
             fused operator. Otherwise, keep ``op`` and rewrite its inputs.
             """
-            nonlocal changed
-            if op in memo:
-                return memo[op]
+            nonlocal did_fuse
+            if op in rewritten_operators:
+                return rewritten_operators[op]
 
-            run, target_max_block_size = self._collect_fusible_run(
+            fusible_chain, effective_target_size = self._collect_fusible_run(
                 op,
                 op_map,
                 logical_consumer_counts,
                 physical_consumer_counts,
             )
 
-            if len(run) >= 2:
-                logical_run = tuple(op_map[stage_op] for stage_op in run)
-                fused_logical_op = self._create_fused_logical_op(logical_run)
-                ingress_physical_op = run[-1]
-                # Build the replacement with Ray's normal map planner so actor setup,
-                # cuDF conversion, and execution settings keep their usual behavior.
+            if len(fusible_chain) >= 2:
+                # Collection is downstream-first, so the final entry is the first
+                # map that receives data. That map's input feeds the replacement.
+                logical_chain_downstream_first = tuple(
+                    op_map[stage_op] for stage_op in fusible_chain
+                )
+                fused_logical_op = self._create_fused_logical_op(
+                    logical_chain_downstream_first
+                )
+                first_stage_physical_op = fusible_chain[-1]
+                # Lower the synthetic logical node with Ray's normal map planner so
+                # actor setup, cuDF conversion, and execution settings stay stock.
                 fused_physical_op = create_udf_map_operator(
                     fused_logical_op,
-                    rewrite_operator(ingress_physical_op.input_dependencies[0]),
+                    rewrite_operator(first_stage_physical_op.input_dependencies[0]),
                     plan.context,
-                    target_max_block_size_override=target_max_block_size,
+                    target_max_block_size_override=effective_target_size,
                 )
-                # Execute the composite, but keep the original maps attached so plan
-                # inspection still shows where it came from.
-                fused_physical_op.set_logical_operators(*reversed(logical_run))
-                for stage_op in run:
+                # Execute the composite while retaining the original logical maps
+                # for plan lineage and reporting.
+                fused_physical_op.set_logical_operators(
+                    *reversed(logical_chain_downstream_first)
+                )
+                for stage_op in fusible_chain:
                     op_map.pop(stage_op)
                 op_map[fused_physical_op] = fused_logical_op
-                memo[op] = fused_physical_op
-                changed = True
+                rewritten_operators[op] = fused_physical_op
+                did_fuse = True
                 return fused_physical_op
 
             rewritten_inputs = [
@@ -191,29 +240,39 @@ class FuseCudfActorMapBatches(Rule):
                     op.input_dependencies,
                 )
             ):
+                # This operator was not fused, but one of its inputs was. Reconnect
+                # the retained operator now; reverse output links are rebuilt once
+                # after the complete traversal.
                 op._input_dependencies = rewritten_inputs
-            memo[op] = op
+            rewritten_operators[op] = op
             return op
 
         new_dag = rewrite_operator(plan.dag)
-        if not changed:
+        if not did_fuse:
             return plan
         self._rebuild_output_dependencies(new_dag)
         return PhysicalPlan(new_dag, op_map, plan.context)
 
     @staticmethod
     def _context_allows_fusion(context: Any) -> bool:
+        """Whether context-wide settings preserve this rule's runtime semantics."""
+
         if getattr(context, "enable_cudf_actor_fusion", False) is not True:
             return False
-        # Fusion wraps errors with the stage name, so original-exception mode and
-        # exception-specific retries would behave differently. Actors must also use
-        # the default task scheduling.
-        return (
-            context.raise_original_map_exception is False
-            and context.max_tasks_in_flight_per_actor is None
-            and type(context.actor_task_retry_on_errors) is bool
-            and type(context.retried_map_errors) is bool
-        )
+        # Adding the stage name wraps the original exception. Original-exception
+        # propagation and exception-class retry matching would therefore change.
+        if context.raise_original_map_exception is not False:
+            return False
+        # Boolean retry policies still mean retry-all or retry-none after wrapping;
+        # policies that match particular exception classes do not.
+        if (
+            type(context.actor_task_retry_on_errors) is not bool
+            or type(context.retried_map_errors) is not bool
+        ):
+            return False
+        # The current fusion contract uses the actor pool's default tasks-in-flight
+        # behavior, without a context-wide override.
+        return context.max_tasks_in_flight_per_actor is None
 
     @classmethod
     def _collect_fusible_run(
@@ -223,61 +282,75 @@ class FuseCudfActorMapBatches(Rule):
         logical_consumer_counts: Mapping[LogicalOperator, int],
         physical_consumer_counts: Mapping[PhysicalOperator, int],
     ) -> Tuple[Tuple[PhysicalOperator, ...], Optional[int]]:
-        """Walk upstream from ``op`` and collect the longest compatible chain.
+        """Collect the longest candidate chain ending at ``op``.
 
-        The returned operators are ordered downstream to upstream.
+        The walk moves toward the source, so returned operators are ordered
+        downstream to upstream. The second return value is the single output block
+        size override that the fused operator should inherit. Two different
+        non-``None`` overrides end the chain. An ineligible ``op`` produces a
+        singleton, which the caller leaves unfused.
         """
 
-        run_spec = cls._fusion_spec(op, op_map.get(op))
-        run = [op]
-        cursor = op
-        target_max_block_size = op.target_max_block_size_override
-        if run_spec is None:
-            return tuple(run), target_max_block_size
+        chain_spec = cls._fusion_spec(op, op_map.get(op))
+        chain = [op]
+        upstream_cursor = op
+        effective_target_size = op.target_max_block_size_override
+        if chain_spec is None:
+            return tuple(chain), effective_target_size
 
-        while len(cursor.input_dependencies) == 1:
-            upstream = cursor.input_dependencies[0]
+        while len(upstream_cursor.input_dependencies) == 1:
+            upstream = upstream_cursor.input_dependencies[0]
             upstream_logical_op = op_map.get(upstream)
             upstream_spec = cls._fusion_spec(upstream, upstream_logical_op)
             upstream_target_size = upstream.target_max_block_size_override
-            # A shared upstream operator is a fusion boundary. Both graphs must
-            # agree that only this chain uses it.
-            if (
+            upstream_is_shared = (
                 logical_consumer_counts.get(upstream_logical_op, 0) != 1
                 or physical_consumer_counts.get(upstream, 0) != 1
+            )
+            block_sizes_conflict = (
+                effective_target_size is not None
+                and upstream_target_size is not None
+                and effective_target_size != upstream_target_size
+            )
+            # Any of these conditions is a boundary. In particular, absorbing a
+            # shared upstream map could remove work still needed by another branch.
+            if (
+                upstream_is_shared
                 or upstream_spec is None
-                or not run_spec.compatible_with(upstream_spec)
-                or (
-                    target_max_block_size is not None
-                    and upstream_target_size is not None
-                    and target_max_block_size != upstream_target_size
-                )
+                or not chain_spec.compatible_with(upstream_spec)
+                or block_sizes_conflict
             ):
                 break
-            run.append(upstream)
-            cursor = upstream
-            if target_max_block_size is None:
-                target_max_block_size = upstream_target_size
-        return tuple(run), target_max_block_size
+            chain.append(upstream)
+            upstream_cursor = upstream
+            if effective_target_size is None:
+                effective_target_size = upstream_target_size
+        return tuple(chain), effective_target_size
 
     @classmethod
     def _create_fused_logical_op(
         cls,
-        logical_run: Tuple[MapBatches, ...],
+        logical_chain_downstream_first: Tuple[MapBatches, ...],
     ) -> MapBatches:
-        """Build one composite ``MapBatches`` from a downstream-first run."""
+        """Build a synthetic ``MapBatches`` from a downstream-first chain."""
 
         # The traversal found stages backward, so restore execution order.
         stages = tuple(
             cls._stage_from_op(stage_op, stage_index)
-            for stage_index, stage_op in enumerate(reversed(logical_run), start=1)
+            for stage_index, stage_op in enumerate(
+                reversed(logical_chain_downstream_first), start=1
+            )
         )
-        ingress_logical_op = logical_run[-1]
+        ingress_logical_op = logical_chain_downstream_first[-1]
+        # Compatibility was already established for the full chain. The first map
+        # therefore supplies the shared actor settings and the one ingress batching
+        # policy. Its former input bypasses every map that the composite replaces.
         fused_logical_op = MapBatches(
             _FusedCudfMapBatches,
             input_dependencies=[ingress_logical_op.input_dependencies[0]],
             can_modify_num_rows=any(
-                stage_op.can_modify_num_rows for stage_op in logical_run
+                stage_op.can_modify_num_rows
+                for stage_op in logical_chain_downstream_first
             ),
             batch_size=ingress_logical_op.batch_size,
             batch_format="cudf",
@@ -316,6 +389,15 @@ class FuseCudfActorMapBatches(Rule):
         physical_op: PhysicalOperator,
         logical_op: Optional[LogicalOperator],
     ) -> Optional[_FusionSpec]:
+        """Return compatibility settings, or ``None`` for a fusion boundary.
+
+        Eligibility is deliberately allowlisted. If the rule cannot prove that an
+        option keeps the same behavior after fusion, the existing Ray operator is
+        left unchanged without warning.
+        """
+
+        # Start with a normal actor-pool map and its MapBatches lineage. Rejecting
+        # the private composite makes repeated optimizer passes idempotent.
         if (
             not isinstance(physical_op, ActorPoolMapOperator)
             or not physical_op.supports_fusion()
@@ -323,6 +405,11 @@ class FuseCudfActorMapBatches(Rule):
             or logical_op.fn is _FusedCudfMapBatches
         ):
             return None
+        # The replacement physical operator has one BatchMapTransformFn, so it needs
+        # one explicit cuDF ingress batch size. Requiring zero_copy_batch=True avoids
+        # silently removing a defensive copy from each original boundary. Per-block
+        # limits and dynamically generated actor options cannot be represented by
+        # one operator either.
         if (
             logical_op.batch_format != "cudf"
             or type(logical_op.batch_size) is not int
@@ -334,6 +421,9 @@ class FuseCudfActorMapBatches(Rule):
         ):
             return None
 
+        # Inspect the class definition without constructing it or invoking a user
+        # descriptor. Reject __call__ implementations declared async or as
+        # generators; the runtime cuDF check catches other unsupported return types.
         call = inspect.getattr_static(logical_op.fn, "__call__", None)
         if isinstance(call, (classmethod, staticmethod)):
             call = call.__func__
@@ -349,6 +439,8 @@ class FuseCudfActorMapBatches(Rule):
 
         actor_pool = cls._supported_actor_pool(logical_op.compute)
         remote_args = logical_op.ray_remote_args
+        # Unknown remote options opt out. Supported options are compared exactly
+        # against the chain's anchor spec through _FusionSpec.compatible_with().
         if (
             actor_pool is None
             or type(remote_args) is not dict
@@ -356,6 +448,8 @@ class FuseCudfActorMapBatches(Rule):
         ):
             return None
         max_concurrency = remote_args.get("max_concurrency", 1)
+        # One actor task at a time preserves single-threaded access to every stage's
+        # UDF instance. One full GPU per actor is the current scope.
         if type(max_concurrency) is not int or max_concurrency != 1:
             return None
         num_gpus = remote_args.get("num_gpus")
@@ -371,6 +465,8 @@ class FuseCudfActorMapBatches(Rule):
 
     @staticmethod
     def _supported_actor_pool(compute: Any) -> Optional[ActorPoolStrategy]:
+        """Return a supported fixed or autoscaling, single-threaded actor pool."""
+
         if (
             type(compute) is not ActorPoolStrategy
             or compute.enable_true_multi_threading is not False
@@ -382,12 +478,14 @@ class FuseCudfActorMapBatches(Rule):
     @staticmethod
     def _set_fused_name(op: MapBatches, stages: Tuple[_CudfMapStage, ...]) -> None:
         names = "->".join(stage.fn.__name__ for stage in stages)
+        # MapBatches is frozen; _name affects display only.
         object.__setattr__(op, "_name", f"MapBatches({names})")
 
     @staticmethod
     def _stage_from_op(op: MapBatches, stage_index: int) -> _CudfMapStage:
         # Keep the user's argument containers untouched. The fused actor unpacks
-        # them only when it constructs or calls the stage.
+        # them only when it constructs or calls the stage. The numbered label lets
+        # constructor and runtime errors identify the exact stage.
         return _CudfMapStage(
             fn=op.fn,
             label=f"{stage_index}: {op.name}",
@@ -403,8 +501,10 @@ class FuseCudfActorMapBatches(Rule):
 
     @staticmethod
     def _rebuild_output_dependencies(root: PhysicalOperator) -> None:
-        # Rewriting changes each operator's inputs. Rebuild the matching output
-        # links once the whole DAG is finished.
+        # Physical operators store each edge twice: as an input on the consumer and
+        # as an output on the producer. Recursive rewriting updates the authoritative
+        # input edges first, so rebuild reverse edges for the rewritten DAG at the
+        # end.
         operators = set(root.post_order_iter())
         for op in operators:
             op._output_dependencies = []
