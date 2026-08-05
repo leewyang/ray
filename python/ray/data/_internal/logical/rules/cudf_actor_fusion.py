@@ -29,64 +29,6 @@ from ray.data._internal.planner.plan_udf_map_op import create_udf_map_operator
 from ray.data.block import _is_cudf_dataframe
 
 
-# Actor-side execution
-
-
-@dataclass(frozen=True, eq=False)
-class _CudfMapStage:
-    """Data needed to reconstruct one original ``map_batches`` UDF in an actor."""
-
-    udf_class: type
-    error_label: str
-    constructor_args: Iterable[Any] = ()
-    constructor_kwargs: Dict[str, Any] = field(default_factory=dict)
-    call_args: Iterable[Any] = ()
-    call_kwargs: Dict[str, Any] = field(default_factory=dict)
-
-
-class _FusedCudfMapBatches:
-    """Run the original UDFs sequentially inside one Ray actor."""
-
-    def __init__(self, stages: Tuple[_CudfMapStage, ...]):
-        """Construct a separate UDF instance for every original map stage."""
-
-        self._stages = tuple(stages)
-        instances = []
-        for stage in self._stages:
-            try:
-                instance = stage.udf_class(
-                    *stage.constructor_args,
-                    **stage.constructor_kwargs,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Fused cuDF map_batches stage {stage.error_label!r} failed "
-                    "during construction."
-                ) from exc
-            instances.append(instance)
-        self._instances = tuple(instances)
-
-    def __call__(self, batch: Any) -> Any:
-        """Pass one cuDF batch through every UDF without an intermediate boundary."""
-
-        for stage, instance in zip(self._stages, self._instances):
-            try:
-                # BatchMapTransformFn handles only the chain's ingress and egress.
-                # Passing the returned object unchanged avoids conversion or rebatching.
-                batch = instance(batch, *stage.call_args, **stage.call_kwargs)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Fused cuDF map_batches stage {stage.error_label!r} failed."
-                ) from exc
-            if not _is_cudf_dataframe(batch):
-                output_type = f"{type(batch).__module__}.{type(batch).__qualname__}"
-                raise TypeError(
-                    f"Fused cuDF map_batches stage {stage.error_label!r} returned "
-                    f"{output_type}; expected cudf.DataFrame."
-                )
-        return batch
-
-
 # Driver-side physical-plan rewrite
 
 
@@ -100,52 +42,6 @@ _SUPPORTED_REMOTE_ARGS = frozenset(
 )
 
 
-@dataclass(frozen=True, eq=False)
-class _CudfMapFusionConfig:
-    """Execution settings that must match across a fused map chain."""
-
-    actor_pool: ActorPoolStrategy
-    batch_size: int
-    min_rows_per_bundle: Optional[int]
-    ray_remote_args: Mapping[str, Any]
-
-    def is_compatible_with(self, other: "_CudfMapFusionConfig") -> bool:
-        if (
-            self.actor_pool != other.actor_pool
-            or self.batch_size != other.batch_size
-            or not _equal_config_values(
-                self.min_rows_per_bundle,
-                other.min_rows_per_bundle,
-            )
-        ):
-            return False
-        try:
-            return _equal_config_values(self.ray_remote_args, other.ray_remote_args)
-        except Exception:
-            return False
-
-
-def _equal_config_values(left: Any, right: Any) -> bool:
-    """Compare settings without type coercion or array-like equality results."""
-
-    if type(left) is not type(right):
-        return False
-    if isinstance(left, Mapping):
-        if left.keys() != right.keys():
-            return False
-        return all(_equal_config_values(left[key], right[key]) for key in left)
-    if isinstance(left, (list, tuple)):
-        return len(left) == len(right) and all(
-            _equal_config_values(left_value, right_value)
-            for left_value, right_value in zip(left, right)
-        )
-    try:
-        result = left == right
-    except Exception:
-        return False
-    return type(result) is bool and result
-
-
 class FuseCudfActorMapBatches(Rule):
     """Replace compatible cuDF actor-map chains with one physical operator."""
 
@@ -155,16 +51,15 @@ class FuseCudfActorMapBatches(Rule):
         if not self._context_allows_fusion(plan.context):
             return plan
 
-        # makes sure operatorions are sequential (no branching)
         op_map = plan.op_map.copy()
         (
             logical_consumer_counts,
             physical_consumer_counts,
         ) = self._count_logical_and_physical_consumers(op_map, plan.dag)
 
-        # Planning can copy one shared logical node into multiple physical nodes.
-        # The two consumer counts protect both forms of sharing, while this memo
-        # preserves any physical nodes that are genuinely shared in the DAG.
+        # Fusion requires a sequential, single-consumer chain. Planning can copy one
+        # shared logical node into multiple physical nodes, so both counts are needed.
+        # This memo also preserves physical nodes that are genuinely shared in the DAG.
         rewritten_operators: Dict[PhysicalOperator, PhysicalOperator] = {}
         did_fuse = False
 
@@ -308,7 +203,7 @@ class FuseCudfActorMapBatches(Rule):
     def _fusion_config_if_eligible(
         physical_op: PhysicalOperator,
         logical_op: Optional[LogicalOperator],
-    ) -> Optional[_CudfMapFusionConfig]:
+    ) -> Optional["_CudfMapFusionConfig"]:
         """Return an eligible map's compatibility settings, otherwise ``None``."""
 
         if (
@@ -454,3 +349,107 @@ class FuseCudfActorMapBatches(Rule):
         for op in operators:
             for input_op in op.input_dependencies:
                 input_op._output_dependencies.append(op)
+
+
+@dataclass(frozen=True, eq=False)
+class _CudfMapFusionConfig:
+    """Execution settings that must match across a fused map chain."""
+
+    actor_pool: ActorPoolStrategy
+    batch_size: int
+    min_rows_per_bundle: Optional[int]
+    ray_remote_args: Mapping[str, Any]
+
+    def is_compatible_with(self, other: "_CudfMapFusionConfig") -> bool:
+        if (
+            self.actor_pool != other.actor_pool
+            or self.batch_size != other.batch_size
+            or not _equal_config_values(
+                self.min_rows_per_bundle,
+                other.min_rows_per_bundle,
+            )
+        ):
+            return False
+        try:
+            return _equal_config_values(self.ray_remote_args, other.ray_remote_args)
+        except Exception:
+            return False
+
+
+def _equal_config_values(left: Any, right: Any) -> bool:
+    """Compare settings without type coercion or array-like equality results."""
+
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, Mapping):
+        if left.keys() != right.keys():
+            return False
+        return all(_equal_config_values(left[key], right[key]) for key in left)
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(
+            _equal_config_values(left_value, right_value)
+            for left_value, right_value in zip(left, right)
+        )
+    try:
+        result = left == right
+    except Exception:
+        return False
+    return type(result) is bool and result
+
+
+# Actor-side execution
+
+
+@dataclass(frozen=True, eq=False)
+class _CudfMapStage:
+    """Data needed to reconstruct one original ``map_batches`` UDF in an actor."""
+
+    udf_class: type
+    error_label: str
+    constructor_args: Iterable[Any] = ()
+    constructor_kwargs: Dict[str, Any] = field(default_factory=dict)
+    call_args: Iterable[Any] = ()
+    call_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+
+class _FusedCudfMapBatches:
+    """Run the original UDFs sequentially inside one Ray actor."""
+
+    def __init__(self, stages: Tuple[_CudfMapStage, ...]):
+        """Construct a separate UDF instance for every original map stage."""
+
+        self._stages = tuple(stages)
+        instances = []
+        for stage in self._stages:
+            try:
+                instance = stage.udf_class(
+                    *stage.constructor_args,
+                    **stage.constructor_kwargs,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Fused cuDF map_batches stage {stage.error_label!r} failed "
+                    "during construction."
+                ) from exc
+            instances.append(instance)
+        self._instances = tuple(instances)
+
+    def __call__(self, batch: Any) -> Any:
+        """Pass one cuDF batch through every UDF without an intermediate boundary."""
+
+        for stage, instance in zip(self._stages, self._instances):
+            try:
+                # BatchMapTransformFn handles only the chain's ingress and egress.
+                # Passing the returned object unchanged avoids conversion or rebatching.
+                batch = instance(batch, *stage.call_args, **stage.call_kwargs)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Fused cuDF map_batches stage {stage.error_label!r} failed."
+                ) from exc
+            if not _is_cudf_dataframe(batch):
+                output_type = f"{type(batch).__module__}.{type(batch).__qualname__}"
+                raise TypeError(
+                    f"Fused cuDF map_batches stage {stage.error_label!r} returned "
+                    f"{output_type}; expected cudf.DataFrame."
+                )
+        return batch
