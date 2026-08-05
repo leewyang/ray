@@ -34,11 +34,26 @@ from ray.data.block import _is_cudf_dataframe
 
 # New or unsupported actor options opt out until fusion can preserve their behavior.
 _SUPPORTED_REMOTE_ARGS = frozenset(
-    "_labels accelerator_type allow_out_of_order_execution enable_task_events "
-    "fallback_strategy label_selector max_concurrency max_restarts "
-    "max_task_retries memory num_cpus num_gpus placement_group "
-    "placement_group_bundle_index placement_group_capture_child_tasks resources "
-    "runtime_env scheduling_strategy".split()
+    {
+        "_labels",
+        "accelerator_type",
+        "allow_out_of_order_execution",
+        "enable_task_events",
+        "fallback_strategy",
+        "label_selector",
+        "max_concurrency",
+        "max_restarts",
+        "max_task_retries",
+        "memory",
+        "num_cpus",
+        "num_gpus",
+        "placement_group",
+        "placement_group_bundle_index",
+        "placement_group_capture_child_tasks",
+        "resources",
+        "runtime_env",
+        "scheduling_strategy",
+    }
 )
 
 
@@ -46,20 +61,32 @@ class FuseCudfActorMapBatches(Rule):
     """Replace compatible cuDF actor-map chains with one physical operator."""
 
     def apply(self, plan: PhysicalPlan) -> PhysicalPlan:
-        """Fuse every eligible linear cuDF actor-map chain in ``plan``."""
+        """Replace eligible cuDF actor-map chains in a physical plan.
+
+        The input has already been lowered to physical operators. Each eligible
+        single-consumer chain is replaced by one actor-map operator.
+
+        Returns the original plan when nothing is fused. Otherwise, returns a rewritten
+        plan that preserves the context and original logical lineage.
+        """
 
         if not self._context_allows_fusion(plan.context):
             return plan
 
-        op_map = plan.op_map.copy()
+        # Copy Ray's physical-to-logical lookup for the rewritten plan.
+        physical_to_logical = plan.op_map.copy()
+
+        # A fused chain cannot cross a branch. Planning can copy one shared logical
+        # operator into multiple physical operators, so check both plan views.
         (
             logical_consumer_counts,
             physical_consumer_counts,
-        ) = self._count_logical_and_physical_consumers(op_map, plan.dag)
+        ) = self._count_consumers_in_both_plan_views(
+            physical_to_logical,
+            plan.dag,
+        )
 
-        # Fusion requires a sequential, single-consumer chain. Planning can copy one
-        # shared logical node into multiple physical nodes, so both counts are needed.
-        # This memo also preserves physical nodes that are genuinely shared in the DAG.
+        # Process physical operators shared in the DAG only once.
         rewritten_operators: Dict[PhysicalOperator, PhysicalOperator] = {}
         did_fuse = False
 
@@ -70,7 +97,7 @@ class FuseCudfActorMapBatches(Rule):
 
             chain, target_max_block_size = self._collect_fusible_chain(
                 op,
-                op_map,
+                physical_to_logical,
                 logical_consumer_counts,
                 physical_consumer_counts,
             )
@@ -79,16 +106,16 @@ class FuseCudfActorMapBatches(Rule):
                 rewritten_input = rewrite_subdag(chain[0].input_dependencies[0])
                 fused_physical_op, fused_logical_op = self._plan_fused_map_operator(
                     chain,
-                    op_map,
+                    physical_to_logical,
                     rewritten_input,
                     plan.context,
                     target_max_block_size,
                 )
-                # The replacement gets the temporary logical map in op_map; its
-                # physical lineage still carries every original logical map.
+                # The replacement maps to the temporary logical operation; its physical
+                # lineage still carries every original logical operation.
                 for stage_op in chain:
-                    op_map.pop(stage_op)
-                op_map[fused_physical_op] = fused_logical_op
+                    physical_to_logical.pop(stage_op)
+                physical_to_logical[fused_physical_op] = fused_logical_op
                 rewritten_operators[op] = fused_physical_op
                 did_fuse = True
                 return fused_physical_op
@@ -113,7 +140,7 @@ class FuseCudfActorMapBatches(Rule):
         if not did_fuse:
             return plan
         self._rebuild_output_dependencies(new_dag)
-        return PhysicalPlan(new_dag, op_map, plan.context)
+        return PhysicalPlan(new_dag, physical_to_logical, plan.context)
 
     @staticmethod
     def _context_allows_fusion(context: Any) -> bool:
@@ -132,19 +159,19 @@ class FuseCudfActorMapBatches(Rule):
         return context.max_tasks_in_flight_per_actor is None
 
     @staticmethod
-    def _count_logical_and_physical_consumers(
-        op_map: Mapping[PhysicalOperator, LogicalOperator],
-        root: PhysicalOperator,
+    def _count_consumers_in_both_plan_views(
+        physical_to_logical: Mapping[PhysicalOperator, LogicalOperator],
+        physical_root: PhysicalOperator,
     ) -> Tuple[Dict[LogicalOperator, int], Dict[PhysicalOperator, int]]:
         """Count both DAG views because physical planning can copy logical nodes."""
 
         logical_counts: Dict[LogicalOperator, int] = {}
-        for op in set(op_map.values()):
+        for op in set(physical_to_logical.values()):
             for input_op in op.input_dependencies:
                 logical_counts[input_op] = logical_counts.get(input_op, 0) + 1
 
         physical_counts: Dict[PhysicalOperator, int] = {}
-        for op in set(root.post_order_iter()):
+        for op in set(physical_root.post_order_iter()):
             for input_op in op.input_dependencies:
                 physical_counts[input_op] = physical_counts.get(input_op, 0) + 1
         return logical_counts, physical_counts
@@ -153,13 +180,16 @@ class FuseCudfActorMapBatches(Rule):
     def _collect_fusible_chain(
         cls,
         op: PhysicalOperator,
-        op_map: Mapping[PhysicalOperator, LogicalOperator],
+        physical_to_logical: Mapping[PhysicalOperator, LogicalOperator],
         logical_consumer_counts: Mapping[LogicalOperator, int],
         physical_consumer_counts: Mapping[PhysicalOperator, int],
     ) -> Tuple[Tuple[PhysicalOperator, ...], Optional[int]]:
         """Return the maximal eligible chain ending at ``op``, in execution order."""
 
-        chain_config = cls._fusion_config_if_eligible(op, op_map.get(op))
+        chain_config = cls._fusion_config_if_eligible(
+            op,
+            physical_to_logical.get(op),
+        )
         if chain_config is None:
             return (), None
 
@@ -169,7 +199,7 @@ class FuseCudfActorMapBatches(Rule):
 
         while len(upstream_cursor.input_dependencies) == 1:
             upstream = upstream_cursor.input_dependencies[0]
-            upstream_logical_op = op_map.get(upstream)
+            upstream_logical_op = physical_to_logical.get(upstream)
             upstream_config = cls._fusion_config_if_eligible(
                 upstream, upstream_logical_op
             )
@@ -276,14 +306,16 @@ class FuseCudfActorMapBatches(Rule):
     @staticmethod
     def _plan_fused_map_operator(
         physical_chain: Tuple[PhysicalOperator, ...],
-        op_map: Mapping[PhysicalOperator, LogicalOperator],
+        physical_to_logical: Mapping[PhysicalOperator, LogicalOperator],
         input_physical_dag: PhysicalOperator,
         context: Any,
         target_max_block_size: Optional[int],
     ) -> Tuple[PhysicalOperator, MapBatches]:
         """Plan one actor-map replacement for an execution-ordered chain."""
 
-        logical_chain = tuple(op_map[physical_op] for physical_op in physical_chain)
+        logical_chain = tuple(
+            physical_to_logical[physical_op] for physical_op in physical_chain
+        )
         # Preserve user argument containers until the actor constructs or calls a UDF.
         stages = tuple(
             _CudfMapStage(
