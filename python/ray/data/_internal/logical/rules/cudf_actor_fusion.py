@@ -28,7 +28,6 @@ from ray.data._internal.logical.operators.map_operator import MapBatches
 from ray.data._internal.planner.plan_udf_map_op import create_udf_map_operator
 from ray.data.block import _is_cudf_dataframe
 
-
 # Driver-side physical-plan rewrite
 
 
@@ -74,73 +73,101 @@ class FuseCudfActorMapBatches(Rule):
             return plan
 
         # Copy Ray's physical-to-logical lookup for the rewritten plan.
-        physical_to_logical = plan.op_map.copy()
+        rewritten_op_map = plan.op_map.copy()
 
         # A fused chain cannot cross a branch. Planning can copy one shared logical
         # operator into multiple physical operators, so check both plan views.
         (
             logical_consumer_counts,
             physical_consumer_counts,
-        ) = self._count_consumers_in_both_plan_views(
-            physical_to_logical,
-            plan.dag,
-        )
+        ) = self._count_consumers_in_both_plan_views(rewritten_op_map, plan.dag)
 
         # Process physical operators shared in the DAG only once.
         rewritten_operators: Dict[PhysicalOperator, PhysicalOperator] = {}
-        did_fuse = False
+        fused_operators: set[PhysicalOperator] = set()
 
-        def rewrite_subdag(op: PhysicalOperator) -> PhysicalOperator:
-            nonlocal did_fuse
-            if op in rewritten_operators:
-                return rewritten_operators[op]
+        def rewrite_subdag(physical_op: PhysicalOperator) -> PhysicalOperator:
+            """Rewrite ``physical_op`` and every operator upstream of it.
 
-            chain, target_max_block_size = self._collect_fusible_chain(
-                op,
-                physical_to_logical,
+            A fusible group ending at ``physical_op`` is replaced as one unit. If no
+            such group exists, this function calls itself on every operator that
+            directly provides input to ``physical_op``. Repeating this from the plan's
+            downstream-most operator visits the entire reachable physical DAG.
+
+            Unchanged operators are reused and may have their input dependencies updated
+            in place. Returns the downstream-most operator of the rewritten graph.
+            """
+            # Shared operators may be reached through multiple branches. Reuse the
+            # result from the first visit instead of rewriting the same graph twice.
+            if physical_op in rewritten_operators:
+                return rewritten_operators[physical_op]
+
+            # Collect consecutive existing operators, in execution order, that can be
+            # replaced by one fused operator. The block size is the output setting that
+            # the replacement must preserve.
+            fusible_operators, target_max_block_size = self._collect_fusible_chain(
+                physical_op,
+                rewritten_op_map,
                 logical_consumer_counts,
                 physical_consumer_counts,
             )
 
-            if len(chain) >= 2:
-                rewritten_input = rewrite_subdag(chain[0].input_dependencies[0])
+            if len(fusible_operators) >= 2:
+                # The selected operators end at physical_op. Continue scanning from
+                # the input immediately before them so earlier operators and branches
+                # are also rewritten before this group is replaced.
+                rewritten_input = rewrite_subdag(
+                    fusible_operators[0].input_dependencies[0]
+                )
+
+                # Create one executable replacement for the selected operators and the
+                # corresponding synthetic logical operator required by the physical
+                # plan's operator map.
                 fused_physical_op, fused_logical_op = self._plan_fused_map_operator(
-                    chain,
-                    physical_to_logical,
+                    fusible_operators,
+                    rewritten_op_map,
                     rewritten_input,
                     plan.context,
                     target_max_block_size,
                 )
                 # The replacement maps to the temporary logical operation; its physical
                 # lineage still carries every original logical operation.
-                for stage_op in chain:
-                    physical_to_logical.pop(stage_op)
-                physical_to_logical[fused_physical_op] = fused_logical_op
-                rewritten_operators[op] = fused_physical_op
-                did_fuse = True
+                for stage_op in fusible_operators:
+                    rewritten_op_map.pop(stage_op)
+                rewritten_op_map[fused_physical_op] = fused_logical_op
+                rewritten_operators[physical_op] = fused_physical_op
+                fused_operators.add(fused_physical_op)
                 return fused_physical_op
 
+            # No fusible group ends at this operator. Keep it and continue scanning
+            # upstream through every input dependency, including every branch.
             rewritten_inputs = [
-                rewrite_subdag(input_op) for input_op in op.input_dependencies
+                rewrite_subdag(input_op) for input_op in physical_op.input_dependencies
             ]
+            # If an upstream call returned a replacement, reconnect this reused
+            # operator to that replacement.
             if any(
                 rewritten is not original
                 for rewritten, original in zip(
                     rewritten_inputs,
-                    op.input_dependencies,
+                    physical_op.input_dependencies,
                 )
             ):
                 # Input edges drive execution; producer-side output edges are repaired
                 # once the full rewrite is complete.
-                op._input_dependencies = rewritten_inputs
-            rewritten_operators[op] = op
-            return op
+                physical_op._input_dependencies = rewritten_inputs
+            rewritten_operators[physical_op] = physical_op
+            return physical_op
 
+        # Start at the downstream-most operator; recursively following its
+        # input dependencies visits and rewrites the entire physical DAG.
         new_dag = rewrite_subdag(plan.dag)
-        if not did_fuse:
+
+        # If the traversal created no replacements, leave the original plan untouched.
+        if not fused_operators:
             return plan
         self._rebuild_output_dependencies(new_dag)
-        return PhysicalPlan(new_dag, physical_to_logical, plan.context)
+        return PhysicalPlan(new_dag, rewritten_op_map, plan.context)
 
     @staticmethod
     def _context_allows_fusion(context: Any) -> bool:
@@ -160,13 +187,13 @@ class FuseCudfActorMapBatches(Rule):
 
     @staticmethod
     def _count_consumers_in_both_plan_views(
-        physical_to_logical: Mapping[PhysicalOperator, LogicalOperator],
+        rewritten_op_map: Mapping[PhysicalOperator, LogicalOperator],
         physical_root: PhysicalOperator,
     ) -> Tuple[Dict[LogicalOperator, int], Dict[PhysicalOperator, int]]:
         """Count both DAG views because physical planning can copy logical nodes."""
 
         logical_counts: Dict[LogicalOperator, int] = {}
-        for op in set(physical_to_logical.values()):
+        for op in set(rewritten_op_map.values()):
             for input_op in op.input_dependencies:
                 logical_counts[input_op] = logical_counts.get(input_op, 0) + 1
 
@@ -180,7 +207,7 @@ class FuseCudfActorMapBatches(Rule):
     def _collect_fusible_chain(
         cls,
         op: PhysicalOperator,
-        physical_to_logical: Mapping[PhysicalOperator, LogicalOperator],
+        rewritten_op_map: Mapping[PhysicalOperator, LogicalOperator],
         logical_consumer_counts: Mapping[LogicalOperator, int],
         physical_consumer_counts: Mapping[PhysicalOperator, int],
     ) -> Tuple[Tuple[PhysicalOperator, ...], Optional[int]]:
@@ -188,7 +215,7 @@ class FuseCudfActorMapBatches(Rule):
 
         chain_config = cls._fusion_config_if_eligible(
             op,
-            physical_to_logical.get(op),
+            rewritten_op_map.get(op),
         )
         if chain_config is None:
             return (), None
@@ -199,7 +226,7 @@ class FuseCudfActorMapBatches(Rule):
 
         while len(upstream_cursor.input_dependencies) == 1:
             upstream = upstream_cursor.input_dependencies[0]
-            upstream_logical_op = physical_to_logical.get(upstream)
+            upstream_logical_op = rewritten_op_map.get(upstream)
             upstream_config = cls._fusion_config_if_eligible(
                 upstream, upstream_logical_op
             )
@@ -306,7 +333,7 @@ class FuseCudfActorMapBatches(Rule):
     @staticmethod
     def _plan_fused_map_operator(
         physical_chain: Tuple[PhysicalOperator, ...],
-        physical_to_logical: Mapping[PhysicalOperator, LogicalOperator],
+        rewritten_op_map: Mapping[PhysicalOperator, LogicalOperator],
         input_physical_dag: PhysicalOperator,
         context: Any,
         target_max_block_size: Optional[int],
@@ -314,7 +341,7 @@ class FuseCudfActorMapBatches(Rule):
         """Plan one actor-map replacement for an execution-ordered chain."""
 
         logical_chain = tuple(
-            physical_to_logical[physical_op] for physical_op in physical_chain
+            rewritten_op_map[physical_op] for physical_op in physical_chain
         )
         # Preserve user argument containers until the actor constructs or calls a UDF.
         stages = tuple(
