@@ -155,6 +155,7 @@ class FuseCudfActorMapBatches(Rule):
         if not self._context_allows_fusion(plan.context):
             return plan
 
+        # makes sure operatorions are sequential (no branching)
         op_map = plan.op_map.copy()
         (
             logical_consumer_counts,
