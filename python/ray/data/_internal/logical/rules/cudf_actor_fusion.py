@@ -51,7 +51,18 @@ _FUSION_SAFE_REMOTE_ARGS = {
 
 
 def _is_synchronous_callable_class(udf_class: Any) -> bool:
-    """Check a UDF class without constructing it or running driver-side code."""
+    """Return whether the UDF can run in the fused actor's synchronous loop.
+
+    The UDF must be a class whose ``__call__`` method is synchronous—not a
+    coroutine, async generator, or generator. Inspecting the class without creating
+    an instance keeps user setup and GPU initialization inside the Ray actor.
+
+    Args:
+        udf_class: UDF class to inspect.
+
+    Returns:
+        ``True`` when the UDF is a class with a synchronous ``__call__`` method.
+    """
 
     if not inspect.isclass(udf_class):
         return False
@@ -253,6 +264,20 @@ class FuseCudfActorMapBatches(Rule):
             The operators in execution order and the block-size override to preserve.
             An empty tuple means ``physical_op`` is ineligible; one operator means there
             is no adjacent map to fuse.
+
+        Examples:
+            Given an eligible path::
+
+                Input -> MapA -> MapB -> MapC
+
+            starting at ``MapC`` returns ``((MapA, MapB, MapC), None)``. The
+            second value is the block-size override to preserve. If ``CpuMap`` is
+            not eligible::
+
+                Input -> CpuMap -> MapB -> MapC
+
+            starting at ``MapC`` returns ``((MapB, MapC), None)``. The main traversal
+            continues from ``CpuMap`` so earlier parts of the plan are not skipped.
         """
 
         fusion_config = cls._fusion_config_if_eligible(
@@ -530,6 +555,27 @@ def _equal_config_values(left: Any, right: Any) -> bool:
     Values must have identical types and recursively equal contents. Comparisons that
     raise or return an array-like result are treated as unequal so ambiguous settings
     never enable fusion.
+
+    Args:
+        left: First configuration value.
+        right: Second configuration value.
+
+    Returns:
+        ``True`` when both values have the same types and recursively equal contents.
+
+    Examples:
+        Matching nested settings compare equal:
+
+        >>> _equal_config_values(
+        ...     {"num_gpus": 1, "resources": {"worker": 1}},
+        ...     {"num_gpus": 1, "resources": {"worker": 1}},
+        ... )
+        True
+
+        Values with different types do not compare equal:
+
+        >>> _equal_config_values({"num_gpus": 1}, {"num_gpus": True})
+        False
     """
 
     if type(left) is not type(right):
@@ -581,10 +627,15 @@ class _CudfMapStage:
 
 
 class _FusedCudfMapBatches:
-    """Expose several original UDFs as one callable actor transform.
+    """Run several cuDF UDFs as one Ray actor-map operation.
 
-    One instance is created per fused actor. It constructs each original UDF once and
-    passes every batch through them sequentially without an intermediate Ray boundary.
+    Ray's map planner expects one callable class for each physical map operator. This
+    wrapper makes several original UDF classes look like one callable class, allowing
+    Ray to use a single actor pool for the entire fused group.
+
+    Each actor constructs its own UDF instances and passes each cuDF result directly to
+    the next UDF. This avoids the actor, conversion, and rebatching boundaries that
+    would otherwise exist between separate ``map_batches`` operations.
     """
 
     def __init__(self, stages: Tuple[_CudfMapStage, ...]):
