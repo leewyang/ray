@@ -621,7 +621,7 @@ class _CudfMapFusionConfig:
 
 @dataclass(frozen=True, eq=False)
 class _CudfMapStage:
-    """Serializable recipe for one original callable-class UDF.
+    """Serializable representation of one original callable-class UDF.
 
     Keeps constructor arguments separate from per-batch call arguments so the fused
     actor can reproduce the original ``map_batches`` stage. ``error_label`` identifies
