@@ -316,7 +316,7 @@ class FuseCudfActorMapBatches(Rule):
                 not has_one_logical_consumer
                 or not has_one_physical_consumer
                 or upstream_fusion_config is None
-                or not fusion_config.is_compatible_with(upstream_fusion_config)
+                or fusion_config != upstream_fusion_config
                 or block_sizes_conflict
             ):
                 break
@@ -526,87 +526,97 @@ class _CudfMapFusionConfig:
     min_rows_per_bundle: Optional[int]
     ray_remote_args: Mapping[str, Any]
 
-    def is_compatible_with(self, other: "_CudfMapFusionConfig") -> bool:
+    def __eq__(self, other: object) -> bool:
         """Return whether two configurations fit one physical replacement.
 
-        Nested actor options are incompatible when equality raises or does not return
-        one definite boolean.
+        Args:
+            other: Configuration to compare with this one.
+
+        Returns:
+            ``True`` when both configurations can use the same fused operator.
         """
 
+        if not isinstance(other, _CudfMapFusionConfig):
+            return False
         if self.actor_pool != other.actor_pool:
             return False
         if self.batch_size != other.batch_size:
             return False
-        if not _equal_config_values(
+        if not self._values_match_exactly(
             self.min_rows_per_bundle,
             other.min_rows_per_bundle,
         ):
             return False
+        return self._values_match_exactly(
+            self.ray_remote_args,
+            other.ray_remote_args,
+        )
+
+    @staticmethod
+    def _values_match_exactly(left: Any, right: Any) -> bool:
+        """Compare nested settings without type coercion.
+
+        Values must have identical types and recursively equal contents. Comparisons
+        that raise or return an array-like result are treated as unequal so ambiguous
+        settings never enable fusion.
+
+        Args:
+            left: First configuration value.
+            right: Second configuration value.
+
+        Returns:
+            ``True`` when both values have the same types and equal contents.
+
+        Examples:
+            Matching nested settings compare equal:
+
+            >>> _CudfMapFusionConfig._values_match_exactly(
+            ...     {"num_gpus": 1, "resources": {"worker": 1}},
+            ...     {"num_gpus": 1, "resources": {"worker": 1}},
+            ... )
+            True
+
+            Values with different types do not compare equal:
+
+            >>> _CudfMapFusionConfig._values_match_exactly(
+            ...     {"num_gpus": 1}, {"num_gpus": True}
+            ... )
+            False
+        """
+
+        if type(left) is not type(right):
+            return False
 
         try:
-            return _equal_config_values(self.ray_remote_args, other.ray_remote_args)
+            if isinstance(left, Mapping):
+                if len(left) != len(right):
+                    return False
+                for key in left:
+                    if key not in right:
+                        return False
+                    if not _CudfMapFusionConfig._values_match_exactly(
+                        left[key], right[key]
+                    ):
+                        return False
+                return True
+
+            if isinstance(left, (list, tuple)):
+                if len(left) != len(right):
+                    return False
+                for left_value, right_value in zip(left, right):
+                    if not _CudfMapFusionConfig._values_match_exactly(
+                        left_value, right_value
+                    ):
+                        return False
+                return True
+
+            result = left == right
         except Exception:
             return False
 
-
-def _equal_config_values(left: Any, right: Any) -> bool:
-    """Compare nested settings conservatively.
-
-    Values must have identical types and recursively equal contents. Comparisons that
-    raise or return an array-like result are treated as unequal so ambiguous settings
-    never enable fusion.
-
-    Args:
-        left: First configuration value.
-        right: Second configuration value.
-
-    Returns:
-        ``True`` when both values have the same types and recursively equal contents.
-
-    Examples:
-        Matching nested settings compare equal:
-
-        >>> _equal_config_values(
-        ...     {"num_gpus": 1, "resources": {"worker": 1}},
-        ...     {"num_gpus": 1, "resources": {"worker": 1}},
-        ... )
-        True
-
-        Values with different types do not compare equal:
-
-        >>> _equal_config_values({"num_gpus": 1}, {"num_gpus": True})
-        False
-    """
-
-    if type(left) is not type(right):
-        return False
-
-    if isinstance(left, Mapping):
-        if len(left) != len(right):
+        if type(result) is not bool:
             return False
-        for key in left:
-            if key not in right:
-                return False
-            if not _equal_config_values(left[key], right[key]):
-                return False
-        return True
-
-    if isinstance(left, (list, tuple)):
-        if len(left) != len(right):
-            return False
-        for left_value, right_value in zip(left, right):
-            if not _equal_config_values(left_value, right_value):
-                return False
-        return True
-
-    try:
-        result = left == right
-    except Exception:
-        return False
-
-    if type(result) is not bool:
-        return False
-    return result
+        return result
 
 
 @dataclass(frozen=True, eq=False)
