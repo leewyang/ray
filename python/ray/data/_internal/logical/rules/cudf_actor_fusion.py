@@ -27,7 +27,7 @@ from ray.data._internal.logical.operators.map_operator import MapBatches
 from ray.data._internal.planner.plan_udf_map_op import create_udf_map_operator
 from ray.data.block import _is_cudf_dataframe
 
-# Unknown actor options opt out because one fused operator may not preserve them.
+# Actor-option allow-list: add an option only when fusion preserves its behavior.
 _FUSION_SAFE_REMOTE_ARGS = {
     "_labels",
     "accelerator_type",
@@ -140,9 +140,12 @@ class FuseCudfActorMapBatches(Rule):
             )
 
             if len(fusible_operators) >= 2:
+                first_fusible_operator = fusible_operators[0]
+                assert isinstance(first_fusible_operator, ActorPoolMapOperator)
+
                 # Continue before this group so fusion does not skip upstream work.
                 rewritten_group_input = rewrite_upstream_graph(
-                    fusible_operators[0].input_dependencies[0]
+                    first_fusible_operator.input_dependency
                 )
 
                 fused_physical_op, fused_logical_op = self._create_fused_map_operator(
