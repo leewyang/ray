@@ -90,12 +90,14 @@ class TestCudfIterBatches:
 class TestCudfTakeBatch:
     """Tests for take_batch with batch_format='cudf'."""
 
-    def test_take_batch_returns_cudf(self, ray_start_regular_shared, data_source):
+    def test_take_batch_returns_cudf(
+        self, ray_start_regular_shared_2_cpus, data_source
+    ):
         ds = _make_dataset(data_source, None, n=10, blocks=2)
         batch = ds.take_batch(3, batch_format="cudf")
         assert isinstance(batch, cudf.DataFrame)
 
-    def test_take_batch_data(self, ray_start_regular_shared, data_source):
+    def test_take_batch_data(self, ray_start_regular_shared_2_cpus, data_source):
         ds = _make_dataset(data_source, None, n=10, blocks=2)
         batch = ds.take_batch(3, batch_format="cudf")
         if data_source == "range":
@@ -128,7 +130,7 @@ class TestCudfMapBatches:
     """Tests for map_batches with various batch formats (cuDF in/out)."""
 
     def test_map_batches_cudf_receive_and_return(
-        self, ray_start_regular_shared, batch_format
+        self, ray_start_regular_shared_2_cpus, batch_format
     ):
         """UDF receives batches in requested format; test cudf round-trip."""
         ds = ray.data.range(10, override_num_blocks=2)
@@ -156,7 +158,9 @@ class TestCudfMapBatches:
         ).take()
         assert result == [{"id": i} for i in range(1, 11)]
 
-    def test_map_batches_udf_returns_cudf(self, ray_start_regular_shared, batch_format):
+    def test_map_batches_udf_returns_cudf(
+        self, ray_start_regular_shared_2_cpus, batch_format
+    ):
         """UDF returns cudf.DataFrame regardless of input format (batch_to_block)."""
         if batch_format == "cudf":
             pytest.skip("Already testing cudf in/out above")
@@ -213,7 +217,11 @@ class TestCudfFilterExpressions:
     """Tests for filter with expressions on cuDF blocks."""
 
     def test_filter_expr_after_map_batches_cudf(
-        self, ray_start_regular_shared, predicate_expr, test_data, expected_ids
+        self,
+        ray_start_regular_shared_2_cpus,
+        predicate_expr,
+        test_data,
+        expected_ids,
     ):
         """filter(expr=...) works on cuDF blocks from map_batches(batch_format='cudf')."""
         if test_data is not None:
@@ -240,7 +248,11 @@ class TestCudfFilterExpressions:
         assert result_ids == expected_ids
 
     def test_map_batches_after_filter_expr(
-        self, ray_start_regular_shared, predicate_expr, test_data, expected_ids
+        self,
+        ray_start_regular_shared_2_cpus,
+        predicate_expr,
+        test_data,
+        expected_ids,
     ):
         """map_batches(batch_format='cudf') after filter(expr=...) works."""
         if test_data is not None:
@@ -272,7 +284,7 @@ class TestCudfFilterExpressions:
 class TestCudfAddColumn:
     """Tests for add_column with batch_format='cudf'."""
 
-    def test_add_column_cudf(self, ray_start_regular_shared):
+    def test_add_column_cudf(self, ray_start_regular_shared_2_cpus):
         """add_column with batch_format='cudf' adds column to cudf batches."""
         ds = ray.data.range(5).add_column(
             "doubled",
@@ -292,7 +304,7 @@ class TestCudfAddColumn:
 
 
 @pytest.fixture
-def cudf_actor_fusion_context(ray_start_regular_shared):
+def cudf_actor_fusion_context(ray_start_regular_shared_2_cpus):
     if float(ray.cluster_resources().get("GPU", 0)) < 1:
         pytest.skip("cuDF actor fusion requires one GPU")
 
