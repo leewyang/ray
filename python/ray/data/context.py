@@ -702,11 +702,13 @@ class DataContext:
             actor and passes its exact cuDF result to the next stage without Arrow
             conversion or rebatching. The first stage controls the input batch size,
             and every stage must synchronously return one ``cudf.DataFrame``. Each
-            actor holds all stage objects and GPU state; retries rerun the full chain,
-            and Ray reports one physical operator instead of per-stage progress and
-            timing. Ray cannot detect device-to-host work inside a UDF, such as
-            ``to_pandas()``. This setting is off by default and applies independently
-            to each compatible run in datasets created from this context.
+            actor holds all stage objects and GPU state; task retries rerun the full
+            chain, and Ray reports one physical operator instead of per-stage progress
+            and timing. Fusion is skipped when ``actor_init_retry_on_errors`` is enabled
+            because initialization retries would reconstruct preceding stages. Ray
+            cannot detect device-to-host work inside a UDF, such as ``to_pandas()``.
+            This setting is off by default and applies independently to each compatible
+            run in datasets created from this context.
         gpu_shuffle_num_actors: Number of GPU actors (ranks) for GPU shuffle. Defaults
             to total GPUs available in the cluster.
         gpu_shuffle_rmm_pool_size: RMM GPU memory pool size for each rank. ``"auto"``

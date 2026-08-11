@@ -1,5 +1,6 @@
 """CPU-only tests for opt-in actor-based cuDF ``map_batches`` fusion."""
 
+import logging
 from decimal import Decimal
 
 import pytest
@@ -16,7 +17,11 @@ from ray.data._internal.execution.operators.task_pool_map_operator import (
 from ray.data._internal.execution.operators.union_operator import UnionOperator
 from ray.data._internal.logical.interfaces import LogicalPlan
 from ray.data._internal.logical.operators import InputData, MapBatches, MapRows, Union
-from ray.data._internal.logical.optimizers import LogicalOptimizer, get_execution_plan
+from ray.data._internal.logical.optimizers import (
+    LogicalOptimizer,
+    PhysicalOptimizer,
+    get_execution_plan,
+)
 from ray.data._internal.logical.rules import cudf_actor_fusion
 from ray.data._internal.logical.rules.cudf_actor_fusion import (
     FuseCudfActorMapBatches,
@@ -201,6 +206,17 @@ class _RaiseDuringConstruction:
 
 
 _DEFAULT = object()
+_FUSION_LOGGER_NAME = cudf_actor_fusion.__name__
+
+
+def _fusion_skip_records(caplog):
+    return [
+        record
+        for record in caplog.records
+        if record.name == _FUSION_LOGGER_NAME
+        and record.levelno == logging.DEBUG
+        and "cuDF actor fusion" in record.getMessage()
+    ]
 
 
 @pytest.fixture
@@ -337,7 +353,7 @@ def _empty_dataset_with_current_context(monkeypatch):
 # Physical planning
 
 
-def test_default_disabled_and_logical_plan_is_never_rewritten():
+def test_default_disabled_and_logical_plan_is_never_rewritten(caplog, propagate_logs):
     assert DEFAULT_ENABLE_CUDF_ACTOR_FUSION is False
     assert DataContext().enable_cudf_actor_fusion is False
     root, operators = _make_actor_map_chain(_Udf1, _Udf2)
@@ -349,12 +365,16 @@ def test_default_disabled_and_logical_plan_is_never_rewritten():
     assert root.fn is _Udf2
     assert root.input_dependencies[0] is operators[0]
 
-    disabled = _create_unoptimized_physical_plan(root, enabled=False)
-    assert FuseCudfActorMapBatches().apply(disabled) is disabled
-    assert len(_actor_map_operators(disabled)) == 2
+    with caplog.at_level(logging.DEBUG, logger=_FUSION_LOGGER_NAME):
+        caplog.clear()
+        disabled = _create_unoptimized_physical_plan(root, enabled=False)
+        assert FuseCudfActorMapBatches().apply(disabled) is disabled
+        assert len(_actor_map_operators(disabled)) == 2
 
-    logical_plan = LogicalPlan(root, _fusion_context(enabled=True))
-    physical, _ = get_execution_plan(logical_plan)
+        logical_plan = LogicalPlan(root, _fusion_context(enabled=True))
+        physical, _ = get_execution_plan(logical_plan)
+
+    assert _fusion_skip_records(caplog) == []
     assert logical_plan.dag is root
     assert root.input_dependencies[0] is operators[0]
     assert len(_actor_map_operators(physical)) == 1
@@ -468,7 +488,9 @@ def test_single_target_max_block_size_override_is_preserved(override_stage):
     assert fused.dag.target_max_block_size_override == 1024
 
 
-def test_conflicting_target_max_block_size_overrides_prevent_fusion():
+def test_conflicting_target_max_block_size_overrides_prevent_fusion(
+    caplog, propagate_logs
+):
     root, _ = _make_actor_map_chain(_Udf1, _Udf2)
     raw = _create_unoptimized_physical_plan(root)
     downstream = raw.dag
@@ -476,10 +498,15 @@ def test_conflicting_target_max_block_size_overrides_prevent_fusion():
     upstream.override_target_max_block_size(1024)
     downstream.override_target_max_block_size(2048)
 
-    result = FuseCudfActorMapBatches().apply(raw)
+    with caplog.at_level(logging.DEBUG, logger=_FUSION_LOGGER_NAME):
+        caplog.clear()
+        result = FuseCudfActorMapBatches().apply(raw)
 
     assert result is raw
     assert len(_actor_map_operators(result)) == 2
+    records = _fusion_skip_records(caplog)
+    assert len(records) == 1
+    assert "compatible target block sizes" in records[0].getMessage()
 
 
 @pytest.mark.parametrize("unsupported_stage", ["upstream", "downstream"])
@@ -837,32 +864,67 @@ def test_ineligible_map_breaks_a_fusion_run(overrides):
 
 
 @pytest.mark.parametrize(
-    ("setting", "value"),
+    ("setting", "value", "reason"),
     [
-        ("actor_task_retry_on_errors", [ValueError]),
-        ("retried_map_errors", ["ValueError"]),
-        ("raise_original_map_exception", True),
-        ("max_tasks_in_flight_per_actor", 2),
+        (
+            "actor_task_retry_on_errors",
+            [ValueError],
+            "actor_task_retry_on_errors",
+        ),
+        ("actor_init_retry_on_errors", True, "actor_init_retry_on_errors"),
+        ("retried_map_errors", ["ValueError"], "retried_map_errors"),
+        (
+            "raise_original_map_exception",
+            True,
+            "raise_original_map_exception",
+        ),
+        (
+            "max_tasks_in_flight_per_actor",
+            2,
+            "max_tasks_in_flight_per_actor",
+        ),
     ],
     ids=[
         "selective-actor-retry",
+        "actor-init-retry",
         "selective-map-retry",
         "original-exception",
         "context-tasks-in-flight",
     ],
 )
 def test_context_settings_with_incompatible_runtime_semantics_prevent_fusion(
-    setting, value
+    setting, value, reason, caplog, propagate_logs
 ):
     root, _ = _make_actor_map_chain(_Udf1, _Udf2)
     context = _fusion_context(enabled=True)
     setattr(context, setting, value)
     raw = _create_unoptimized_physical_plan(root, context=context)
 
-    result = FuseCudfActorMapBatches().apply(raw)
+    with caplog.at_level(logging.DEBUG, logger=_FUSION_LOGGER_NAME):
+        caplog.clear()
+        result = FuseCudfActorMapBatches().apply(raw)
 
     assert result is raw
     assert len(_actor_map_operators(result)) == 2
+    records = _fusion_skip_records(caplog)
+    assert len(records) == 1
+    assert reason in records[0].getMessage()
+
+
+def test_ineligible_middle_stage_logs_actionable_guidance(caplog, propagate_logs):
+    source = InputData([])
+    upstream = _make_actor_map(source, _Udf1)
+    middle = _make_actor_map(upstream, _Udf2, zero_copy_batch=False)
+    downstream = _make_actor_map(middle, _Udf3)
+
+    with caplog.at_level(logging.DEBUG, logger=_FUSION_LOGGER_NAME):
+        caplog.clear()
+        result = _apply_fusion_rule(downstream)
+
+    assert len(_actor_map_operators(result)) == 3
+    records = _fusion_skip_records(caplog)
+    assert len(records) == 1
+    assert "zero_copy_batch=True" in records[0].getMessage()
 
 
 @pytest.mark.parametrize(
@@ -975,16 +1037,21 @@ def test_context_settings_with_incompatible_runtime_semantics_prevent_fusion(
     ],
 )
 def test_individually_eligible_but_incompatible_maps_do_not_fuse(
-    upstream_overrides, downstream_overrides
+    upstream_overrides, downstream_overrides, caplog, propagate_logs
 ):
     source = InputData([])
     upstream = _make_actor_map(source, _Udf1, **upstream_overrides)
     downstream = _make_actor_map(upstream, _Udf2, **downstream_overrides)
 
-    result = _apply_fusion_rule(downstream)
+    with caplog.at_level(logging.DEBUG, logger=_FUSION_LOGGER_NAME):
+        caplog.clear()
+        result = _apply_fusion_rule(downstream)
 
     assert len(_actor_map_operators(result)) == 2
     assert result.op_map[result.dag] is downstream
+    records = _fusion_skip_records(caplog)
+    assert len(records) == 1
+    assert "matching serial ActorPoolStrategy" in records[0].getMessage()
 
 
 def test_identical_raw_remote_args_are_preserved():
@@ -1011,6 +1078,44 @@ def test_identical_raw_remote_args_are_preserved():
 
 
 # Fusion boundaries
+
+
+def test_partial_fusion_logs_unfused_candidate(caplog, propagate_logs):
+    source = InputData([])
+    upstream = _make_actor_map(source, _Udf1, batch_size=16)
+    middle = _make_actor_map(upstream, _Udf2)
+    downstream = _make_actor_map(middle, _Udf3)
+
+    with caplog.at_level(logging.DEBUG, logger=_FUSION_LOGGER_NAME):
+        caplog.clear()
+        raw = _create_unoptimized_physical_plan(downstream)
+        result = PhysicalOptimizer().optimize(raw)
+
+    assert len(_actor_map_operators(result)) == 2
+    assert [stage.udf_class for stage in _fused_stages(result)] == [_Udf2, _Udf3]
+    records = _fusion_skip_records(caplog)
+    assert len(records) == 1
+    assert "matching positive batch_size" in records[0].getMessage()
+
+
+def test_skip_diagnostic_is_not_repeated_after_unrelated_fusion(caplog, propagate_logs):
+    actor_source = InputData([])
+    actor_upstream = _make_actor_map(actor_source, _Udf1, batch_size=16)
+    blocked_actor = _make_actor_map(actor_upstream, _Udf2)
+
+    task_source = InputData([])
+    task_upstream = MapRows(lambda row: row, input_dependencies=[task_source])
+    task_downstream = MapRows(lambda row: row, input_dependencies=[task_upstream])
+    root = Union([blocked_actor, task_downstream])
+
+    with caplog.at_level(logging.DEBUG, logger=_FUSION_LOGGER_NAME):
+        caplog.clear()
+        raw = _create_unoptimized_physical_plan(root)
+        result = PhysicalOptimizer().optimize(raw)
+
+    assert len(_actor_map_operators(result)) == 2
+    assert len(_task_map_operators(result)) == 1
+    assert len(_fusion_skip_records(caplog)) == 1
 
 
 def test_cpu_barrier_keeps_two_composite_regions_separate():
@@ -1102,3 +1207,9 @@ def test_udf_arguments_with_unusable_repr_can_be_physically_planned():
     physical, _ = get_execution_plan(LogicalPlan(second, _fusion_context(enabled=True)))
 
     assert len(_actor_map_operators(physical)) == 1
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main(["-v", __file__]))

@@ -13,6 +13,7 @@ the next UDF. Ray's normal UDF map planner creates the replacement operator.
 """
 
 import inspect
+import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
@@ -26,6 +27,10 @@ from ray.data._internal.logical.interfaces import LogicalOperator, PhysicalPlan,
 from ray.data._internal.logical.operators.map_operator import MapBatches
 from ray.data._internal.planner.plan_udf_map_op import create_udf_map_operator
 from ray.data.block import _is_cudf_dataframe
+
+logger = logging.getLogger(__name__)
+
+_FUSION_DIAGNOSTIC_LOGGED_ATTR = "_cudf_actor_fusion_diagnostic_logged"
 
 # Actor-option allow-list: add an option only when fusion preserves its behavior.
 _FUSION_SAFE_REMOTE_ARGS = {
@@ -103,7 +108,21 @@ class FuseCudfActorMapBatches(Rule):
             otherwise, a new ``PhysicalPlan`` with an updated DAG and operator map.
         """
 
+        if getattr(plan.context, "enable_cudf_actor_fusion", False) is not True:
+            return plan
+
+        undiagnosed_candidates = self._undiagnosed_cudf_candidates(plan)
+
         if not self._context_allows_fusion(plan.context):
+            if undiagnosed_candidates:
+                logger.debug(
+                    "cuDF actor fusion is enabled, but DataContext settings prevent "
+                    "it. Check that raise_original_map_exception=False, "
+                    "actor_init_retry_on_errors=False, actor_task_retry_on_errors "
+                    "and retried_map_errors are booleans, and "
+                    "max_tasks_in_flight_per_actor=None."
+                )
+                self._mark_diagnostics_logged(undiagnosed_candidates)
             return plan
 
         # Build a separate map so the input plan keeps its operator map.
@@ -118,7 +137,7 @@ class FuseCudfActorMapBatches(Rule):
 
         # Reuse the first rewrite when two paths reach the same operator.
         rewritten_operator_by_original: Dict[PhysicalOperator, PhysicalOperator] = {}
-        new_fused_operators: list[PhysicalOperator] = []
+        did_fuse = False
 
         def rewrite_upstream_graph(physical_op: PhysicalOperator) -> PhysicalOperator:
             """Rewrite the subgraph ending at ``physical_op``.
@@ -128,6 +147,8 @@ class FuseCudfActorMapBatches(Rule):
             keep shared operators shared. Returns the downstream operator of the
             rewritten subgraph.
             """
+            nonlocal did_fuse
+
             if physical_op in rewritten_operator_by_original:
                 return rewritten_operator_by_original[physical_op]
 
@@ -160,7 +181,7 @@ class FuseCudfActorMapBatches(Rule):
                     del rewritten_op_map[original_physical_op]
                 rewritten_op_map[fused_physical_op] = fused_logical_op
                 rewritten_operator_by_original[physical_op] = fused_physical_op
-                new_fused_operators.append(fused_physical_op)
+                did_fuse = True
                 return fused_physical_op
 
             # Nothing ends here, so continue through every input.
@@ -180,14 +201,26 @@ class FuseCudfActorMapBatches(Rule):
 
         rewritten_final_operator = rewrite_upstream_graph(original_final_operator)
 
-        if not new_fused_operators:
+        if not did_fuse:
+            if undiagnosed_candidates:
+                logger.debug(
+                    "cuDF actor fusion found adjacent candidate stages it could not "
+                    "fuse. Check that the stages use synchronous callable classes, "
+                    'batch_format="cudf", a matching positive batch_size, '
+                    "zero_copy_batch=True, per_block_limit=None, a matching serial "
+                    "ActorPoolStrategy, no ray_remote_args_fn or unsupported actor "
+                    "options, max_concurrency=1, num_gpus=1, and a linear DAG with "
+                    "compatible target block sizes. Use Dataset.explain() to inspect "
+                    "the optimized physical plan."
+                )
+                self._mark_diagnostics_logged(undiagnosed_candidates)
             return plan
         self._rebuild_output_dependencies(rewritten_final_operator)
         return PhysicalPlan(rewritten_final_operator, rewritten_op_map, plan.context)
 
     @staticmethod
     def _context_allows_fusion(context: Any) -> bool:
-        """Return whether ``context`` enables fusion without changing semantics.
+        """Return whether ``context`` opts in with supported execution settings.
 
         Fusion is rejected when exception propagation, retry matching, or actor task
         admission would differ from the original sequence of actor pools.
@@ -199,6 +232,9 @@ class FuseCudfActorMapBatches(Rule):
         if context.raise_original_map_exception is not False:
             return False
 
+        if context.actor_init_retry_on_errors is not False:
+            return False
+
         if not isinstance(context.actor_task_retry_on_errors, bool):
             return False
         if not isinstance(context.retried_map_errors, bool):
@@ -207,13 +243,48 @@ class FuseCudfActorMapBatches(Rule):
         return context.max_tasks_in_flight_per_actor is None
 
     @staticmethod
+    def _undiagnosed_cudf_candidates(
+        plan: PhysicalPlan,
+    ) -> Tuple[PhysicalOperator, ...]:
+        """Return downstream operators of undiagnosed cuDF candidate pairs.
+
+        Previously fused maps remain candidates here so a later fixed-point pass can
+        diagnose an incompatible boundary left by a partial fusion.
+        """
+
+        candidates = []
+        for physical_op, logical_op in plan.op_map.items():
+            if not isinstance(logical_op, MapBatches) or getattr(
+                physical_op, _FUSION_DIAGNOSTIC_LOGGED_ATTR, False
+            ):
+                continue
+            for input_physical_op in physical_op.input_dependencies:
+                input_logical_op = plan.op_map.get(input_physical_op)
+                if isinstance(input_logical_op, MapBatches) and (
+                    logical_op.batch_format == "cudf"
+                    or input_logical_op.batch_format == "cudf"
+                ):
+                    candidates.append(physical_op)
+                    break
+        return tuple(candidates)
+
+    @staticmethod
+    def _mark_diagnostics_logged(candidates: Tuple[PhysicalOperator, ...]) -> None:
+        """Prevent duplicate diagnostics across optimizer fixed-point passes."""
+
+        for physical_op in candidates:
+            setattr(physical_op, _FUSION_DIAGNOSTIC_LOGGED_ATTR, True)
+
+    @staticmethod
     def _count_logical_consumers(
         rewritten_op_map: Mapping[PhysicalOperator, LogicalOperator],
     ) -> Dict[LogicalOperator, int]:
         """Count each logical operator's direct consumers.
 
-        The set removes duplicate logical operators from the physical-to-logical map.
-        Operators with no consumers are omitted.
+        Logical operators store only their inputs, so count how often each operator
+        appears as an input. The set prevents physical copies of the same logical
+        operator from being counted as separate consumers. Operators with no consumers
+        are omitted.
         """
 
         logical_counts: Dict[LogicalOperator, int] = {}
