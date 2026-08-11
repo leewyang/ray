@@ -25,7 +25,7 @@ from ray.data._internal.execution.operators.actor_pool_map_operator import (
 )
 from ray.data._internal.logical.interfaces import LogicalOperator, PhysicalPlan, Rule
 from ray.data._internal.logical.operators.map_operator import MapBatches
-from ray.data._internal.planner.plan_udf_map_op import create_udf_map_operator
+from ray.data._internal.planner.plan_udf_map_op import plan_udf_map_op
 from ray.data.block import _is_cudf_dataframe
 
 logger = logging.getLogger(__name__)
@@ -558,12 +558,12 @@ class FuseCudfActorMapBatches(Rule):
         object.__setattr__(fused_logical_op, "_name", f"MapBatches({udf_names})")
 
         # Reuse Ray's planner to preserve normal actor and batch-conversion behavior.
-        fused_physical_op = create_udf_map_operator(
+        fused_physical_op = plan_udf_map_op(
             fused_logical_op,
-            input_physical_op,
+            [input_physical_op],
             context,
-            target_max_block_size_override=target_max_block_size,
         )
+        fused_physical_op.override_target_max_block_size(target_max_block_size)
 
         # The caller maps this physical operator to ``fused_logical_op`` in
         # ``op_map``. Keep the replaced logical operators separately as lineage

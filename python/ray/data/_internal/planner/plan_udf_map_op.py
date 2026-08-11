@@ -290,17 +290,7 @@ def plan_udf_map_op(
     See Planner.plan() for more details.
     """
     assert len(physical_children) == 1
-    return create_udf_map_operator(op, physical_children[0], data_context)
-
-
-def create_udf_map_operator(
-    op: AbstractUDFMap,
-    input_physical_dag: PhysicalOperator,
-    data_context: DataContext,
-    *,
-    target_max_block_size_override: Optional[int] = None,
-) -> MapOperator:
-    """Lower one logical UDF map onto its already-planned physical input."""
+    input_physical_dag = physical_children[0]
 
     output_block_size_option = OutputBlockSizeOption.of(
         target_max_block_size=data_context.target_max_block_size,
@@ -347,7 +337,6 @@ def create_udf_map_operator(
         map_transformer,
         input_physical_dag,
         data_context,
-        target_max_block_size_override=target_max_block_size_override,
         name=op.name,
         compute_strategy=compute,
         min_rows_per_bundle=op.min_rows_per_bundled_input,
