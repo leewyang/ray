@@ -565,7 +565,9 @@ class FuseCudfActorMapBatches(Rule):
             target_max_block_size_override=target_max_block_size,
         )
 
-        # Preserve original lineage for stats and plan inspection.
+        # The caller maps this physical operator to ``fused_logical_op`` in
+        # ``op_map``. Keep the replaced logical operators separately as lineage
+        # metadata for stats and plan inspection; they aren't dataflow inputs.
         fused_physical_op.set_logical_operators(*logical_operators)
         return fused_physical_op, fused_logical_op
 
