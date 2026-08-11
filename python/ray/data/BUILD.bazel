@@ -336,6 +336,36 @@ py_test(
 )
 
 py_test(
+    name = "test_cudf_actor_fusion",
+    size = "small",
+    srcs = ["tests/test_cudf_actor_fusion.py"],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
+py_test(
+    name = "test_cudf_actor_fusion_multinode",
+    size = "medium",
+    srcs = ["tests/test_cudf_actor_fusion_multinode.py"],
+    tags = [
+        "cudf",
+        "exclusive",
+        "multi_gpu",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
+py_test(
     name = "test_block_batching",
     size = "small",
     srcs = ["tests/block_batching/test_block_batching.py"],

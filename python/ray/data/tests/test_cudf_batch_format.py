@@ -13,6 +13,10 @@ import pytest
 
 import ray
 from ray.data._internal.block_batching.block_batching import batch_blocks
+from ray.data._internal.execution.operators.actor_pool_map_operator import (
+    ActorPoolMapOperator,
+)
+from ray.data._internal.logical.optimizers import get_execution_plan
 from ray.data.expressions import col
 from ray.data.tests.conftest import *  # noqa
 
@@ -86,12 +90,14 @@ class TestCudfIterBatches:
 class TestCudfTakeBatch:
     """Tests for take_batch with batch_format='cudf'."""
 
-    def test_take_batch_returns_cudf(self, ray_start_regular_shared, data_source):
+    def test_take_batch_returns_cudf(
+        self, ray_start_regular_shared_2_cpus, data_source
+    ):
         ds = _make_dataset(data_source, None, n=10, blocks=2)
         batch = ds.take_batch(3, batch_format="cudf")
         assert isinstance(batch, cudf.DataFrame)
 
-    def test_take_batch_data(self, ray_start_regular_shared, data_source):
+    def test_take_batch_data(self, ray_start_regular_shared_2_cpus, data_source):
         ds = _make_dataset(data_source, None, n=10, blocks=2)
         batch = ds.take_batch(3, batch_format="cudf")
         if data_source == "range":
@@ -124,7 +130,7 @@ class TestCudfMapBatches:
     """Tests for map_batches with various batch formats (cuDF in/out)."""
 
     def test_map_batches_cudf_receive_and_return(
-        self, ray_start_regular_shared, batch_format
+        self, ray_start_regular_shared_2_cpus, batch_format
     ):
         """UDF receives batches in requested format; test cudf round-trip."""
         ds = ray.data.range(10, override_num_blocks=2)
@@ -152,7 +158,9 @@ class TestCudfMapBatches:
         ).take()
         assert result == [{"id": i} for i in range(1, 11)]
 
-    def test_map_batches_udf_returns_cudf(self, ray_start_regular_shared, batch_format):
+    def test_map_batches_udf_returns_cudf(
+        self, ray_start_regular_shared_2_cpus, batch_format
+    ):
         """UDF returns cudf.DataFrame regardless of input format (batch_to_block)."""
         if batch_format == "cudf":
             pytest.skip("Already testing cudf in/out above")
@@ -209,7 +217,11 @@ class TestCudfFilterExpressions:
     """Tests for filter with expressions on cuDF blocks."""
 
     def test_filter_expr_after_map_batches_cudf(
-        self, ray_start_regular_shared, predicate_expr, test_data, expected_ids
+        self,
+        ray_start_regular_shared_2_cpus,
+        predicate_expr,
+        test_data,
+        expected_ids,
     ):
         """filter(expr=...) works on cuDF blocks from map_batches(batch_format='cudf')."""
         if test_data is not None:
@@ -236,7 +248,11 @@ class TestCudfFilterExpressions:
         assert result_ids == expected_ids
 
     def test_map_batches_after_filter_expr(
-        self, ray_start_regular_shared, predicate_expr, test_data, expected_ids
+        self,
+        ray_start_regular_shared_2_cpus,
+        predicate_expr,
+        test_data,
+        expected_ids,
     ):
         """map_batches(batch_format='cudf') after filter(expr=...) works."""
         if test_data is not None:
@@ -268,7 +284,7 @@ class TestCudfFilterExpressions:
 class TestCudfAddColumn:
     """Tests for add_column with batch_format='cudf'."""
 
-    def test_add_column_cudf(self, ray_start_regular_shared):
+    def test_add_column_cudf(self, ray_start_regular_shared_2_cpus):
         """add_column with batch_format='cudf' adds column to cudf batches."""
         ds = ray.data.range(5).add_column(
             "doubled",
@@ -285,6 +301,180 @@ class TestCudfAddColumn:
             {"id": 3, "doubled": 6},
             {"id": 4, "doubled": 8},
         ]
+
+
+@pytest.fixture
+def cudf_actor_fusion_context(ray_start_regular_shared_2_cpus):
+    if float(ray.cluster_resources().get("GPU", 0)) < 1:
+        pytest.skip("cuDF actor fusion requires one GPU")
+
+    context = ray.data.DataContext.get_current()
+    previous = context.enable_cudf_actor_fusion
+    context.enable_cudf_actor_fusion = True
+    try:
+        yield context
+    finally:
+        context.enable_cudf_actor_fusion = previous
+
+
+def _cudf_actor_map_kwargs():
+    return {
+        "batch_format": "cudf",
+        "batch_size": 8,
+        "zero_copy_batch": True,
+        "compute": ray.data.ActorPoolStrategy(size=1),
+        "num_gpus": 1,
+    }
+
+
+@pytest.mark.gpu
+class TestCudfActorMapFusion:
+    def test_three_public_map_batches_share_frame_actor_and_plan(
+        self, cudf_actor_fusion_context
+    ):
+        assert cudf_actor_fusion_context.enable_cudf_actor_fusion is True
+
+        class FirstStage:
+            def __init__(self, constructor_value):
+                self.constructor_value = constructor_value
+
+            def __call__(self, batch):
+                actor_id = str(ray.get_runtime_context().get_actor_id())
+                batch["python_object_id"] = id(batch)
+                batch["actor_id"] = actor_id
+                batch["first_constructor"] = self.constructor_value
+                return batch
+
+        class SecondStage:
+            def __init__(self, constructor_value):
+                self.constructor_value = constructor_value
+
+            def __call__(self, batch):
+                actor_id = str(ray.get_runtime_context().get_actor_id())
+                assert bool((batch["python_object_id"] == id(batch)).all())
+                assert bool((batch["actor_id"] == actor_id).all())
+                batch["second_constructor"] = self.constructor_value
+                return batch
+
+        class ThirdStage:
+            def __init__(self, constructor_value):
+                self.constructor_value = constructor_value
+
+            def __call__(self, batch):
+                actor_id = str(ray.get_runtime_context().get_actor_id())
+                assert bool((batch["python_object_id"] == id(batch)).all())
+                assert bool((batch["actor_id"] == actor_id).all())
+                batch["third_constructor"] = self.constructor_value
+                return batch
+
+        ds = (
+            ray.data.range(8, override_num_blocks=1)
+            .map_batches(
+                FirstStage,
+                fn_constructor_args=("first",),
+                **_cudf_actor_map_kwargs(),
+            )
+            .map_batches(
+                SecondStage,
+                fn_constructor_args=("second",),
+                **_cudf_actor_map_kwargs(),
+            )
+            .map_batches(
+                ThirdStage,
+                fn_constructor_args=("third",),
+                **_cudf_actor_map_kwargs(),
+            )
+        )
+
+        physical_plan, _ = get_execution_plan(ds._logical_plan)
+        operators = []
+        stack = [physical_plan.dag]
+        while stack:
+            operator = stack.pop()
+            operators.append(operator)
+            stack.extend(operator.input_dependencies)
+        assert sum(isinstance(op, ActorPoolMapOperator) for op in operators) == 1
+
+        rows = ds.take_all()
+        assert len(rows) == 8
+        assert {row["python_object_id"] for row in rows} == {
+            rows[0]["python_object_id"]
+        }
+        assert {row["actor_id"] for row in rows} == {rows[0]["actor_id"]}
+        assert {row["first_constructor"] for row in rows} == {"first"}
+        assert {row["second_constructor"] for row in rows} == {"second"}
+        assert {row["third_constructor"] for row in rows} == {"third"}
+
+    def test_row_filter_output_is_passed_directly_to_next_stage(
+        self, cudf_actor_fusion_context
+    ):
+        class RecordActor:
+            def __call__(self, batch):
+                batch["actor_id"] = str(ray.get_runtime_context().get_actor_id())
+                return batch
+
+        class KeepEvenRows:
+            def __call__(self, batch):
+                filtered = batch[batch["id"] % 2 == 0]
+                filtered["post_filter_object_id"] = id(filtered)
+                return filtered
+
+        class AssertFilteredBatch:
+            def __init__(self, expected_size):
+                self.expected_size = expected_size
+
+            def __call__(self, batch):
+                assert len(batch) == self.expected_size
+                assert bool((batch["post_filter_object_id"] == id(batch)).all())
+                assert bool(
+                    (
+                        batch["actor_id"]
+                        == str(ray.get_runtime_context().get_actor_id())
+                    ).all()
+                )
+                batch["next_stage_batch_size"] = len(batch)
+                return batch
+
+        ds = (
+            ray.data.range(8, override_num_blocks=1)
+            .map_batches(RecordActor, **_cudf_actor_map_kwargs())
+            .map_batches(KeepEvenRows, **_cudf_actor_map_kwargs())
+            .map_batches(
+                AssertFilteredBatch,
+                fn_constructor_args=(4,),
+                **_cudf_actor_map_kwargs(),
+            )
+        )
+
+        rows = ds.take_all()
+        assert [row["id"] for row in rows] == [0, 2, 4, 6]
+        assert {row["next_stage_batch_size"] for row in rows} == {4}
+
+    def test_non_cudf_intermediate_output_fails(self, cudf_actor_fusion_context):
+        class Identity:
+            def __call__(self, batch):
+                return batch
+
+        class ReturnArrow:
+            def __call__(self, batch):
+                return batch.to_arrow()
+
+        class MustNotRun:
+            def __call__(self, batch):
+                raise AssertionError("stage after invalid cuDF output must not run")
+
+        ds = (
+            ray.data.range(8, override_num_blocks=1)
+            .map_batches(Identity, **_cudf_actor_map_kwargs())
+            .map_batches(ReturnArrow, **_cudf_actor_map_kwargs())
+            .map_batches(MustNotRun, **_cudf_actor_map_kwargs())
+        )
+
+        with pytest.raises(ray.exceptions.RayTaskError) as exc_info:
+            ds.take_all()
+        message = str(exc_info.value)
+        assert "MapBatches(ReturnArrow)" in message
+        assert "expected cudf.DataFrame" in message
 
 
 if __name__ == "__main__":
