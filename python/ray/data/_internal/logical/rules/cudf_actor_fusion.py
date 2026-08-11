@@ -735,9 +735,8 @@ class _FusedCudfMapBatches:
                 message and the original exception is retained as the cause.
         """
 
-        self._stages = tuple(stages)
-        udf_instances = []
-        for stage in self._stages:
+        stage_udf_pairs = []
+        for stage in stages:
             try:
                 udf_instance = stage.udf_class(
                     *stage.constructor_args,
@@ -748,8 +747,8 @@ class _FusedCudfMapBatches:
                     f"Fused cuDF map_batches stage {stage.error_label!r} failed "
                     "during construction."
                 ) from exc
-            udf_instances.append(udf_instance)
-        self._udf_instances = tuple(udf_instances)
+            stage_udf_pairs.append((stage, udf_instance))
+        self._stage_udf_pairs = tuple(stage_udf_pairs)
 
     def __call__(self, batch: Any) -> Any:
         """Run ``batch`` through every UDF and return the final cuDF DataFrame.
@@ -769,7 +768,7 @@ class _FusedCudfMapBatches:
             TypeError: If any UDF returns an object other than a cuDF DataFrame.
         """
 
-        for stage, udf_instance in zip(self._stages, self._udf_instances):
+        for stage, udf_instance in self._stage_udf_pairs:
             try:
                 batch = udf_instance(batch, *stage.call_args, **stage.call_kwargs)
             except Exception as exc:
