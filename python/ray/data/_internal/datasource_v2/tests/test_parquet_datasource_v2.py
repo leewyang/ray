@@ -8,6 +8,7 @@ spin up Ray.
 import os
 
 import pyarrow as pa
+import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 import pytest
 
@@ -103,6 +104,47 @@ def test_create_scanner_returns_parquet_scanner(tmp_path):
 
     assert isinstance(scanner, ParquetScanner)
     assert scanner.schema == schema
+
+
+@pytest.mark.parametrize(
+    ("datasource_kwargs", "has_custom_read_behavior"),
+    [
+        pytest.param({}, False, id="defaults"),
+        pytest.param(
+            {"filesystem": pafs.LocalFileSystem()},
+            True,
+            id="explicit-filesystem",
+        ),
+        pytest.param(
+            {"schema": pa.schema([("a", pa.int64())])},
+            True,
+            id="user-schema",
+        ),
+        pytest.param(
+            {"arrow_parquet_args": {"batch_size": 1}},
+            True,
+            id="arrow-read-options",
+        ),
+        pytest.param(
+            {"parquet_format_kwargs": {"pre_buffer": False}},
+            True,
+            id="parquet-format-options",
+        ),
+    ],
+)
+def test_create_scanner_marks_custom_read_behavior(
+    tmp_path,
+    datasource_kwargs,
+    has_custom_read_behavior,
+):
+    file_path = tmp_path / "data.parquet"
+    _write_parquet(str(file_path), pa.table({"a": [1]}))
+
+    datasource = ParquetDatasourceV2([str(file_path)], **datasource_kwargs)
+    schema = datasource.infer_schema(_manifest_of([str(file_path)]))
+    scanner = datasource.create_scanner(schema)
+
+    assert scanner.has_custom_read_behavior is has_custom_read_behavior
 
 
 def test_get_size_estimator_returns_parquet_estimator(tmp_path):

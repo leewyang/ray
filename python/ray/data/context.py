@@ -83,6 +83,8 @@ DEFAULT_READ_OP_MIN_NUM_BLOCKS = 200
 
 DEFAULT_USE_DATASOURCE_V2 = env_bool("RAY_DATA_USE_DATASOURCE_V2", True)
 
+DEFAULT_ENABLE_CUDF_PARQUET_READ_FUSION = False
+
 # Default target chunk size for ``ParquetFileChunker``. ``None`` means the chunker
 # uses its built-in default (currently 1 GiB).
 DEFAULT_PARQUET_CHUNKER_TARGET_CHUNK_SIZE: Optional[int] = None
@@ -543,6 +545,10 @@ class DataContext:
             driver-side first-file sampling for schema inference,
             ``ParquetScanner`` / ``ParquetFileReader``). Defaults to False — V1
             remains the production path while V2 bakes.
+        enable_cudf_parquet_read_fusion: Whether to decode compatible DataSourceV2
+            Parquet reads with cuDF inside a downstream GPU ``map_batches`` actor.
+            Fusion changes task-level batch boundaries and makes the read and UDF one
+            retry unit. Each actor reserves one GPU. Disabled by default.
         parquet_chunker_target_chunk_size: Target chunk size in bytes used by
             ``ParquetFileChunker`` when splitting large Parquet files into
             multiple read tasks. When ``None``, the chunker's built-in default
@@ -820,6 +826,7 @@ class DataContext:
     min_parallelism: int = DEFAULT_MIN_PARALLELISM
     read_op_min_num_blocks: int = DEFAULT_READ_OP_MIN_NUM_BLOCKS
     use_datasource_v2: bool = DEFAULT_USE_DATASOURCE_V2
+    enable_cudf_parquet_read_fusion: bool = DEFAULT_ENABLE_CUDF_PARQUET_READ_FUSION
     # Target chunk size in bytes for ``ParquetFileChunker``. When ``None``, the
     # chunker uses its built-in default (currently 1 GiB).
     parquet_chunker_target_chunk_size: Optional[

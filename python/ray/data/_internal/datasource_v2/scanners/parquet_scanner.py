@@ -33,6 +33,8 @@ class ParquetScanner(ArrowFileScanner):
     target_block_size: Optional[int] = None
     include_paths: bool = False
     include_row_hash: bool = False
+    # True when direct cuDF decoding would ignore caller-specific read behavior.
+    has_custom_read_behavior: bool = False
     # Extra kwargs forwarded to ``pds.ParquetFileFormat(**kwargs)`` inside
     # the per-task ``ParquetFileReader`` (e.g. ``coerce_int96_timestamp_unit``,
     # ``pre_buffer``, ``dictionary_columns``). Carries the deprecated
