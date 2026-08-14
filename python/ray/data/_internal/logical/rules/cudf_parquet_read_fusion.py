@@ -15,6 +15,7 @@ already-planned UDF. Unsupported reads keep the original plan.
 from __future__ import annotations
 
 import copy
+import functools
 import inspect
 import logging
 from dataclasses import dataclass, replace
@@ -304,6 +305,30 @@ class _CudfBatchMapTransformFn(BatchMapTransformFn):
 
         if rows:
             yield combine()
+
+
+def _init_fused_actor(init_udf: Any) -> None:
+    """Reuse RMM device allocations inside the fused cuDF actor."""
+
+    import rmm
+
+    current = rmm.mr.get_current_device_resource()
+    # Leave custom memory resources unchanged.
+    if type(current) is rmm.mr.CudaMemoryResource:
+        available, _ = rmm.mr.available_device_memory()
+        # Grow on demand, then release unused memory above one quarter of what
+        # was available when the actor started.
+        try:
+            resource = rmm.mr.CudaAsyncMemoryResource(
+                initial_pool_size=0,
+                release_threshold=available // 4,
+            )
+        except RuntimeError:
+            logger.debug("CUDA asynchronous allocation is unavailable.")
+        else:
+            rmm.mr.set_current_device_resource(resource)
+
+    init_udf()
 
 
 def _is_synchronous_callable_class(fn: Any) -> bool:
@@ -697,7 +722,9 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
                 ),
                 _CudfBatchMapTransformFn(planned_batch_transform),
             ],
-            init_fn=downstream_transformer._init_fn,
+            init_fn=functools.partial(
+                _init_fused_actor, downstream_transformer._init_fn
+            ),
             output_block_size_option_override=(
                 replace(output_option) if output_option is not None else None
             ),

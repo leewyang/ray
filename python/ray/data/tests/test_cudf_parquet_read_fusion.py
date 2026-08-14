@@ -36,6 +36,7 @@ from ray.data._internal.logical.rules.cudf_parquet_read_fusion import (
     _CudfBatchMapTransformFn,
     _CudfParquetFileChunker,
     _CudfParquetReader,
+    _init_fused_actor,
 )
 from ray.data._internal.object_extensions.arrow import ArrowPythonObjectArray
 from ray.data._internal.output_buffer import OutputBlockSizeOption
@@ -140,6 +141,35 @@ def fake_cudf(monkeypatch):
     module.concat = concat
     monkeypatch.setitem(sys.modules, "cudf", module)
     return calls
+
+
+@pytest.fixture
+def fake_rmm(monkeypatch):
+    module = ModuleType("rmm")
+    module.mr = ModuleType("rmm.mr")
+
+    class CudaMemoryResource:
+        pass
+
+    class CudaAsyncMemoryResource:
+        def __init__(self, *, initial_pool_size, release_threshold):
+            self.initial_pool_size = initial_pool_size
+            self.release_threshold = release_threshold
+            module.mr.async_constructions += 1
+
+    module.mr.CudaMemoryResource = CudaMemoryResource
+    module.mr.CudaAsyncMemoryResource = CudaAsyncMemoryResource
+    module.mr.async_constructions = 0
+    module.mr.current = CudaMemoryResource()
+    module.mr.get_current_device_resource = lambda: module.mr.current
+    module.mr.available_device_memory = lambda: (8_192, 16_384)
+
+    def set_current_device_resource(resource):
+        module.mr.current = resource
+
+    module.mr.set_current_device_resource = set_current_device_resource
+    monkeypatch.setitem(sys.modules, "rmm", module)
+    return module.mr
 
 
 def _write_parquet(path, *, rows=12, row_group_size=3, start=0):
@@ -385,8 +415,82 @@ def test_public_dgx_shape_selects_direct_cudf_decode(
     assert physical.dag._ray_remote_args["num_gpus"] == 1
 
 
+def test_fused_actor_uses_async_device_memory(fake_rmm):
+    initialized_with = []
+
+    _init_fused_actor(lambda: initialized_with.append(fake_rmm.current))
+
+    resource = fake_rmm.current
+    assert type(resource) is fake_rmm.CudaAsyncMemoryResource
+    assert resource.initial_pool_size == 0
+    assert resource.release_threshold == 2_048
+    assert initialized_with == [resource]
+
+
+def test_fused_actor_preserves_configured_device_memory_resource(fake_rmm):
+    configured = object()
+    fake_rmm.current = configured
+    initialized = []
+
+    _init_fused_actor(lambda: initialized.append(True))
+
+    assert fake_rmm.current is configured
+    assert initialized == [True]
+
+
+def test_fused_actor_reuses_async_resource_after_init_retry(fake_rmm):
+    attempts = 0
+
+    def init():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("retry actor initialization")
+
+    with pytest.raises(RuntimeError, match="retry actor initialization"):
+        _init_fused_actor(init)
+    resource = fake_rmm.current
+
+    _init_fused_actor(init)
+
+    assert fake_rmm.current is resource
+    assert fake_rmm.async_constructions == 1
+    assert attempts == 2
+
+
+def test_fused_actor_allows_udf_to_replace_device_memory_resource(fake_rmm):
+    configured = object()
+
+    _init_fused_actor(lambda: setattr(fake_rmm, "current", configured))
+    _init_fused_actor(lambda: None)
+
+    assert fake_rmm.current is configured
+    assert fake_rmm.async_constructions == 1
+
+
+def test_fused_actor_keeps_default_resource_when_async_is_unavailable(
+    fake_rmm, monkeypatch
+):
+    default = fake_rmm.current
+
+    def unsupported_async_resource(**_):
+        raise RuntimeError("unsupported")
+
+    monkeypatch.setattr(
+        fake_rmm,
+        "CudaAsyncMemoryResource",
+        unsupported_async_resource,
+    )
+    initialized = []
+
+    _init_fused_actor(lambda: initialized.append(True))
+
+    assert fake_rmm.current is default
+    assert initialized == [True]
+
+
 def test_fake_cudf_execution_preserves_projection_row_groups_and_batching(
-    ray_start_regular_shared_2_cpus, tmp_path, monkeypatch, fake_cudf
+    ray_start_regular_shared_2_cpus, tmp_path, monkeypatch, fake_cudf, fake_rmm
 ):
     path = tmp_path / "input.parquet"
     _write_parquet(path)
@@ -590,7 +694,8 @@ def test_fusion_preserves_planned_state_and_actor_options(
         assert getattr(fused_batch_transform, field) == getattr(
             planned_batch_transform, field
         )
-    assert fused_transformer._init_fn is downstream_transformer._init_fn
+    assert fused_transformer._init_fn.func is _init_fused_actor
+    assert fused_transformer._init_fn.args == (downstream_transformer._init_fn,)
     assert fused.dag._ray_remote_args == original_physical_remote_args
     assert fused.dag.get_map_task_kwargs() == {"map": 2, "callback": True}
     assert fused.dag.target_max_block_size_override == 34_567
