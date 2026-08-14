@@ -8,6 +8,7 @@ from packaging.version import parse as parse_version
 
 from ray.data import DataContext
 from ray.data._internal.execution.util import memory_string
+from ray.data._internal.tensor_extensions import arrow as arrow_module
 from ray.data._internal.tensor_extensions.arrow import (
     ArrowConversionError,
     ArrowTensorArray,
@@ -149,6 +150,59 @@ def test_infer_type_does_not_leak_memory(dtype):
 
     margin_of_error = 64 * MiB
     assert after - before < margin_of_error, memory_string(after - before)
+
+
+@pytest.mark.parametrize(
+    "ndarray",
+    [
+        np.asarray([1, 2], dtype=np.int32),
+        np.asarray([1.5, 2.5], dtype=np.float64),
+        np.asarray([True, False], dtype=np.bool_),
+        np.asarray(["a", "bb"], dtype="U2"),
+        np.asarray([b"a", b"bb"], dtype="S2"),
+        np.asarray([1, None], dtype=object),
+        np.asarray([1, 2], dtype="datetime64[ns]"),
+    ],
+)
+def test_infer_numpy_type_matches_pyarrow(ndarray):
+    assert _infer_pyarrow_type(ndarray) == pa.infer_type(ndarray)
+
+
+def test_infer_numpy_type_preserves_empty_array():
+    assert _infer_pyarrow_type(np.asarray([], dtype=np.int64)) is None
+
+
+def test_infer_numpy_type_skips_value_scan(monkeypatch):
+    def fail_if_called(_):
+        raise AssertionError("pa.infer_type should not scan a fixed-dtype array")
+
+    monkeypatch.setattr(pa, "infer_type", fail_if_called)
+
+    assert _infer_pyarrow_type(np.asarray([1, 2], dtype=np.int64)) == pa.int64()
+
+
+@pytest.mark.parametrize(
+    "ndarray",
+    [
+        np.ma.array([1, 2, 3], mask=[False, True, False]),
+        np.ones((2, 2), dtype=np.int64),
+    ],
+)
+def test_infer_numpy_type_preserves_non_plain_arrays(ndarray):
+    with pytest.raises(pa.ArrowInvalid):
+        _infer_pyarrow_type(ndarray)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected_type"),
+    [("S2", pa.large_binary()), ("U2", pa.large_string())],
+)
+def test_infer_numpy_type_preserves_large_string_upcast(
+    monkeypatch, dtype, expected_type
+):
+    monkeypatch.setattr(arrow_module, "INT32_MAX", 1)
+
+    assert _infer_pyarrow_type(np.asarray(["xx"], dtype=dtype)) == expected_type
 
 
 def test_pa_infer_type_failing_to_infer():

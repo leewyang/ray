@@ -481,6 +481,18 @@ def _infer_pyarrow_type(
     if dtype_with_timestamp_type is not None:
         return dtype_with_timestamp_type
 
+    # A nonempty 1-D NumPy array carries its fixed-width non-string type in its
+    # dtype. Skip scanning every value; objects and strings need the checks below.
+    if (
+        type(column_values) is np.ndarray
+        and column_values.ndim == 1
+        and column_values.dtype.kind not in ("O", "S", "U")
+    ):
+        try:
+            return pa.from_numpy_dtype(column_values.dtype)
+        except pa.ArrowNotImplementedError:
+            pass
+
     inferred_pa_dtype = pa.infer_type(column_values)
 
     def _len_gt_overflow_threshold(obj: Any) -> bool:
