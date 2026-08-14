@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import math
 import pickle
+import time
 import types
 from collections import Counter
 from numbers import Number
@@ -43,6 +45,9 @@ _DEFAULT_WORD_PATTERN = r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?"
 _DEFAULT_TOKEN_PATTERN = r"[A-Za-z]+|[0-9]+|[^A-Za-z0-9\s]"
 _COMBINED_FIT_INDEX_COLUMN = "__preprocessor_index"
 _COMBINED_FIT_STATS_COLUMN = "__fit_stats"
+_GPU_ORDINAL_FIT_NUM_PARTITIONS = 256
+
+logger = logging.getLogger(__name__)
 
 
 def _import_cudf():
@@ -671,8 +676,8 @@ class _GPUFitStatsUDF:
             rows.append(
                 {
                     _COMBINED_FIT_INDEX_COLUMN: index,
-                    _COMBINED_FIT_STATS_COLUMN: pickle.dumps(
-                        stats, protocol=pickle.HIGHEST_PROTOCOL
+                    _COMBINED_FIT_STATS_COLUMN: preprocessor._serialize_gpu_fit_stats(
+                        stats
                     ),
                 }
             )
@@ -747,7 +752,7 @@ class GPUPreprocessor(SerializablePreprocessorBase):
             **_gpu_actor_compute_strategy(self._concurrency),
         )
 
-        partial_batches: List[pd.DataFrame] = []
+        partial_batches: List[Any] = []
         for batch in partials.iter_batches(batch_size=None, batch_format="pandas"):
             if batch.empty or _COMBINED_FIT_STATS_COLUMN not in batch:
                 continue
@@ -755,15 +760,30 @@ class GPUPreprocessor(SerializablePreprocessorBase):
                 [_COMBINED_FIT_INDEX_COLUMN, _COMBINED_FIT_STATS_COLUMN]
             ].itertuples(index=False, name=None):
                 if int(index) == 0:
-                    partial_batches.append(_deserialize_pandas_fit_stats(payload))
+                    partial_batches.append(self._deserialize_gpu_fit_stats(payload))
 
+        self._finalize_gpu_fit_stat_batches(partial_batches)
+        return self
+
+    def _serialize_gpu_fit_stats(self, stats: pd.DataFrame) -> bytes:
+        return pickle.dumps(stats, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def _deserialize_gpu_fit_stats(
+        self, payload: Union[bytes, memoryview]
+    ) -> pd.DataFrame:
+        return _deserialize_pandas_fit_stats(payload)
+
+    def _finalize_gpu_fit_stat_batches(
+        self, partial_batches: Sequence[pd.DataFrame]
+    ) -> int:
+        num_rows = sum(len(partial) for partial in partial_batches)
         stats = (
             pd.concat(partial_batches, ignore_index=True, sort=False)
             if partial_batches
             else pd.DataFrame()
         )
         self._finalize_gpu_fit_stats(stats)
-        return self
+        return num_rows
 
     def _prepare_gpu_state(self) -> None:
         """Prepare per-worker GPU state before fit or transform.
@@ -1028,8 +1048,11 @@ class GPUChain(SerializablePreprocessorBase):
             **kwargs,
         )
 
-        partial_batches: Dict[int, List[pd.DataFrame]] = {
+        partial_batches: Dict[int, List[Any]] = {
             index: [] for index, _, _ in fit_entries
+        }
+        preprocessors_by_index = {
+            index: preprocessor for index, preprocessor, _ in fit_entries
         }
 
         for batch in partials.iter_batches(batch_size=None, batch_format="pandas"):
@@ -1041,20 +1064,151 @@ class GPUChain(SerializablePreprocessorBase):
                 index = int(index)
                 if index not in partial_batches:
                     continue
-                partial_batches[index].append(_deserialize_pandas_fit_stats(payload))
+                partial_batches[index].append(
+                    preprocessors_by_index[index]._deserialize_gpu_fit_stats(payload)
+                )
 
+        finalize_start = time.perf_counter()
+        num_partial_rows = 0
         for index, preprocessor, _ in fit_entries:
-            preprocessor_partials = partial_batches[index]
-            if preprocessor_partials:
-                stats = pd.concat(preprocessor_partials, ignore_index=True, sort=False)
-            else:
-                stats = pd.DataFrame()
-            preprocessor._finalize_gpu_fit_stats(stats)
+            num_partial_rows += preprocessor._finalize_gpu_fit_stat_batches(
+                partial_batches[index]
+            )
             preprocessor._fitted = True
+        logger.info(
+            "GPU combined-fit driver finalization finished in %.2f seconds "
+            "for %d partial rows across %d preprocessors.",
+            time.perf_counter() - finalize_start,
+            num_partial_rows,
+            len(fit_entries),
+        )
+        return True
+
+    def _fit_distributed_combined(self, ds: "Dataset") -> bool:
+        """Fit scalar moments and ordinal counts in one distributed GPU pass."""
+        from ray.data._internal.gpu_shuffle.hash_aggregate import (
+            GPUPreprocessorFitAggregate,
+        )
+        from ray.data.grouped_data import GroupedData
+
+        prefix: List[GPUPreprocessor] = []
+        ordinal_entries = []
+        moment_entries = []
+        fittable: List[Tuple[int, GPUPreprocessor]] = []
+
+        for index, preprocessor in enumerate(self._preprocessors):
+            if preprocessor.fit_status() != Preprocessor.FitStatus.NOT_FITTABLE:
+                required_prefix = tuple(self._required_prefix(preprocessor, prefix))
+                if any(
+                    item.fit_status() != Preprocessor.FitStatus.NOT_FITTABLE
+                    for item in required_prefix
+                ):
+                    return False
+                if isinstance(preprocessor, GPUOrdinalEncoder):
+                    ordinal_entries.append(
+                        (
+                            index,
+                            tuple(preprocessor.columns),
+                            required_prefix,
+                            preprocessor.min_evidence,
+                        )
+                    )
+                elif isinstance(preprocessor, GPUStandardScaler):
+                    moment_entries.append(
+                        (index, tuple(preprocessor.columns), required_prefix)
+                    )
+                else:
+                    return False
+                fittable.append((index, preprocessor))
+            prefix.append(preprocessor)
+
+        # The serialized combined-fit path is cheaper when there is no
+        # distributed cardinality aggregation to share this scan with.
+        if not ordinal_entries or not moment_entries:
+            return False
+
+        aggregate = GPUPreprocessorFitAggregate(
+            ordinal_entries=ordinal_entries,
+            moment_entries=moment_entries,
+            input_batch_rows=self._batch_size,
+        )
+        retained = GroupedData(
+            ds,
+            list(aggregate.generated_key_columns()),
+            num_partitions=_GPU_ORDINAL_FIT_NUM_PARTITIONS,
+        ).aggregate(aggregate)
+
+        moment_values: Dict[int, Dict[str, Dict[int, float]]] = {
+            index: {} for index, _, _ in moment_entries
+        }
+        retained_values: Dict[int, Dict[str, List[Any]]] = {
+            index: {column: [] for column in columns}
+            for index, columns, _, _ in ordinal_entries
+        }
+        output_column = aggregate.name
+        for batch in retained.iter_batches(batch_size=None, batch_format="pandas"):
+            if batch.empty:
+                continue
+            columns = list(aggregate.generated_key_columns()) + [output_column]
+            for kind, index, column, value, metric, fit_value in batch[
+                columns
+            ].itertuples(index=False, name=None):
+                index = int(index)
+                kind = int(kind)
+                if kind == aggregate.MOMENT_KIND and index in moment_values:
+                    moment_values[index].setdefault(column, {})[int(metric)] = float(
+                        fit_value
+                    )
+                elif (
+                    kind == aggregate.CATEGORY_KIND
+                    and index in retained_values
+                    and column in retained_values[index]
+                    and not _is_missing_value(value)
+                ):
+                    retained_values[index][column].append(value)
+
+        preprocessors_by_index = dict(fittable)
+        for index, columns, _ in moment_entries:
+            rows = []
+            for column in columns:
+                metrics = moment_values[index].get(column, {})
+                rows.append(
+                    {
+                        "column": column,
+                        "count": int(metrics.get(aggregate.COUNT_METRIC, 0)),
+                        "sum": metrics.get(aggregate.SUM_METRIC, 0.0),
+                        "sum_sq": metrics.get(aggregate.SUM_SQ_METRIC, 0.0),
+                    }
+                )
+            scaler = preprocessors_by_index[index]
+            scaler._finalize_gpu_fit_stats(pd.DataFrame(rows))
+
+        for index, columns, _, _ in ordinal_entries:
+            encoder = preprocessors_by_index[index]
+            encoder.stats_ = {}
+            for column in columns:
+                encoder.stats_[f"unique_values({column})"] = {
+                    value: position + encoder.encoded_value_offset
+                    for position, value in enumerate(
+                        sorted(retained_values[index][column])
+                    )
+                }
+            encoder._gpu_maps = {}
+
+        for _, preprocessor in fittable:
+            preprocessor._fitted = True
+        logger.info(
+            "GPU distributed combined fit finalized %d moment preprocessors and "
+            "%d ordinal preprocessors from one dataset pass.",
+            len(moment_entries),
+            len(ordinal_entries),
+        )
         return True
 
     def _fit(self, ds: "Dataset") -> "GPUChain":
         """Fit each fittable preprocessor, combining statistics when possible."""
+        if self._fit_distributed_combined(ds):
+            return self
         if self._fit_combined(ds):
             return self
 
@@ -1796,7 +1950,66 @@ class GPUOrdinalEncoder(GPUPreprocessor):
         return self._min_evidence
 
     def _supports_gpu_combined_fit(self) -> bool:
-        return True
+        # Category counts require a grouped GPU shuffle. They can't share the
+        # serialized, driver-finalized statistics path used by scalar fit stats.
+        return False
+
+    def _fit_gpu(
+        self, dataset: "Dataset", prefix: Sequence[GPUPreprocessor]
+    ) -> "GPUOrdinalEncoder":
+        from ray.data._internal.gpu_shuffle.hash_aggregate import (
+            GPUOrdinalValueCounter,
+        )
+        from ray.data.context import ShuffleStrategy
+        from ray.data.grouped_data import GroupedData
+
+        if dataset.context.shuffle_strategy != ShuffleStrategy.GPU_SHUFFLE:
+            raise ValueError(
+                "GPUOrdinalEncoder fitting requires "
+                "DataContext.shuffle_strategy=ShuffleStrategy.GPU_SHUFFLE so "
+                "global category counts remain distributed on GPUs."
+            )
+
+        # These group keys are produced by GPUOrdinalValueCounter's local
+        # aggregation, so they intentionally aren't columns in the input dataset.
+        # Keep the shuffle fanout independent of the number of input blocks. The
+        # production-cardinality dataset has thousands of 128 MiB input blocks;
+        # using that count here makes RAPIDS MPF create millions of tiny packed
+        # fragments. 256 partitions keep individual high-cardinality reducer
+        # partitions bounded while avoiding that per-input fragmentation.
+        retained = GroupedData(
+            dataset,
+            ["column", "value"],
+            num_partitions=_GPU_ORDINAL_FIT_NUM_PARTITIONS,
+        ).aggregate(
+            GPUOrdinalValueCounter(
+                self._columns,
+                prefix=tuple(prefix),
+                min_evidence=self._min_evidence,
+                input_batch_rows=self._batch_size,
+            )
+        )
+
+        retained_by_column: Dict[str, List[Any]] = {
+            column: [] for column in self._columns
+        }
+        for batch in retained.iter_batches(batch_size=None, batch_format="pandas"):
+            if batch.empty:
+                continue
+            for column, value in batch[["column", "value"]].itertuples(
+                index=False, name=None
+            ):
+                if column in retained_by_column and not _is_missing_value(value):
+                    retained_by_column[column].append(value)
+
+        self.stats_ = {}
+        for column in self._columns:
+            self.stats_[f"unique_values({column})"] = {
+                value: index + self._encoded_value_offset
+                for index, value in enumerate(sorted(retained_by_column[column]))
+            }
+        self._gpu_maps = {}
+        return self
 
     def _gpu_fit_stats_cudf(self, df: cudf.DataFrame) -> pd.DataFrame:
         rows: List[Dict[str, Any]] = []
@@ -1818,31 +2031,39 @@ class GPUOrdinalEncoder(GPUPreprocessor):
 
     def _finalize_gpu_fit_stats(self, partials: pd.DataFrame) -> None:
         """Combine category counts into deterministic ordinal mappings."""
-        counters: Dict[str, Counter] = {column: Counter() for column in self._columns}
-        if not partials.empty:
-            for column, value, count in partials[
-                ["column", "value", "count"]
-            ].itertuples(index=False, name=None):
-                if column in counters and not _is_missing_value(value):
-                    counters[column][value] += int(count)
+        if partials.empty:
+            retained_by_column: Dict[str, List[Any]] = {}
+        else:
+            counts = partials[["column", "value", "count"]]
+            counts = counts[
+                counts["column"].isin(self._columns)
+                & counts["value"].notna()
+                & counts["count"].notna()
+            ].copy()
+            counts["count"] = counts["count"].astype("int64", copy=False)
+            totals = counts.groupby(
+                ["column", "value"],
+                as_index=False,
+                observed=True,
+                sort=False,
+            )["count"].sum()
+            totals = totals[totals["count"] >= self._min_evidence]
+            retained_by_column = {
+                column: values.tolist()
+                for column, values in totals.groupby(
+                    "column", observed=True, sort=False
+                )["value"]
+            }
 
         self.stats_ = {}
         for column in self._columns:
-            retained_values = (
-                value
-                for value, count in counters[column].items()
-                if count >= self._min_evidence
-            )
             self.stats_[f"unique_values({column})"] = {
                 value: index + self._encoded_value_offset
-                for index, value in enumerate(sorted(retained_values))
+                for index, value in enumerate(
+                    sorted(retained_by_column.get(column, ()))
+                )
             }
         self._gpu_maps = {}
-
-    def _fit_gpu(
-        self, dataset: "Dataset", prefix: Sequence[GPUPreprocessor]
-    ) -> "GPUOrdinalEncoder":
-        return self._fit_gpu_with_stats(dataset, prefix)
 
     def _prepare_gpu_state(self) -> None:
         self._gpu_maps = {

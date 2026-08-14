@@ -221,6 +221,53 @@ class GPUAggregateFn(abc.ABC):
             f"{accumulator_prefix}_{accumulator}" for accumulator in self._accumulators
         )
 
+    def required_input_columns(self) -> Tuple[str, ...]:
+        """Columns that must be projected from each original input block."""
+        return (self.target_column,) if self.target_column is not None else ()
+
+    def generated_key_columns(self) -> Tuple[str, ...]:
+        """Group keys created by ``partial_aggregate`` instead of read from input."""
+        return ()
+
+    def supports_local_combine(self) -> bool:
+        """Whether partial accumulator rows can be combined before shuffling.
+
+        Aggregates should opt in only when combining partials is associative and
+        preserves every accumulator needed by ``final_aggregate``. The GPU hash
+        aggregate actor uses this to compact repeated keys locally and avoid
+        sending duplicate accumulator rows through the network.
+        """
+        return False
+
+    def preferred_input_batch_rows(self) -> Optional[int]:
+        """Preferred number of source rows per GPU partial aggregation.
+
+        Returning ``None`` preserves the one-input-block-per-partial behavior.
+        Aggregates with substantial fixed per-partial overhead can request that
+        the actor coalesce adjacent source blocks before converting them to
+        cuDF. This is only a batching hint and does not change aggregation
+        semantics.
+        """
+        return None
+
+    def max_local_combine_partials(self) -> Optional[int]:
+        """Maximum partials to compact into one pre-shuffle run.
+
+        ``None`` retains compacted state until input finishes. High-cardinality
+        aggregates can return a finite value to bound actor device memory while
+        still reducing shuffle fragmentation.
+        """
+        return None
+
+    def combine_partial_aggregates(
+        self,
+        df: cudf.DataFrame,
+        key_columns: Tuple[str, ...],
+        accumulator_columns: Tuple[str, ...],
+    ) -> cudf.DataFrame:
+        """Combine partial accumulator rows without applying final filtering."""
+        raise NotImplementedError
+
     def _empty_global_partial_values(self, accumulator_prefix: str) -> Dict[str, Any]:
         """Return accumulator values for an empty block during a global aggregation
         operation (no key columns).
@@ -548,6 +595,336 @@ class GPUSum(GPUAggregateFn):
         if dtype is None or not dtype.is_null_type():
             return {}
         return {output_name: pa.null()}
+
+
+class GPUOrdinalValueCounter(GPUAggregateFn):
+    """Count categorical values locally, then globally merge and threshold them."""
+
+    def __init__(
+        self,
+        columns: Sequence[str],
+        *,
+        prefix: Sequence[Any],
+        min_evidence: int,
+        input_batch_rows: Optional[int] = None,
+        local_combine_partials: Optional[int] = 4,
+        alias_name: str = "count",
+    ) -> None:
+        if not columns:
+            raise ValueError("columns must not be empty.")
+        if min_evidence < 1:
+            raise ValueError(f"min_evidence must be positive, got {min_evidence!r}.")
+        self.columns = tuple(columns)
+        self.prefix = tuple(prefix)
+        self.min_evidence = min_evidence
+        self.input_batch_rows = input_batch_rows
+        self.local_combine_partials = local_combine_partials
+        super().__init__(
+            alias_name,
+            on=None,
+            ignore_nulls=True,
+            accumulators=("count",),
+        )
+
+    def required_input_columns(self) -> Tuple[str, ...]:
+        required = list(self.columns)
+        for preprocessor in self.prefix:
+            for column in preprocessor.get_input_columns():
+                if column not in required:
+                    required.append(column)
+        return tuple(required)
+
+    def generated_key_columns(self) -> Tuple[str, ...]:
+        return ("column", "value")
+
+    def supports_local_combine(self) -> bool:
+        return True
+
+    def preferred_input_batch_rows(self) -> Optional[int]:
+        return self.input_batch_rows
+
+    def max_local_combine_partials(self) -> Optional[int]:
+        return self.local_combine_partials
+
+    def combine_partial_aggregates(
+        self,
+        df: cudf.DataFrame,
+        key_columns: Tuple[str, ...],
+        accumulator_columns: Tuple[str, ...],
+    ) -> cudf.DataFrame:
+        acc_col = accumulator_columns[0]
+        result = (
+            df.groupby(list(key_columns), dropna=False)[acc_col].sum().reset_index()
+        )
+        _cast_cudf_column_dtype(result, acc_col, DataType.from_numpy("int64"))
+        return result[list(key_columns) + [acc_col]]
+
+    def partial_aggregate(
+        self,
+        df: cudf.DataFrame,
+        key_columns: Tuple[str, ...],
+        accumulator_columns: Tuple[str, ...],
+        *,
+        input_schema: Optional[Schema] = None,
+    ) -> cudf.DataFrame:
+        import cudf as cudf_module
+
+        from ray.data.preprocessors.gpu import _apply_gpu_ops
+
+        if tuple(key_columns) != self.generated_key_columns():
+            raise ValueError(
+                "GPUOrdinalValueCounter requires group keys ('column', 'value'); "
+                f"got {key_columns!r}."
+            )
+        for preprocessor in self.prefix:
+            preprocessor._prepare_gpu_state()
+        df = _apply_gpu_ops(df, self.prefix)
+
+        acc_col = accumulator_columns[0]
+        frames = []
+        for column in self.columns:
+            counts = df[column].dropna().value_counts(dropna=False).reset_index()
+            counts.columns = ["value", acc_col]
+            counts.insert(0, "column", column)
+            frames.append(counts[["column", "value", acc_col]])
+        result = cudf_module.concat(frames, ignore_index=True)
+        _cast_cudf_column_dtype(result, acc_col, DataType.from_numpy("int64"))
+        return result
+
+    def final_aggregate(
+        self,
+        df: cudf.DataFrame,
+        key_columns: Tuple[str, ...],
+        accumulator_columns: Tuple[str, ...],
+        output_name: str,
+    ) -> cudf.DataFrame:
+        acc_col = accumulator_columns[0]
+        result = (
+            df.groupby(list(key_columns), dropna=False)[acc_col].sum().reset_index()
+        )
+        result = result.rename(columns={result.columns[-1]: output_name})
+        result = result[result[output_name] >= self.min_evidence]
+        _cast_cudf_column_dtype(result, output_name, DataType.from_numpy("int64"))
+        return result[list(key_columns) + [output_name]]
+
+    def _partial_accumulator_dtypes(
+        self,
+        df: cudf.DataFrame,
+        accumulator_prefix: str,
+        *,
+        input_schema: Optional[Schema] = None,
+    ) -> Dict[str, Optional[DataType]]:
+        return {
+            self._accumulator_columns(accumulator_prefix)[0]: DataType.from_numpy(
+                "int64"
+            )
+        }
+
+    def _final_cudf_dtypes(
+        self,
+        df: cudf.DataFrame,
+        output_name: str,
+        accumulator_prefix: str,
+        *,
+        input_schema: Optional[Schema] = None,
+    ) -> Dict[str, Optional[DataType]]:
+        return {output_name: DataType.from_numpy("int64")}
+
+
+class GPUPreprocessorFitAggregate(GPUAggregateFn):
+    """Fit numeric moments and categorical value counts in one GPU pass.
+
+    The aggregate emits a common, tagged row representation so heterogeneous
+    fit statistics can share one distributed hash aggregation. Numeric moments
+    are represented as three metric rows (count, sum, and squared sum), while
+    categorical values are represented as count rows. All values use one
+    float64 accumulator, which exactly represents integer row counts below
+    ``2**53``.
+    """
+
+    CATEGORY_KIND = 0
+    MOMENT_KIND = 1
+    COUNT_METRIC = 0
+    SUM_METRIC = 1
+    SUM_SQ_METRIC = 2
+    KEY_COLUMNS = (
+        "__fit_kind",
+        "__fit_index",
+        "column",
+        "value",
+        "__fit_metric",
+    )
+
+    def __init__(
+        self,
+        *,
+        ordinal_entries: Sequence[Tuple[int, Sequence[str], Sequence[Any], int]],
+        moment_entries: Sequence[Tuple[int, Sequence[str], Sequence[Any]]],
+        input_batch_rows: Optional[int] = None,
+        local_combine_partials: Optional[int] = 4,
+        alias_name: str = "fit_value",
+    ) -> None:
+        if not ordinal_entries:
+            raise ValueError("At least one ordinal fit entry is required.")
+        self.ordinal_entries = tuple(
+            (index, tuple(columns), tuple(prefix), min_evidence)
+            for index, columns, prefix, min_evidence in ordinal_entries
+        )
+        self.moment_entries = tuple(
+            (index, tuple(columns), tuple(prefix))
+            for index, columns, prefix in moment_entries
+        )
+        self.input_batch_rows = input_batch_rows
+        self.local_combine_partials = local_combine_partials
+        super().__init__(
+            alias_name,
+            on=None,
+            ignore_nulls=True,
+            accumulators=("value",),
+        )
+
+    def required_input_columns(self) -> Tuple[str, ...]:
+        required: List[str] = []
+        entries = [
+            (columns, prefix) for _, columns, prefix, _ in self.ordinal_entries
+        ] + [(columns, prefix) for _, columns, prefix in self.moment_entries]
+        for columns, prefix in entries:
+            for column in columns:
+                if column not in required:
+                    required.append(column)
+            for preprocessor in prefix:
+                for column in preprocessor.get_input_columns():
+                    if column not in required:
+                        required.append(column)
+        return tuple(required)
+
+    def generated_key_columns(self) -> Tuple[str, ...]:
+        return self.KEY_COLUMNS
+
+    def supports_local_combine(self) -> bool:
+        return True
+
+    def preferred_input_batch_rows(self) -> Optional[int]:
+        return self.input_batch_rows
+
+    def max_local_combine_partials(self) -> Optional[int]:
+        return self.local_combine_partials
+
+    def combine_partial_aggregates(
+        self,
+        df: cudf.DataFrame,
+        key_columns: Tuple[str, ...],
+        accumulator_columns: Tuple[str, ...],
+    ) -> cudf.DataFrame:
+        acc_col = accumulator_columns[0]
+        result = (
+            df.groupby(list(key_columns), dropna=False)[acc_col].sum().reset_index()
+        )
+        _cast_cudf_column_dtype(result, acc_col, DataType.from_numpy("float64"))
+        return result[list(key_columns) + [acc_col]]
+
+    def partial_aggregate(
+        self,
+        df: cudf.DataFrame,
+        key_columns: Tuple[str, ...],
+        accumulator_columns: Tuple[str, ...],
+        *,
+        input_schema: Optional[Schema] = None,
+    ) -> cudf.DataFrame:
+        import cudf as cudf_module
+
+        from ray.data.preprocessors.gpu import _apply_gpu_ops
+
+        if tuple(key_columns) != self.KEY_COLUMNS:
+            raise ValueError(
+                "GPUPreprocessorFitAggregate requires generated fit keys; "
+                f"got {key_columns!r}."
+            )
+
+        acc_col = accumulator_columns[0]
+        frames: List[cudf.DataFrame] = []
+        for fit_index, columns, prefix, _ in self.ordinal_entries:
+            transformed = _apply_gpu_ops(df, prefix)
+            for column in columns:
+                counts = (
+                    transformed[column]
+                    .dropna()
+                    .value_counts(dropna=False)
+                    .reset_index()
+                )
+                counts.columns = ["value", acc_col]
+                counts.insert(0, "column", column)
+                counts.insert(0, "__fit_index", fit_index)
+                counts.insert(0, "__fit_kind", self.CATEGORY_KIND)
+                counts["__fit_metric"] = self.COUNT_METRIC
+                frames.append(counts[list(self.KEY_COLUMNS) + [acc_col]])
+
+        for fit_index, columns, prefix in self.moment_entries:
+            transformed = _apply_gpu_ops(df, prefix)
+            numeric = transformed[list(columns)].astype("float64")
+            metrics = (
+                (self.COUNT_METRIC, numeric.count()),
+                (self.SUM_METRIC, numeric.sum()),
+                (self.SUM_SQ_METRIC, (numeric * numeric).sum()),
+            )
+            for metric, values in metrics:
+                stats = values.rename(acc_col).to_frame().reset_index()
+                stats.columns = ["column", acc_col]
+                stats.insert(0, "__fit_index", fit_index)
+                stats.insert(0, "__fit_kind", self.MOMENT_KIND)
+                stats["value"] = None
+                stats["__fit_metric"] = metric
+                frames.append(stats[list(self.KEY_COLUMNS) + [acc_col]])
+
+        result = cudf_module.concat(frames, ignore_index=True)
+        _cast_cudf_column_dtype(result, acc_col, DataType.from_numpy("float64"))
+        return result
+
+    def final_aggregate(
+        self,
+        df: cudf.DataFrame,
+        key_columns: Tuple[str, ...],
+        accumulator_columns: Tuple[str, ...],
+        output_name: str,
+    ) -> cudf.DataFrame:
+        acc_col = accumulator_columns[0]
+        result = (
+            df.groupby(list(key_columns), dropna=False)[acc_col].sum().reset_index()
+        )
+        result = result.rename(columns={result.columns[-1]: output_name})
+        keep = result["__fit_kind"] == self.MOMENT_KIND
+        for fit_index, _, _, min_evidence in self.ordinal_entries:
+            keep = keep | (
+                (result["__fit_kind"] == self.CATEGORY_KIND)
+                & (result["__fit_index"] == fit_index)
+                & (result[output_name] >= min_evidence)
+            )
+        result = result[keep]
+        _cast_cudf_column_dtype(result, output_name, DataType.from_numpy("float64"))
+        return result[list(key_columns) + [output_name]]
+
+    def _partial_accumulator_dtypes(
+        self,
+        df: cudf.DataFrame,
+        accumulator_prefix: str,
+        *,
+        input_schema: Optional[Schema] = None,
+    ) -> Dict[str, Optional[DataType]]:
+        return {
+            self._accumulator_columns(accumulator_prefix)[0]: DataType.from_numpy(
+                "float64"
+            )
+        }
+
+    def _final_cudf_dtypes(
+        self,
+        df: cudf.DataFrame,
+        output_name: str,
+        accumulator_prefix: str,
+        *,
+        input_schema: Optional[Schema] = None,
+    ) -> Dict[str, Optional[DataType]]:
+        return {output_name: DataType.from_numpy("float64")}
 
 
 class GPUMin(GPUAggregateFn):
@@ -1295,17 +1672,77 @@ class GPUAggregationPlan:
         These include the key columns and aggregation target columns, e.g.
         groupby("col1").sum("col2")
         """
-        columns = list(self._key_columns)
+        generated_keys = {
+            column
+            for agg in self._gpu_aggregates
+            for column in agg.generated_key_columns()
+        }
+        columns = [
+            column for column in self._key_columns if column not in generated_keys
+        ]
         for agg in self._gpu_aggregates:
-            target_column = agg.target_column
-            if target_column is not None and target_column not in columns:
-                columns.append(target_column)
+            for input_column in agg.required_input_columns():
+                if input_column not in columns:
+                    columns.append(input_column)
         return tuple(columns)
 
     @property
     def shuffle_key_columns(self) -> Tuple[str, ...]:
         """Return the shuffle key columns for the GPU aggregation plan."""
         return self._shuffle_key_columns
+
+    @property
+    def supports_local_combine(self) -> bool:
+        """Whether actor-local compaction is valid for every aggregation."""
+        return all(agg.supports_local_combine() for agg in self._gpu_aggregates)
+
+    @property
+    def preferred_input_batch_rows(self) -> Optional[int]:
+        """Common source-row batching hint requested by the aggregates."""
+        hints = [
+            hint
+            for agg in self._gpu_aggregates
+            if (hint := agg.preferred_input_batch_rows()) is not None
+        ]
+        return min(hints) if hints else None
+
+    @property
+    def max_local_combine_partials(self) -> Optional[int]:
+        """Smallest finite actor-local compaction bound in the plan."""
+        limits = [
+            limit
+            for agg in self._gpu_aggregates
+            if (limit := agg.max_local_combine_partials()) is not None
+        ]
+        return min(limits) if limits else None
+
+    def combine_partial_aggregates(self, df: cudf.DataFrame) -> cudf.DataFrame:
+        """Combine duplicate partial rows while retaining accumulator schema."""
+        if not self.supports_local_combine:
+            raise ValueError("Aggregation plan does not support local combining.")
+        if len(df) == 0:
+            return df[list(self._shuffle_key_columns) + list(self.accumulator_columns)]
+
+        result = None
+        for agg, accumulator_prefix in zip(
+            self._gpu_aggregates, self._accumulator_prefixes
+        ):
+            accumulator_columns = agg._accumulator_columns(accumulator_prefix)
+            combined = agg.combine_partial_aggregates(
+                df,
+                self._shuffle_key_columns,
+                accumulator_columns,
+            )
+            result = (
+                combined
+                if result is None
+                else result.merge(
+                    combined, on=list(self._shuffle_key_columns), how="outer"
+                )
+            )
+
+        assert result is not None
+        return result[list(self._shuffle_key_columns) + list(self.accumulator_columns)]
 
     def normalize_output_arrow(
         self,
@@ -1713,6 +2150,16 @@ class GPUHashAggregateActor:
             spill_memory_limit=spill_memory_limit,
         )
         self._shuffle_columns: Optional[List[str]] = None
+        # Associative partial aggregations can be compacted in an LSM-style
+        # hierarchy before the distributed shuffle. A run at level N represents
+        # 2**N input partials. This bounds temporary device memory while ensuring
+        # each input row participates in only O(log(num_blocks)) local combines.
+        self._local_partial_runs: List[Optional[Any]] = []
+        self._local_partial_count = 0
+        self._local_partial_input_rows = 0
+        self._local_combine_elapsed_s = 0.0
+        self._pending_input_tables: List[pa.Table] = []
+        self._pending_input_rows = 0
         self._runtime_input_schema: Optional[pa.Schema] = (
             aggregation_plan._input_schema
             if isinstance(aggregation_plan._input_schema, pa.Schema)
@@ -1743,20 +2190,35 @@ class GPUHashAggregateActor:
         logger.info("UCXX setup_worker completed in %.2fs.", elapsed)
 
     def insert_batch(self, block: Block) -> int:
-        import cudf
-
         table = BlockAccessor.for_block(block).to_arrow()
+        num_rows = table.num_rows
         required_columns = self._aggregation_plan.required_columns
         if required_columns:
-            projected_table = table.select(list(required_columns))
-            df = cudf.DataFrame.from_arrow(projected_table)
-        else:
-            df = cudf.DataFrame(index=range(table.num_rows))
+            table = table.select(list(required_columns))
 
         self._runtime_input_schema = self._aggregation_plan.merge_input_schema(
             self._runtime_input_schema,
             table.schema,
         )
+        batch_rows = self._aggregation_plan.preferred_input_batch_rows
+        if batch_rows is not None:
+            self._pending_input_tables.append(table)
+            self._pending_input_rows += num_rows
+            if self._pending_input_rows < batch_rows:
+                return num_rows
+            self._flush_pending_inputs()
+        else:
+            self._aggregate_input_table(table)
+        return num_rows
+
+    def _aggregate_input_table(self, table: pa.Table) -> None:
+        """Convert one possibly-coalesced Arrow table and aggregate it on GPU."""
+        import cudf
+
+        if self._aggregation_plan.required_columns:
+            df = cudf.DataFrame.from_arrow(table)
+        else:
+            df = cudf.DataFrame(index=range(table.num_rows))
         partial = self._aggregation_plan.partial_aggregate(
             df,
             input_schema=self._runtime_input_schema,
@@ -1764,10 +2226,88 @@ class GPUHashAggregateActor:
         if self._shuffle_columns is None:
             self._shuffle_columns = list(partial.columns)
 
-        self._shuffler.insert_chunk(table=partial, column_names=self._shuffle_columns)
-        return table.num_rows
+        if self._aggregation_plan.supports_local_combine:
+            self._add_local_partial(partial)
+        else:
+            self._shuffler.insert_chunk(
+                table=partial, column_names=self._shuffle_columns
+            )
+
+    def _flush_pending_inputs(self) -> None:
+        """Coalesce buffered projected Arrow blocks into one GPU partial."""
+        if not self._pending_input_tables:
+            return
+        if len(self._pending_input_tables) == 1:
+            table = self._pending_input_tables[0]
+        else:
+            table = pa.concat_tables(
+                self._pending_input_tables,
+                promote_options="default",
+            )
+        self._pending_input_tables.clear()
+        self._pending_input_rows = 0
+        self._aggregate_input_table(table)
+
+    def _add_local_partial(self, partial: Any) -> None:
+        """Add one partial frame to the actor-local compaction hierarchy."""
+        import cudf
+
+        self._local_partial_input_rows += len(partial)
+        self._local_partial_count += 1
+        level = 0
+        while level < len(self._local_partial_runs):
+            run = self._local_partial_runs[level]
+            if run is None:
+                self._local_partial_runs[level] = partial
+                break
+
+            self._local_partial_runs[level] = None
+            started = time.perf_counter()
+            partial = self._aggregation_plan.combine_partial_aggregates(
+                cudf.concat((run, partial), ignore_index=True)
+            )
+            self._local_combine_elapsed_s += time.perf_counter() - started
+            level += 1
+
+        else:
+            self._local_partial_runs.append(partial)
+
+        limit = self._aggregation_plan.max_local_combine_partials
+        if limit is not None and self._local_partial_count >= limit:
+            self._flush_local_partials()
+
+    def _flush_local_partials(self) -> None:
+        """Combine remaining local runs and insert one compacted shuffle chunk."""
+        import cudf
+
+        runs = [run for run in self._local_partial_runs if run is not None]
+        if not runs:
+            return
+
+        started = time.perf_counter()
+        compacted = self._aggregation_plan.combine_partial_aggregates(
+            cudf.concat(runs, ignore_index=True)
+        )
+        self._local_combine_elapsed_s += time.perf_counter() - started
+        compacted_rows = len(compacted)
+        logger.info(
+            "GPU hash aggregate local combine compacted %d partial rows to %d "
+            "rows in %.2fs before shuffle.",
+            self._local_partial_input_rows,
+            compacted_rows,
+            self._local_combine_elapsed_s,
+        )
+        assert self._shuffle_columns is not None
+        self._shuffler.insert_chunk(table=compacted, column_names=self._shuffle_columns)
+        self._local_partial_runs.clear()
+        self._local_partial_count = 0
+        self._local_partial_input_rows = 0
+        self._local_combine_elapsed_s = 0.0
 
     def finish_and_extract(self) -> Iterator[pa.Table | bytes]:
+        self._flush_pending_inputs()
+        if self._aggregation_plan.supports_local_combine:
+            self._flush_local_partials()
         self._shuffler.insert_finished()
 
         import cudf

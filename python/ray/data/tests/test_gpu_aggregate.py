@@ -22,6 +22,8 @@ from ray.data._internal.gpu_shuffle.hash_aggregate import (
     GPUGlobalAggregateOperator,
     GPUHashAggregateActor,
     GPUHashAggregateOperator,
+    GPUOrdinalValueCounter,
+    GPUPreprocessorFitAggregate,
     build_gpu_aggregation_plan,
 )
 from ray.data._internal.logical.interfaces import LogicalOperator
@@ -121,6 +123,30 @@ class TestGPUHashAggregatePlanning:
             assert not hasattr(gpu_agg, "finalize")
         assert "user_id" in plan.required_columns
         assert "value" in plan.required_columns
+
+    def test_ordinal_counter_generates_shuffle_keys_from_wide_input(self):
+        aggregate = GPUOrdinalValueCounter(
+            ["cat_0", "cat_1"], prefix=(), min_evidence=3
+        )
+        plan = build_gpu_aggregation_plan(
+            ("column", "value"),
+            (aggregate,),
+            input_schema=pa.schema([("cat_0", pa.string()), ("cat_1", pa.string())]),
+        )
+
+        assert isinstance(plan, GPUAggregationPlan), plan
+        assert plan.required_columns == ("cat_0", "cat_1")
+        assert plan.shuffle_key_columns == ("column", "value")
+        assert plan.supports_local_combine
+
+    def test_builtin_aggregation_plan_does_not_enable_local_combine(self):
+        plan = build_gpu_aggregation_plan(
+            ("user_id",),
+            (Count(), Sum("value")),
+            input_schema=pa.schema([("user_id", pa.int64()), ("value", pa.int64())]),
+        )
+        assert isinstance(plan, GPUAggregationPlan), plan
+        assert not plan.supports_local_combine
 
     def test_unsupported_aggregation_plan_rejected(self):
         schema = pa.schema([("user_id", pa.int64())])
@@ -624,6 +650,73 @@ class TestGPUAggregationPlanReal:
         assert group_zero[mean_sum_col] == 2
         assert group_zero[float_sum_col] == pytest.approx(4.0)
 
+    def test_ordinal_local_combine_preserves_global_threshold_semantics(
+        self, ray_with_gpu
+    ):
+        import cudf
+
+        aggregate = GPUOrdinalValueCounter(["cat"], prefix=(), min_evidence=3)
+        plan = build_gpu_aggregation_plan(
+            ("column", "value"),
+            (aggregate,),
+            input_schema=pa.schema([("cat", pa.string())]),
+        )
+        assert isinstance(plan, GPUAggregationPlan), plan
+
+        first = plan.partial_aggregate(cudf.DataFrame({"cat": ["a", "a", "b"]}))
+        second = plan.partial_aggregate(cudf.DataFrame({"cat": ["a", "b", "b"]}))
+        combined = plan.combine_partial_aggregates(
+            cudf.concat((first, second), ignore_index=True)
+        )
+        combined_pdf = combined.to_pandas().sort_values("value").reset_index(drop=True)
+
+        assert combined_pdf["value"].tolist() == ["a", "b"]
+        assert combined_pdf[plan.accumulator_columns[0]].tolist() == [3, 3]
+        finalized = plan.final_aggregate(combined).to_pandas().sort_values("value")
+        assert finalized["value"].tolist() == ["a", "b"]
+        assert finalized["count"].tolist() == [3, 3]
+
+    def test_preprocessor_fit_aggregate_combines_moments_and_categories(
+        self, ray_with_gpu
+    ):
+        import cudf
+
+        aggregate = GPUPreprocessorFitAggregate(
+            ordinal_entries=((5, ("cat",), (), 3),),
+            moment_entries=((2, ("num",), ()),),
+            input_batch_rows=8,
+        )
+        plan = build_gpu_aggregation_plan(
+            aggregate.generated_key_columns(),
+            (aggregate,),
+            input_schema=pa.schema([("cat", pa.string()), ("num", pa.float64())]),
+        )
+        assert isinstance(plan, GPUAggregationPlan), plan
+        assert plan.preferred_input_batch_rows == 8
+
+        first = plan.partial_aggregate(
+            cudf.DataFrame({"cat": ["a", "a", "b"], "num": [1.0, 2.0, 3.0]})
+        )
+        second = plan.partial_aggregate(
+            cudf.DataFrame({"cat": ["a", "b", "b"], "num": [4.0, 5.0, 6.0]})
+        )
+        combined = plan.combine_partial_aggregates(
+            cudf.concat((first, second), ignore_index=True)
+        )
+        result = plan.final_aggregate(combined).to_pandas()
+
+        categories = result[result["__fit_kind"] == aggregate.CATEGORY_KIND]
+        assert categories.sort_values("value")["value"].tolist() == ["a", "b"]
+        assert categories.sort_values("value")["fit_value"].tolist() == [3.0, 3.0]
+
+        moments = result[result["__fit_kind"] == aggregate.MOMENT_KIND]
+        values = dict(zip(moments["__fit_metric"], moments["fit_value"]))
+        assert values == {
+            aggregate.COUNT_METRIC: 6.0,
+            aggregate.SUM_METRIC: 21.0,
+            aggregate.SUM_SQ_METRIC: 91.0,
+        }
+
     def test_empty_final_aggregate_preserves_output_dtypes(self, ray_with_gpu):
         import cudf
 
@@ -1031,6 +1124,37 @@ class TestGPUHashAggregateActorReal:
         assert pd.isna(std_values[0])
         assert std_values[1] == pytest.approx(0.5**0.5)
         assert pd.isna(std_values[2])
+
+    def test_ordinal_actor_locally_combines_before_shuffle(self, ray_with_gpu):
+        aggregate = GPUOrdinalValueCounter(
+            ["cat"],
+            prefix=(),
+            min_evidence=3,
+            input_batch_rows=5,
+            local_combine_partials=1,
+        )
+        plan = build_gpu_aggregation_plan(
+            ("column", "value"),
+            (aggregate,),
+            input_schema=pa.schema([("cat", pa.string())]),
+        )
+        assert isinstance(plan, GPUAggregationPlan), plan
+
+        actor = self._make_setup_actor(plan)
+        try:
+            for values in (["a", "a", "b"], ["a", "b"], ["b", "c"]):
+                table = pa.table({"cat": values})
+                assert ray.get(actor.insert_batch.remote(table)) == table.num_rows
+            result = (
+                self._collect_frame(actor).sort_values("value").reset_index(drop=True)
+            )
+        finally:
+            ray.kill(actor)
+
+        assert result.to_dict("records") == [
+            {"column": "cat", "value": "a", "count": 3},
+            {"column": "cat", "value": "b", "count": 3},
+        ]
 
     def test_grouped_aggregate_output_has_unique_join_keys(self, ray_with_gpu):
         import cudf
