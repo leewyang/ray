@@ -712,7 +712,7 @@ def test_incompatible_file_uses_arrow_fallback(
 
 
 @pytest.mark.parametrize("tasks_in_flight_source", ["actor-pool", "context"])
-def test_fusion_preserves_planned_state_and_actor_options(
+def test_fusion_preserves_planned_udf_and_actor_pool(
     ray_start_regular_shared_2_cpus, tmp_path, tasks_in_flight_source
 ):
     path = tmp_path / "input.parquet"
@@ -727,18 +727,11 @@ def test_fusion_preserves_planned_state_and_actor_options(
     remote_args = {
         "num_gpus": 1,
         "max_concurrency": 1,
-        "memory": 1_048_576,
-        "enable_task_events": False,
     }
     mapped = _make_gpu_map(read, compute=compute, ray_remote_args=remote_args)
     raw = _plan(mapped, context=context)
-    read_physical = _find_read_physical(raw, read)
     downstream_transformer = raw.dag.get_map_transformer()
     (planned_batch_transform,) = downstream_transformer.get_transform_fns()
-
-    read_physical._output_block_size_option_override = OutputBlockSizeOption.of(
-        target_max_block_size=34_567
-    )
 
     original_physical_remote_args = dict(raw.dag._ray_remote_args)
     fused = FuseCudfParquetReadIntoMapBatches().apply(raw)
@@ -759,7 +752,6 @@ def test_fusion_preserves_planned_state_and_actor_options(
     assert fused_transformer._init_fn.func is _init_fused_actor
     assert fused_transformer._init_fn.args == (downstream_transformer._init_fn,)
     assert fused.dag._ray_remote_args == original_physical_remote_args
-    assert fused.dag.target_max_block_size_override == 34_567
     fused_pool = fused.dag._actor_pool
     assert fused_pool.max_tasks_in_flight_per_actor() == 3
     assert fused_pool.max_actor_concurrency() == 1
@@ -778,22 +770,20 @@ def test_fusion_preserves_planned_state_and_actor_options(
     ],
 )
 def test_nondefault_context_settings_fail_closed(
-    ray_start_regular_shared_2_cpus,
     tmp_path,
     setting,
     value,
 ):
     path = tmp_path / "input.parquet"
     _write_parquet(path)
-    raw = _plan(_make_gpu_map(_make_read_files(path)))
+    context = _context()
     if setting == "checkpoint_config":
-        # The rule only needs the presence of a checkpoint config. Bypass its
-        # unrelated required path/id validation after physical planning.
-        raw.context._checkpoint_config = object()
+        context._checkpoint_config = object()
     else:
-        setattr(raw.context, setting, value)
+        setattr(context, setting, value)
+    plan = LogicalPlan(_make_gpu_map(_make_read_files(path)), context)
 
-    assert FuseCudfParquetReadIntoMapBatches().apply(raw) is raw
+    assert ConfigureCudfParquetReadForFusion().apply(plan) is plan
 
 
 @pytest.mark.parametrize(
@@ -801,6 +791,9 @@ def test_nondefault_context_settings_fail_closed(
     [
         {},
         {"num_gpus": 1, "future_actor_option": True},
+        {"num_gpus": 1, "memory": 1_048_576},
+        {"num_gpus": 1, "enable_task_events": False},
+        {"num_gpus": 1, "runtime_env": {}},
         {"num_gpus": 0.25},
         {"num_gpus": float("nan")},
         {"num_gpus": 1, "max_concurrency": True},
@@ -847,7 +840,13 @@ def test_nonambient_s3_configuration_fails_closed(
 ):
     path = tmp_path / "input.parquet"
     _write_parquet(path)
-    read = _make_read_files(path, scanner_overrides={"filesystem": filesystem})
+    read = _make_read_files(
+        path,
+        scanner_overrides={
+            "filesystem": filesystem,
+            "has_custom_read_behavior": True,
+        },
+    )
     raw = _plan(_make_gpu_map(read))
 
     assert FuseCudfParquetReadIntoMapBatches().apply(raw) is raw
@@ -870,6 +869,8 @@ def test_nonambient_s3_configuration_fails_closed(
         "map-on-start",
         "map-task-args",
         "map-task-args-fn",
+        "read-target",
+        "map-target",
     ],
 )
 def test_ineligible_candidate_fails_closed(
@@ -920,6 +921,15 @@ def test_ineligible_candidate_fails_closed(
         raw.dag._map_task_kwargs = {"map": True}
     elif case == "map-task-args-fn":
         raw.dag.add_map_task_kwargs_fn(lambda: {"map": True})
+    elif case == "read-target":
+        read_physical = _find_read_physical(raw, read)
+        read_physical._output_block_size_option_override = OutputBlockSizeOption.of(
+            target_max_block_size=34_567
+        )
+    elif case == "map-target":
+        raw.dag._output_block_size_option_override = OutputBlockSizeOption.of(
+            target_max_block_size=34_567
+        )
 
     assert FuseCudfParquetReadIntoMapBatches().apply(raw) is raw
 

@@ -32,8 +32,6 @@ from ray.data._internal.datasource_v2.chunkers.file_chunker import (
     ChunkMetadata,
     FileChunker,
     ParquetFileChunker,
-    ParquetFileChunkMetadata,
-    create_chunk_metadata,
 )
 from ray.data._internal.datasource_v2.listing.file_indexer import (
     NonSamplingFileIndexer,
@@ -68,28 +66,6 @@ logger = logging.getLogger(__name__)
 
 _DIAGNOSTIC_LOGGED_ATTR = "_cudf_parquet_read_fusion_diagnostic_logged"
 
-# Actor-option allow-list: add an option only when fusion preserves its behavior.
-_FUSION_SAFE_REMOTE_ARGS = {
-    "_labels",
-    "accelerator_type",
-    "allow_out_of_order_execution",
-    "enable_task_events",
-    "fallback_strategy",
-    "label_selector",
-    "max_concurrency",
-    "max_restarts",
-    "max_task_retries",
-    "memory",
-    "num_cpus",
-    "num_gpus",
-    "placement_group",
-    "placement_group_bundle_index",
-    "placement_group_capture_child_tasks",
-    "resources",
-    "runtime_env",
-    "scheduling_strategy",
-}
-
 
 @dataclass(frozen=True)
 class _CudfParquetReadConfig:
@@ -99,14 +75,6 @@ class _CudfParquetReadConfig:
     columns: Tuple[str, ...]
     batch_size: int
     retried_io_errors: Tuple[str, ...]
-
-
-class _CudfParquetFileChunkMetadata(ParquetFileChunkMetadata):
-    """An exact row-group range for one fused GPU read."""
-
-    row_group_start_idx: int
-    row_group_end_idx: int
-    needs_arrow_fallback: bool
 
 
 class _CudfParquetFileChunker(FileChunker):
@@ -148,14 +116,13 @@ class _CudfParquetFileChunker(FileChunker):
         chunk_size, remainder = divmod(file_size, num_chunks)
         for chunk_idx, (start_row_group, end_row_group) in enumerate(row_group_ranges):
             yield (
-                create_chunk_metadata(
-                    _CudfParquetFileChunkMetadata,
-                    chunk_idx=chunk_idx,
-                    total_num_chunks=num_chunks,
-                    row_group_start_idx=start_row_group,
-                    row_group_end_idx=end_row_group,
-                    needs_arrow_fallback=needs_arrow_fallback,
-                ),
+                {
+                    "chunk_idx": chunk_idx,
+                    "total_num_chunks": num_chunks,
+                    "row_group_start_idx": start_row_group,
+                    "row_group_end_idx": end_row_group,
+                    "needs_arrow_fallback": needs_arrow_fallback,
+                },
                 chunk_size + (chunk_idx < remainder),
             )
 
@@ -255,7 +222,7 @@ class _CudfParquetReader:
         self,
         path: str,
         size: int,
-        chunk_metadata: _CudfParquetFileChunkMetadata,
+        chunk_metadata: ChunkMetadata,
     ) -> Iterator[pa.Table]:
         """Run one manifest entry through the original V2 reader in this actor."""
 
@@ -356,13 +323,11 @@ def _is_synchronous_callable_class(udf_class: Any) -> bool:
         call_method = call_method.__func__
     if call_method is None:
         return False
-    if inspect.iscoroutinefunction(call_method):
-        return False
-    if inspect.isasyncgenfunction(call_method):
-        return False
-    if inspect.isgeneratorfunction(call_method):
-        return False
-    return True
+    return not (
+        inspect.iscoroutinefunction(call_method)
+        or inspect.isasyncgenfunction(call_method)
+        or inspect.isgeneratorfunction(call_method)
+    )
 
 
 def _count_consumers(operators: Iterable[Any]) -> Dict[Any, int]:
@@ -425,9 +390,13 @@ def _logical_config_if_eligible(
         return None
 
     indexer = read.input_dependencies[0].file_indexer
-    if type(indexer) is not NonSamplingFileIndexer or type(
-        indexer.file_chunker
-    ) not in (ParquetFileChunker, _CudfParquetFileChunker):
+    chunker = indexer.file_chunker
+    if (
+        type(indexer) is not NonSamplingFileIndexer
+        or context.parquet_chunker_target_chunk_size is not None
+        or type(chunker) is not ParquetFileChunker
+        or chunker._target_chunk_size != ParquetFileChunker._DEFAULT_TARGET_CHUNK_SIZE
+    ):
         return None
 
     # Reject scanner features that a direct cuDF read would skip.
@@ -452,28 +421,8 @@ def _logical_config_if_eligible(
         return None
 
     if type(filesystem) is pafs.S3FileSystem:
-        # Accept only the default ambient-credential configuration.
-        region = filesystem.region
-        if not region:
-            return None
-        try:
-            state = filesystem.__reduce__()[1][0]
-        except Exception:
-            return None
-        if type(state) is not dict:
-            return None
-        try:
-            # PyArrow records an omitted region as "" even after resolving the
-            # effective region. Compare it with the matching default form.
-            default_filesystem = (
-                pafs.S3FileSystem()
-                if state.get("region") == ""
-                else pafs.S3FileSystem(region=region)
-            )
-            default_state = default_filesystem.__reduce__()[1][0]
-        except Exception:
-            return None
-        if state != default_state:
+        # cuDF receives only the resolved region and ambient actor credentials.
+        if not filesystem.region:
             return None
 
     columns = (
@@ -503,7 +452,10 @@ def _logical_config_if_eligible(
         return None
 
     remote_args = downstream.ray_remote_args
-    if type(remote_args) is not dict or set(remote_args) - _FUSION_SAFE_REMOTE_ARGS:
+    if type(remote_args) is not dict or set(remote_args) - {
+        "max_concurrency",
+        "num_gpus",
+    }:
         return None
     max_concurrency = remote_args.get("max_concurrency", 1)
     if type(max_concurrency) is not int or max_concurrency != 1:
@@ -550,9 +502,7 @@ class ConfigureCudfParquetReadForFusion(Rule):
             if config is None:
                 return operator
             list_files = read.input_dependencies[0]
-            if consumers.get(
-                list_files, 0
-            ) != 1 or not self._uses_default_parquet_chunker(list_files, plan.context):
+            if consumers.get(list_files, 0) != 1:
                 return operator
 
             indexer = copy.deepcopy(list_files.file_indexer)
@@ -566,19 +516,6 @@ class ConfigureCudfParquetReadForFusion(Rule):
             plan
             if rewritten_dag is plan.dag
             else LogicalPlan(rewritten_dag, plan.context)
-        )
-
-    @staticmethod
-    def _uses_default_parquet_chunker(list_files: ListFiles, context: Any) -> bool:
-        indexer = list_files.file_indexer
-        if type(indexer) is not NonSamplingFileIndexer:
-            return False
-        chunker = indexer.file_chunker
-        return (
-            context.parquet_chunker_target_chunk_size is None
-            and type(chunker) is ParquetFileChunker
-            and chunker._target_chunk_size
-            == ParquetFileChunker._DEFAULT_TARGET_CHUNK_SIZE
         )
 
 
@@ -621,7 +558,6 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
                     read_logical,
                     physical_op,
                     map_logical,
-                    plan,
                     logical_consumers,
                     physical_consumers,
                 )
@@ -693,25 +629,19 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
         read_logical: ReadFiles,
         downstream_physical: PhysicalOperator,
         downstream_logical: MapBatches,
-        plan: PhysicalPlan,
         logical_consumers: Mapping[LogicalOperator, int],
         physical_consumers: Mapping[PhysicalOperator, int],
     ) -> Optional[_CudfParquetReadConfig]:
         """Return the read config when planning preserved the eligible pair.
 
-        The logical rule checks user-visible read semantics. This method rejects
-        physical sharing, callbacks, transforms, and block-size policies that one
-        replacement cannot preserve.
+        The configured chunker proves that the logical rule accepted the pair. This
+        method checks only state added or changed by physical planning.
         """
-
-        context = plan.context
-        config = _logical_config_if_eligible(read_logical, downstream_logical, context)
-        if config is None:
-            return None
 
         # Exact ranges are added by the logical rule before physical planning.
         list_files = read_logical.input_dependencies[0]
-        if type(list_files.file_indexer.file_chunker) is not _CudfParquetFileChunker:
+        chunker = list_files.file_indexer.file_chunker
+        if type(chunker) is not _CudfParquetFileChunker:
             return None
 
         # The read must be an ordinary, unshared V2 read.
@@ -753,17 +683,13 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
         ):
             return None
 
-        read_target = read_physical.target_max_block_size_override
-        downstream_target = downstream_physical.target_max_block_size_override
-        # A fused operator can preserve only one block-size override.
         if (
-            read_target is not None
-            and downstream_target is not None
-            and read_target != downstream_target
+            read_physical.target_max_block_size_override is not None
+            or downstream_physical.target_max_block_size_override is not None
         ):
             return None
 
-        return config
+        return chunker._config
 
     @staticmethod
     def _create_fused_operator(
@@ -802,18 +728,12 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
             ),
         )
 
-        read_target = read_physical.target_max_block_size_override
-        downstream_target = downstream_physical.target_max_block_size_override
-        target_max_block_size = (
-            read_target if read_target is not None else downstream_target
-        )
         name = f"{read_physical.name}->{downstream_physical.name}"
 
         fused_physical_op = MapOperator.create(
             fused_map_transformer,
             input_physical_op,
             plan.context,
-            target_max_block_size_override=target_max_block_size,
             name=name,
             compute_strategy=downstream_logical.compute,
             # The input rows are manifest entries, not decoded dataset rows.
@@ -851,7 +771,7 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
             "credentials, followed by a serial callable-class map_batches with "
             "batch_format='cudf', "
             "zero_copy_batch=True, and num_gpus=1. The physical pair must also be "
-            "linear, callback-free, and use compatible block sizing.",
+            "linear, callback-free, and have no block-size override.",
             read.name,
             downstream.name,
         )
