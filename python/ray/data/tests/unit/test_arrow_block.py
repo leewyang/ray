@@ -219,6 +219,46 @@ def test_fill_column(input_block, fill_column_name, fill_value, expected_output_
     assert actual_output_block.equals(expected_output_block)
 
 
+def test_to_cudf_materializes_arrow_buffers(monkeypatch):
+    chunked = pa.concat_tables(
+        [
+            pa.table({"value": [1, None]}),
+            pa.table({"value": [3, 4]}),
+        ]
+    )
+    table = pa.Table.from_arrays(
+        [chunked.column("value"), pa.array([5, None, 7, 8])],
+        names=["chunked", "single"],
+    )
+    assert table.column("chunked").num_chunks == 2
+
+    source_buffer = table.column("single").chunk(0).buffers()[0]
+
+    class FakeDataFrame:
+        @staticmethod
+        def from_arrow(table):
+            assert all(column.num_chunks == 1 for column in table.columns)
+            assert (
+                table.column("single").chunk(0).buffers()[0].address
+                != source_buffer.address
+            )
+            return table
+
+    class FakeCudf:
+        DataFrame = FakeDataFrame
+
+    monkeypatch.setattr(
+        "ray.data.util.data_batch_conversion._lazy_import_cudf", lambda: FakeCudf
+    )
+
+    result = ArrowBlockAccessor(table).to_cudf()
+
+    assert result.to_pydict() == {
+        "chunked": [1, None, 3, 4],
+        "single": [5, None, 7, 8],
+    }
+
+
 def test_add_blocks_with_different_column_names():
     builder = ArrowBlockBuilder()
 
