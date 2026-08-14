@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import copy
 import functools
+import importlib
 import inspect
 import logging
 from dataclasses import dataclass, replace
@@ -130,29 +131,29 @@ class _CudfParquetFileChunker(FileChunker):
         if footer.num_rows == 0:
             return
 
-        ranges = []
-        start = 0
-        rows = 0
-        for end in range(1, footer.num_row_groups + 1):
-            rows += footer.row_group(end - 1).num_rows
-            if rows >= self._config.batch_size:
-                ranges.append((start, end))
-                start = end
-                rows = 0
-        if start < footer.num_row_groups:
-            ranges.append((start, footer.num_row_groups))
+        row_group_ranges = []
+        start_row_group = 0
+        num_rows = 0
+        for end_row_group in range(1, footer.num_row_groups + 1):
+            num_rows += footer.row_group(end_row_group - 1).num_rows
+            if num_rows >= self._config.batch_size:
+                row_group_ranges.append((start_row_group, end_row_group))
+                start_row_group = end_row_group
+                num_rows = 0
+        if start_row_group < footer.num_row_groups:
+            row_group_ranges.append((start_row_group, footer.num_row_groups))
 
         needs_arrow_fallback = self._needs_arrow_fallback(path, footer)
-        num_chunks = len(ranges)
+        num_chunks = len(row_group_ranges)
         chunk_size, remainder = divmod(file_size, num_chunks)
-        for chunk_idx, (start, end) in enumerate(ranges):
+        for chunk_idx, (start_row_group, end_row_group) in enumerate(row_group_ranges):
             yield (
                 create_chunk_metadata(
                     _CudfParquetFileChunkMetadata,
                     chunk_idx=chunk_idx,
                     total_num_chunks=num_chunks,
-                    row_group_start_idx=start,
-                    row_group_end_idx=end,
+                    row_group_start_idx=start_row_group,
+                    row_group_end_idx=end_row_group,
                     needs_arrow_fallback=needs_arrow_fallback,
                 ),
                 chunk_size + (chunk_idx < remainder),
@@ -184,20 +185,22 @@ class _CudfParquetReader:
     def __init__(self, config: _CudfParquetReadConfig):
         self._config = config
         self._is_s3 = type(config.scanner.filesystem) is pafs.S3FileSystem
+        self._can_read_s3_directly: Optional[bool] = None
 
-    def __call__(self, blocks: Iterable[Block], _: Any) -> Iterator[DataBatch]:
+    def __call__(self, manifest_blocks: Iterable[Block], _: Any) -> Iterator[DataBatch]:
         # Importing cuDF initializes CUDA and is deliberately deferred to the actor.
         import cudf
 
-        for block in blocks:
-            manifest = FileManifest(block)
+        can_read_s3_directly = self._direct_s3_read_is_available()
+        for manifest_block in manifest_blocks:
+            manifest = FileManifest(manifest_block)
             for path, size, chunk_metadata in zip(
                 manifest.paths,
                 manifest.file_sizes,
                 manifest.file_chunk_metadatas,
             ):
                 path = str(path)
-                if chunk_metadata["needs_arrow_fallback"]:
+                if chunk_metadata["needs_arrow_fallback"] or not can_read_s3_directly:
                     # Preserve Arrow's schema and partition handling in this actor.
                     yield from self._read_with_arrow(path, int(size), chunk_metadata)
                     continue
@@ -224,6 +227,21 @@ class _CudfParquetReader:
                 )
                 if len(frame):
                     yield frame
+
+    def _direct_s3_read_is_available(self) -> bool:
+        if not self._is_s3:
+            return True
+        if self._can_read_s3_directly is None:
+            try:
+                importlib.import_module("s3fs")
+            except ImportError:
+                # Keep S3 reads inside the actor when cuDF's optional transport
+                # is absent, but let Arrow perform the decode.
+                logger.debug("s3fs is unavailable; decoding S3 Parquet with Arrow.")
+                self._can_read_s3_directly = False
+            else:
+                self._can_read_s3_directly = True
+        return self._can_read_s3_directly
 
     def _s3_storage_options(self) -> Optional[Dict[str, Any]]:
         if not self._is_s3:
@@ -261,8 +279,6 @@ class _CudfBatchMapTransformFn(BatchMapTransformFn):
             output_block_size_option=(
                 replace(output_option) if output_option is not None else None
             ),
-            target_batch_size_bytes=planned._target_batch_size_bytes,
-            reports_custom_op_stats=planned._reports_custom_op_stats,
         )
 
     def _pre_process(self, frames: Iterable[Any]) -> Iterator[DataBatch]:
@@ -271,13 +287,13 @@ class _CudfBatchMapTransformFn(BatchMapTransformFn):
         import cudf
 
         batch_size = self._batch_size
-        pieces = []
-        rows = 0
+        batch_pieces = []
+        num_buffered_rows = 0
 
-        def combine() -> Any:
-            if len(pieces) == 1:
-                return pieces[0].reset_index(drop=True)
-            return cudf.concat(pieces, ignore_index=True)
+        def combine_batch_pieces() -> Any:
+            if len(batch_pieces) == 1:
+                return batch_pieces[0].reset_index(drop=True)
+            return cudf.concat(batch_pieces, ignore_index=True)
 
         for frame in frames:
             if isinstance(frame, pa.Table):
@@ -288,23 +304,23 @@ class _CudfBatchMapTransformFn(BatchMapTransformFn):
                     f"{type(frame)!r}"
                 )
             frame_rows = len(frame)
-            if not pieces and frame_rows == batch_size:
+            if not batch_pieces and frame_rows == batch_size:
                 yield frame.reset_index(drop=True)
                 continue
 
             offset = 0
             while offset < frame_rows:
-                count = min(batch_size - rows, frame_rows - offset)
-                pieces.append(frame.iloc[offset : offset + count])
-                offset += count
-                rows += count
-                if rows == batch_size:
-                    yield combine()
-                    pieces = []
-                    rows = 0
+                rows_to_take = min(batch_size - num_buffered_rows, frame_rows - offset)
+                batch_pieces.append(frame.iloc[offset : offset + rows_to_take])
+                offset += rows_to_take
+                num_buffered_rows += rows_to_take
+                if num_buffered_rows == batch_size:
+                    yield combine_batch_pieces()
+                    batch_pieces = []
+                    num_buffered_rows = 0
 
-        if rows:
-            yield combine()
+        if num_buffered_rows:
+            yield combine_batch_pieces()
 
 
 def _init_fused_actor(init_udf: Any) -> None:
@@ -312,40 +328,46 @@ def _init_fused_actor(init_udf: Any) -> None:
 
     import rmm
 
-    current = rmm.mr.get_current_device_resource()
-    # Leave custom memory resources unchanged.
-    if type(current) is rmm.mr.CudaMemoryResource:
-        available, _ = rmm.mr.available_device_memory()
-        # Grow on demand, then release unused memory above one quarter of what
-        # was available when the actor started.
-        try:
+    try:
+        current = rmm.mr.get_current_device_resource()
+        # Leave custom memory resources unchanged.
+        if type(current) is rmm.mr.CudaMemoryResource:
+            available, _ = rmm.mr.available_device_memory()
+            # Grow on demand, then release unused memory above one quarter of what
+            # was available when the actor started.
             resource = rmm.mr.CudaAsyncMemoryResource(
                 initial_pool_size=0,
                 release_threshold=available // 4,
             )
-        except RuntimeError:
-            logger.debug("CUDA asynchronous allocation is unavailable.")
-        else:
             rmm.mr.set_current_device_resource(resource)
+    except RuntimeError:
+        logger.debug("CUDA asynchronous allocation is unavailable.")
 
     init_udf()
 
 
-def _is_synchronous_callable_class(fn: Any) -> bool:
-    if not inspect.isclass(fn):
+def _is_synchronous_callable_class(udf_class: Any) -> bool:
+    """Check a UDF class without constructing it or running driver-side code."""
+
+    if not inspect.isclass(udf_class):
         return False
-    call = inspect.getattr_static(fn, "__call__", None)
-    if isinstance(call, (classmethod, staticmethod)):
-        call = call.__func__
-    return bool(
-        call is not None
-        and not inspect.iscoroutinefunction(call)
-        and not inspect.isasyncgenfunction(call)
-        and not inspect.isgeneratorfunction(call)
-    )
+    call_method = inspect.getattr_static(udf_class, "__call__", None)
+    if isinstance(call_method, (classmethod, staticmethod)):
+        call_method = call_method.__func__
+    if call_method is None:
+        return False
+    if inspect.iscoroutinefunction(call_method):
+        return False
+    if inspect.isasyncgenfunction(call_method):
+        return False
+    if inspect.isgeneratorfunction(call_method):
+        return False
+    return True
 
 
 def _count_consumers(operators: Iterable[Any]) -> Dict[Any, int]:
+    """Count how many direct consumers refer to each operator."""
+
     counts = {}
     for operator in operators:
         for input_op in operator.input_dependencies:
@@ -354,16 +376,20 @@ def _count_consumers(operators: Iterable[Any]) -> Dict[Any, int]:
 
 
 def _has_default_read_remote_args(read: ReadFiles, context: Any) -> bool:
-    args = read.ray_remote_args
-    if set(args) - {"scheduling_strategy"}:
+    """Accept only the read's absent or inherited scheduling strategy."""
+
+    remote_args = read.ray_remote_args
+    if set(remote_args) - {"scheduling_strategy"}:
         return False
-    if "scheduling_strategy" not in args:
+    if "scheduling_strategy" not in remote_args:
         return True
     try:
-        result = args["scheduling_strategy"] == context.scheduling_strategy
+        matches_context = (
+            remote_args["scheduling_strategy"] == context.scheduling_strategy
+        )
     except Exception:
         return False
-    return type(result) is bool and result
+    return type(matches_context) is bool and matches_context
 
 
 def _logical_config_if_eligible(
@@ -371,6 +397,11 @@ def _logical_config_if_eligible(
     downstream: MapBatches,
     context: Any,
 ) -> Optional[_CudfParquetReadConfig]:
+    """Return direct-read settings for one eligible logical read-map pair.
+
+    Returning ``None`` leaves the ordinary Ray Data plan unchanged.
+    """
+
     # Keep checkpointing, retries, errors, and actor task admission unchanged.
     if (
         context.checkpoint_config is not None
@@ -382,9 +413,9 @@ def _logical_config_if_eligible(
     ):
         return None
 
+    # Require an ordinary V2 read with one direct ListFiles input.
     if (
-        downstream.batch_format != "cudf"
-        or type(read.compute) is not TaskPoolStrategy
+        type(read.compute) is not TaskPoolStrategy
         or read.compute.size is not None
         or read.block_udf is not None
         or not _has_default_read_remote_args(read, context)
@@ -427,10 +458,22 @@ def _logical_config_if_eligible(
             return None
         try:
             state = filesystem.__reduce__()[1][0]
-            default_state = pafs.S3FileSystem(region=region).__reduce__()[1][0]
         except Exception:
             return None
-        if type(state) is not dict or state != default_state:
+        if type(state) is not dict:
+            return None
+        try:
+            # PyArrow records an omitted region as "" even after resolving the
+            # effective region. Compare it with the matching default form.
+            default_filesystem = (
+                pafs.S3FileSystem()
+                if state.get("region") == ""
+                else pafs.S3FileSystem(region=region)
+            )
+            default_state = default_filesystem.__reduce__()[1][0]
+        except Exception:
+            return None
+        if state != default_state:
             return None
 
     columns = (
@@ -447,7 +490,8 @@ def _logical_config_if_eligible(
 
     # Reuse only a serial callable-class actor that owns one GPU.
     if (
-        type(downstream.compute) is not ActorPoolStrategy
+        downstream.batch_format != "cudf"
+        or type(downstream.compute) is not ActorPoolStrategy
         or downstream.compute.enable_true_multi_threading is not False
         or type(downstream.batch_size) is not int
         or downstream.batch_size <= 0
@@ -477,7 +521,11 @@ def _logical_config_if_eligible(
 
 
 class ConfigureCudfParquetReadForFusion(Rule):
-    """Size Parquet work units for an eligible fused GPU map."""
+    """Choose exact row-group work units before physical planning.
+
+    Physical planning captures the ListFiles chunker before physical rules run, so
+    this pass replaces only the default chunker for an eligible linear read-map pair.
+    """
 
     def apply(self, plan: LogicalPlan) -> LogicalPlan:
         if getattr(plan.context, "enable_cudf_parquet_read_fusion", False) is not True:
@@ -485,7 +533,7 @@ class ConfigureCudfParquetReadForFusion(Rule):
 
         consumers = _count_consumers(set(plan.dag.post_order_iter()))
 
-        def rewrite(operator: LogicalOperator) -> LogicalOperator:
+        def configure_map_input(operator: LogicalOperator) -> LogicalOperator:
             if not isinstance(operator, MapBatches):
                 return operator
             if len(operator.input_dependencies) != 1:
@@ -513,8 +561,12 @@ class ConfigureCudfParquetReadForFusion(Rule):
             read = replace(read, input_dependencies=[list_files])
             return replace(operator, input_dependencies=[read])
 
-        rewritten = plan.dag._apply_transform(rewrite)
-        return plan if rewritten is plan.dag else LogicalPlan(rewritten, plan.context)
+        rewritten_dag = plan.dag._apply_transform(configure_map_input)
+        return (
+            plan
+            if rewritten_dag is plan.dag
+            else LogicalPlan(rewritten_dag, plan.context)
+        )
 
     @staticmethod
     def _uses_default_parquet_chunker(list_files: ListFiles, context: Any) -> bool:
@@ -548,13 +600,17 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
         logical_consumers = _count_consumers(set(rewritten_op_map.values()))
         physical_consumers = _count_consumers(set(plan.dag.post_order_iter()))
         # Cache rewrites so shared operators stay shared.
-        rewritten: Dict[PhysicalOperator, PhysicalOperator] = {}
+        rewritten_operator_by_original: Dict[PhysicalOperator, PhysicalOperator] = {}
         did_fuse = False
 
-        def rewrite(physical_op: PhysicalOperator) -> PhysicalOperator:
+        def rewrite_upstream_graph(
+            physical_op: PhysicalOperator,
+        ) -> PhysicalOperator:
+            """Return the rewritten subgraph ending at ``physical_op``."""
+
             nonlocal did_fuse
-            if physical_op in rewritten:
-                return rewritten[physical_op]
+            if physical_op in rewritten_operator_by_original:
+                return rewritten_operator_by_original[physical_op]
 
             # Check only the pair ending here; recursion finds earlier pairs.
             pair = self._candidate_pair(physical_op, rewritten_op_map)
@@ -571,42 +627,45 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
                 )
                 if config is not None:
                     # Rewrite work before the pair, then replace the pair.
-                    fused_input = rewrite(read_physical.input_dependency)
-                    fused_physical, fused_logical = self._create_fused_operator(
+                    rewritten_pair_input = rewrite_upstream_graph(
+                        read_physical.input_dependency
+                    )
+                    fused_physical_op, fused_logical_op = self._create_fused_operator(
                         read_physical,
                         read_logical,
                         physical_op,
                         map_logical,
-                        fused_input,
+                        rewritten_pair_input,
                         plan,
                         config,
                     )
                     rewritten_op_map.pop(read_physical)
                     rewritten_op_map.pop(physical_op)
-                    rewritten_op_map[fused_physical] = fused_logical
-                    rewritten[physical_op] = fused_physical
+                    rewritten_op_map[fused_physical_op] = fused_logical_op
+                    rewritten_operator_by_original[physical_op] = fused_physical_op
                     did_fuse = True
-                    return fused_physical
+                    return fused_physical_op
                 self._log_skip_once(physical_op, read_logical, map_logical)
 
             # No replacement ends here, so rewrite each input.
-            new_inputs = []
+            rewritten_inputs = []
             inputs_changed = False
             for input_op in physical_op.input_dependencies:
-                new_input = rewrite(input_op)
-                new_inputs.append(new_input)
-                inputs_changed |= new_input is not input_op
+                rewritten_input = rewrite_upstream_graph(input_op)
+                rewritten_inputs.append(rewritten_input)
+                if rewritten_input is not input_op:
+                    inputs_changed = True
             if inputs_changed:
                 # Output links are rebuilt after all input links are final.
-                physical_op._input_dependencies = new_inputs
-            rewritten[physical_op] = physical_op
+                physical_op._input_dependencies = rewritten_inputs
+            rewritten_operator_by_original[physical_op] = physical_op
             return physical_op
 
-        final_operator = rewrite(plan.dag)
+        rewritten_final_operator = rewrite_upstream_graph(plan.dag)
         if not did_fuse:
             return plan
-        self._rebuild_output_dependencies(final_operator)
-        return PhysicalPlan(final_operator, rewritten_op_map, plan.context)
+        self._rebuild_output_dependencies(rewritten_final_operator)
+        return PhysicalPlan(rewritten_final_operator, rewritten_op_map, plan.context)
 
     @staticmethod
     def _candidate_pair(
@@ -638,6 +697,13 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
         logical_consumers: Mapping[LogicalOperator, int],
         physical_consumers: Mapping[PhysicalOperator, int],
     ) -> Optional[_CudfParquetReadConfig]:
+        """Return the read config when planning preserved the eligible pair.
+
+        The logical rule checks user-visible read semantics. This method rejects
+        physical sharing, callbacks, transforms, and block-size policies that one
+        replacement cannot preserve.
+        """
+
         context = plan.context
         config = _logical_config_if_eligible(read_logical, downstream_logical, context)
         if config is None:
@@ -671,6 +737,8 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
             or not downstream_physical.supports_fusion()
             or downstream_physical.get_additional_split_factor() != 1
             or downstream_physical._on_start is not None
+            or downstream_physical._map_task_kwargs
+            or downstream_physical._map_task_kwargs_fns
         ):
             return None
 
@@ -703,18 +771,22 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
         read_logical: ReadFiles,
         downstream_physical: PhysicalOperator,
         downstream_logical: MapBatches,
-        input_physical: PhysicalOperator,
+        input_physical_op: PhysicalOperator,
         plan: PhysicalPlan,
         config: _CudfParquetReadConfig,
     ) -> Tuple[MapOperator, MapBatches]:
+        """Create one actor map that reads manifests and runs the planned GPU UDF.
+
+        The standard planner cannot batch cuDF frames read from manifests, so preserve
+        its planned UDF transform and replace only the input reader and batcher.
+        """
+
         assert isinstance(downstream_physical, ActorPoolMapOperator)
         downstream_transformer = downstream_physical.get_map_transformer()
         (planned_batch_transform,) = downstream_transformer.get_transform_fns()
         output_option = downstream_transformer._output_block_size_option_override
 
-        # The standard planner can't consume file manifests in a GPU actor. Reuse
-        # its planned UDF transform and replace only the input batcher.
-        fused_transformer = MapTransformer(
+        fused_map_transformer = MapTransformer(
             [
                 BlockMapTransformFn(
                     _CudfParquetReader(config),
@@ -737,9 +809,9 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
         )
         name = f"{read_physical.name}->{downstream_physical.name}"
 
-        fused_physical = MapOperator.create(
-            fused_transformer,
-            input_physical,
+        fused_physical_op = MapOperator.create(
+            fused_map_transformer,
+            input_physical_op,
             plan.context,
             target_max_block_size_override=target_max_block_size,
             name=name,
@@ -748,15 +820,12 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
             min_rows_per_bundle=None,
             # Do not offer this custom transform to another fusion rule.
             supports_fusion=False,
-            map_task_kwargs=dict(downstream_physical._map_task_kwargs),
             ray_remote_args=dict(downstream_logical.ray_remote_args),
         )
-        for callback in downstream_physical._map_task_kwargs_fns:
-            fused_physical.add_map_task_kwargs_fn(callback)
 
         # Keep original operators as lineage only; op_map gets a synthetic node.
-        fused_physical.set_logical_operators(read_logical, downstream_logical)
-        fused_logical = replace(
+        fused_physical_op.set_logical_operators(read_logical, downstream_logical)
+        fused_logical_op = replace(
             downstream_logical,
             input_dependencies=list(read_logical.input_dependencies),
             # Relative to ListFiles, this operator expands manifest entries into
@@ -765,8 +834,8 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
             min_rows_per_bundled_input=None,
             ray_remote_args=dict(downstream_logical.ray_remote_args),
         )
-        object.__setattr__(fused_logical, "_name", name)
-        return fused_physical, fused_logical
+        object.__setattr__(fused_logical_op, "_name", name)
+        return fused_physical_op, fused_logical_op
 
     @staticmethod
     def _log_skip_once(
@@ -781,25 +850,26 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
             "requires a default local read or an S3 read using ambient AWS "
             "credentials, followed by a serial callable-class map_batches with "
             "batch_format='cudf', "
-            "zero_copy_batch=True, and num_gpus=1.",
+            "zero_copy_batch=True, and num_gpus=1. The physical pair must also be "
+            "linear, callback-free, and use compatible block sizing.",
             read.name,
             downstream.name,
         )
         setattr(physical, _DIAGNOSTIC_LOGGED_ATTR, True)
 
     @staticmethod
-    def _rebuild_output_dependencies(final_operator: PhysicalOperator) -> None:
-        """Rebuild producer links after rewriting consumer inputs."""
+    def _rebuild_output_dependencies(
+        final_physical_operator: PhysicalOperator,
+    ) -> None:
+        """Rebuild reverse links after rewriting input dependencies.
 
-        operators = set(final_operator.post_order_iter())
-        for operator in operators:
-            operator._output_dependencies = []
-        for operator in operators:
-            for input_op in operator.input_dependencies:
-                input_op._output_dependencies.append(operator)
+        Ray stores every edge in both directions, but traversal updates only consumer
+        input links. Treat those links as authoritative and recreate producer links.
+        """
 
-
-__all__ = [
-    "ConfigureCudfParquetReadForFusion",
-    "FuseCudfParquetReadIntoMapBatches",
-]
+        physical_operators = set(final_physical_operator.post_order_iter())
+        for physical_op in physical_operators:
+            physical_op._output_dependencies = []
+        for physical_op in physical_operators:
+            for input_physical_op in physical_op.input_dependencies:
+                input_physical_op._output_dependencies.append(physical_op)

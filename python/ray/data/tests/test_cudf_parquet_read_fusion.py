@@ -489,6 +489,27 @@ def test_fused_actor_keeps_default_resource_when_async_is_unavailable(
     assert initialized == [True]
 
 
+@pytest.mark.parametrize("failure_point", ["memory-query", "resource-install"])
+def test_fused_actor_ignores_optional_allocator_setup_failures(
+    fake_rmm, monkeypatch, failure_point
+):
+    default = fake_rmm.current
+
+    def unavailable(*_, **__):
+        raise RuntimeError("unavailable")
+
+    if failure_point == "memory-query":
+        monkeypatch.setattr(fake_rmm, "available_device_memory", unavailable)
+    else:
+        monkeypatch.setattr(fake_rmm, "set_current_device_resource", unavailable)
+    initialized = []
+
+    _init_fused_actor(lambda: initialized.append(True))
+
+    assert fake_rmm.current is default
+    assert initialized == [True]
+
+
 def test_fake_cudf_execution_preserves_projection_row_groups_and_batching(
     ray_start_regular_shared_2_cpus, tmp_path, monkeypatch, fake_cudf, fake_rmm
 ):
@@ -541,9 +562,20 @@ def test_fake_cudf_execution_preserves_projection_row_groups_and_batching(
     assert table.column("value").to_pylist() == list(range(12))
 
 
+@pytest.mark.parametrize(
+    "filesystem",
+    [
+        pytest.param(pafs.S3FileSystem(), id="inferred-region"),
+        pytest.param(
+            pafs.S3FileSystem(region="us-east-1"),
+            id="explicit-region",
+        ),
+    ],
+)
 def test_ambient_s3_read_passes_uri_and_region_to_cudf(
-    ray_start_regular_shared_2_cpus, tmp_path, fake_cudf
+    ray_start_regular_shared_2_cpus, tmp_path, fake_cudf, filesystem, monkeypatch
 ):
+    monkeypatch.setitem(sys.modules, "s3fs", ModuleType("s3fs"))
     local_path = tmp_path / "input.parquet"
     _write_parquet(local_path, rows=2, row_group_size=2)
     s3_path = "bucket/folder/input file.parquet"
@@ -551,9 +583,7 @@ def test_ambient_s3_read_passes_uri_and_region_to_cudf(
 
     read = _make_read_files(
         local_path,
-        scanner_overrides={
-            "filesystem": pafs.S3FileSystem(region="us-east-1"),
-        },
+        scanner_overrides={"filesystem": filesystem},
     )
     fused = FuseCudfParquetReadIntoMapBatches().apply(_plan(_make_gpu_map(read)))
     assert _is_direct_cudf_read(fused.dag)
@@ -579,8 +609,39 @@ def test_ambient_s3_read_passes_uri_and_region_to_cudf(
 
     assert [call["path"] for call in fake_cudf] == [cudf_path]
     assert fake_cudf[0]["storage_options"] == {
-        "client_kwargs": {"region_name": "us-east-1"},
+        "client_kwargs": {"region_name": filesystem.region},
     }
+
+
+def test_s3_without_s3fs_decodes_with_arrow_in_actor(
+    ray_start_regular_shared_2_cpus, tmp_path, fake_cudf, monkeypatch
+):
+    path = tmp_path / "input.parquet"
+    _write_parquet(path, rows=2, row_group_size=2)
+    read = _make_read_files(path)
+    fused = FuseCudfParquetReadIntoMapBatches().apply(_plan(_make_gpu_map(read)))
+    reader = fused.dag.get_map_transformer().get_transform_fns()[0]._fn
+
+    # Exercise the transport fallback offline with the scanner's local path.
+    reader._is_s3 = True
+    monkeypatch.setitem(sys.modules, "s3fs", None)
+    manifest = FileManifest.construct_manifest(
+        [str(path)],
+        [os.path.getsize(path)],
+        [
+            {
+                "chunk_idx": 0,
+                "total_num_chunks": 1,
+                "row_group_start_idx": 0,
+                "row_group_end_idx": 1,
+                "needs_arrow_fallback": False,
+            }
+        ],
+    )
+
+    table = pa.concat_tables(reader([manifest.as_block()], None))
+    assert table.column("value").to_pylist() == [0, 1]
+    assert fake_cudf == []
 
 
 @pytest.mark.parametrize(
@@ -664,14 +725,7 @@ def test_fusion_preserves_planned_state_and_actor_options(
     read_physical = _find_read_physical(raw, read)
     downstream_transformer = raw.dag.get_map_transformer()
     (planned_batch_transform,) = downstream_transformer.get_transform_fns()
-    planned_batch_transform._target_batch_size_bytes = 12_345
-    planned_batch_transform._reports_custom_op_stats = True
 
-    def callback():
-        return {"callback": True}
-
-    raw.dag._map_task_kwargs = {"map": 2}
-    raw.dag.add_map_task_kwargs_fn(callback)
     read_physical._output_block_size_option_override = OutputBlockSizeOption.of(
         target_max_block_size=34_567
     )
@@ -688,8 +742,6 @@ def test_fusion_preserves_planned_state_and_actor_options(
         "_batch_size",
         "_batch_format",
         "_zero_copy_batch",
-        "_target_batch_size_bytes",
-        "_reports_custom_op_stats",
     ):
         assert getattr(fused_batch_transform, field) == getattr(
             planned_batch_transform, field
@@ -697,7 +749,6 @@ def test_fusion_preserves_planned_state_and_actor_options(
     assert fused_transformer._init_fn.func is _init_fused_actor
     assert fused_transformer._init_fn.args == (downstream_transformer._init_fn,)
     assert fused.dag._ray_remote_args == original_physical_remote_args
-    assert fused.dag.get_map_task_kwargs() == {"map": 2, "callback": True}
     assert fused.dag.target_max_block_size_override == 34_567
     fused_pool = fused.dag._actor_pool
     assert fused_pool.max_tasks_in_flight_per_actor() == 3
@@ -807,6 +858,8 @@ def test_nonambient_s3_configuration_fails_closed(
         "read-on-start",
         "read-task-args",
         "map-on-start",
+        "map-task-args",
+        "map-task-args-fn",
     ],
 )
 def test_ineligible_candidate_fails_closed(
@@ -853,6 +906,10 @@ def test_ineligible_candidate_fails_closed(
         _find_read_physical(raw, read)._map_task_kwargs = {"read": True}
     elif case == "map-on-start":
         raw.dag._on_start = lambda schema: None
+    elif case == "map-task-args":
+        raw.dag._map_task_kwargs = {"map": True}
+    elif case == "map-task-args-fn":
+        raw.dag.add_map_task_kwargs_fn(lambda: {"map": True})
 
     assert FuseCudfParquetReadIntoMapBatches().apply(raw) is raw
 
