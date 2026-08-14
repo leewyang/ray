@@ -489,14 +489,15 @@ def test_fused_actor_keeps_default_resource_when_async_is_unavailable(
     assert initialized == [True]
 
 
+@pytest.mark.parametrize("error_type", [AttributeError, RuntimeError, TypeError])
 @pytest.mark.parametrize("failure_point", ["memory-query", "resource-install"])
 def test_fused_actor_ignores_optional_allocator_setup_failures(
-    fake_rmm, monkeypatch, failure_point
+    fake_rmm, monkeypatch, failure_point, error_type
 ):
     default = fake_rmm.current
 
     def unavailable(*_, **__):
-        raise RuntimeError("unavailable")
+        raise error_type("unavailable")
 
     if failure_point == "memory-query":
         monkeypatch.setattr(fake_rmm, "available_device_memory", unavailable)
@@ -507,6 +508,15 @@ def test_fused_actor_ignores_optional_allocator_setup_failures(
     _init_fused_actor(lambda: initialized.append(True))
 
     assert fake_rmm.current is default
+    assert initialized == [True]
+
+
+def test_fused_actor_initializes_without_rmm(monkeypatch):
+    monkeypatch.setitem(sys.modules, "rmm", None)
+    initialized = []
+
+    _init_fused_actor(lambda: initialized.append(True))
+
     assert initialized == [True]
 
 

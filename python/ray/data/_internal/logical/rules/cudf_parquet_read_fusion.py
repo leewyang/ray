@@ -326,9 +326,9 @@ class _CudfBatchMapTransformFn(BatchMapTransformFn):
 def _init_fused_actor(init_udf: Any) -> None:
     """Reuse RMM device allocations inside the fused cuDF actor."""
 
-    import rmm
-
     try:
+        import rmm
+
         current = rmm.mr.get_current_device_resource()
         # Leave custom memory resources unchanged.
         if type(current) is rmm.mr.CudaMemoryResource:
@@ -340,7 +340,7 @@ def _init_fused_actor(init_udf: Any) -> None:
                 release_threshold=available // 4,
             )
             rmm.mr.set_current_device_resource(resource)
-    except RuntimeError:
+    except (AttributeError, ImportError, RuntimeError, TypeError):
         logger.debug("CUDA asynchronous allocation is unavailable.")
 
     init_udf()

@@ -193,8 +193,11 @@ class TableBlockAccessor(BlockAccessor):
                 "install cuDF (GPU required)."
             )
 
-        # cuDF can reject Arrow buffers backed by Ray's object store.
-        return cudf.DataFrame.from_arrow(combine_chunks(self.to_arrow(), copy=True))
+        table = self.to_arrow()
+        if self.block_type() == BlockType.ARROW:
+            # Arrow blocks can hold buffers backed by Ray's object store.
+            table = combine_chunks(table, copy=True)
+        return cudf.DataFrame.from_arrow(table)
 
     def column_names(self) -> List[str]:
         raise NotImplementedError
