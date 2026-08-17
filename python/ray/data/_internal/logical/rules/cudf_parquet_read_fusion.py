@@ -481,7 +481,7 @@ class _CudfParquetReader:
         can_read_s3_directly = self._direct_s3_read_is_available()
         storage_options = (
             {"client_kwargs": {"region_name": self._config.scanner.filesystem.region}}
-            if self._is_s3
+            if self._is_s3 and can_read_s3_directly
             else None
         )
         for manifest_block in manifest_blocks:
