@@ -437,7 +437,7 @@ def _logical_config_if_eligible(
     ):
         return None
 
-    # Reuse only a serial callable-class actor that owns one GPU.
+    # Keep GPU UDF calls serial even when actor tasks overlap reading.
     if (
         downstream.batch_format != "cudf"
         or type(downstream.compute) is not ActorPoolStrategy
@@ -458,7 +458,7 @@ def _logical_config_if_eligible(
     }:
         return None
     max_concurrency = remote_args.get("max_concurrency", 1)
-    if type(max_concurrency) is not int or max_concurrency != 1:
+    if type(max_concurrency) is not int or max_concurrency not in (1, 2, 3):
         return None
     num_gpus = remote_args.get("num_gpus")
     if type(num_gpus) not in (int, float) or num_gpus != 1:
@@ -768,7 +768,7 @@ class FuseCudfParquetReadIntoMapBatches(Rule):
         logger.debug(
             "Skipping direct cuDF Parquet read fusion for %s -> %s. Fusion "
             "requires a default local read or an S3 read using ambient AWS "
-            "credentials, followed by a serial callable-class map_batches with "
+            "credentials, followed by a synchronous callable-class map_batches with "
             "batch_format='cudf', "
             "zero_copy_batch=True, and num_gpus=1. The physical pair must also be "
             "linear, callback-free, and have no block-size override.",

@@ -385,8 +385,16 @@ def test_logical_rule_preserves_nondefault_configuration(tmp_path, case):
     assert ConfigureCudfParquetReadForFusion().apply(plan) is plan
 
 
-def test_public_dgx_shape_selects_direct_cudf_decode(
-    ray_start_regular_shared_2_cpus, tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("max_concurrency", "expected_tasks_in_flight"),
+    [(None, 2), (2, 4), (3, 6)],
+)
+def test_public_api_shape_selects_direct_cudf_decode(
+    ray_start_regular_shared_2_cpus,
+    tmp_path,
+    monkeypatch,
+    max_concurrency,
+    expected_tasks_in_flight,
 ):
     path = tmp_path / "input.parquet"
     _write_parquet(path)
@@ -394,12 +402,15 @@ def test_public_dgx_shape_selects_direct_cudf_decode(
     monkeypatch.setattr(context, "use_datasource_v2", True)
     monkeypatch.setattr(context, "enable_cudf_parquet_read_fusion", True)
 
+    remote_args = {"num_gpus": 1}
+    if max_concurrency is not None:
+        remote_args["max_concurrency"] = max_concurrency
     dataset = ray.data.read_parquet(str(path), columns=["value"]).map_batches(
         _Identity,
         batch_format="cudf",
         batch_size=4,
         compute=ActorPoolStrategy(size=1),
-        num_gpus=1,
+        **remote_args,
     )
     physical, _ = get_execution_plan(dataset._logical_plan)
     configured_list = dataset._logical_plan.dag.input_dependencies[
@@ -413,6 +424,15 @@ def test_public_dgx_shape_selects_direct_cudf_decode(
     reader = physical.dag.get_map_transformer().get_transform_fns()[0]._fn
     assert reader._config.columns == ("value",)
     assert physical.dag._ray_remote_args["num_gpus"] == 1
+    if max_concurrency is None:
+        assert "max_concurrency" not in physical.dag._ray_remote_args
+    else:
+        assert physical.dag._ray_remote_args["max_concurrency"] == max_concurrency
+    assert physical.dag._actor_pool.max_actor_concurrency() == (max_concurrency or 1)
+    assert (
+        physical.dag._actor_pool.max_tasks_in_flight_per_actor()
+        == expected_tasks_in_flight
+    )
 
 
 def test_fused_actor_uses_async_device_memory(fake_rmm):
@@ -712,8 +732,12 @@ def test_incompatible_file_uses_arrow_fallback(
 
 
 @pytest.mark.parametrize("tasks_in_flight_source", ["actor-pool", "context"])
+@pytest.mark.parametrize("max_concurrency", [1, 2, 3])
 def test_fusion_preserves_planned_udf_and_actor_pool(
-    ray_start_regular_shared_2_cpus, tmp_path, tasks_in_flight_source
+    ray_start_regular_shared_2_cpus,
+    tmp_path,
+    tasks_in_flight_source,
+    max_concurrency,
 ):
     path = tmp_path / "input.parquet"
     _write_parquet(path)
@@ -726,7 +750,7 @@ def test_fusion_preserves_planned_udf_and_actor_pool(
         context.max_tasks_in_flight_per_actor = 3
     remote_args = {
         "num_gpus": 1,
-        "max_concurrency": 1,
+        "max_concurrency": max_concurrency,
     }
     mapped = _make_gpu_map(read, compute=compute, ray_remote_args=remote_args)
     raw = _plan(mapped, context=context)
@@ -754,7 +778,7 @@ def test_fusion_preserves_planned_udf_and_actor_pool(
     assert fused.dag._ray_remote_args == original_physical_remote_args
     fused_pool = fused.dag._actor_pool
     assert fused_pool.max_tasks_in_flight_per_actor() == 3
-    assert fused_pool.max_actor_concurrency() == 1
+    assert fused_pool.max_actor_concurrency() == max_concurrency
     assert fused_pool.per_actor_resource_usage().gpu == 1
 
 
@@ -797,7 +821,8 @@ def test_nondefault_context_settings_fail_closed(
         {"num_gpus": 0.25},
         {"num_gpus": float("nan")},
         {"num_gpus": 1, "max_concurrency": True},
-        {"num_gpus": 1, "max_concurrency": 2},
+        {"num_gpus": 1, "max_concurrency": 2.0},
+        {"num_gpus": 1, "max_concurrency": 4},
     ],
 )
 def test_unsupported_remote_args_fail_closed(
