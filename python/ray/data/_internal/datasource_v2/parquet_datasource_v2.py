@@ -83,8 +83,7 @@ class ParquetDatasourceV2(DataSourceV2[FileManifest]):
         file_chunker: Optional[FileChunker] = None,
     ):
         super().__init__(name="ParquetV2", category=DatasourceCategory.FILE_BASED)
-        # Filesystem resolution erases whether the caller supplied one, which
-        # direct cuDF reads need to know.
+        # Save this before resolution so fusion can reject caller-supplied filesystems.
         self._has_custom_read_behavior = filesystem is not None
         # Capture the ``local://`` check against the *original* paths;
         # ``_resolve_paths_and_filesystem`` below strips the scheme, so

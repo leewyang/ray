@@ -545,10 +545,11 @@ class DataContext:
             driver-side first-file sampling for schema inference,
             ``ParquetScanner`` / ``ParquetFileReader``). Defaults to False — V1
             remains the production path while V2 bakes.
-        enable_cudf_parquet_read_fusion: Whether to decode compatible DataSourceV2
-            Parquet reads with cuDF inside a downstream GPU ``map_batches`` actor.
-            Fusion changes task-level batch boundaries and makes the read and UDF one
-            retry unit. Each actor reserves one GPU. Disabled by default.
+        enable_cudf_parquet_read_fusion: Whether to fuse an eligible DataSourceV2
+            Parquet read with its downstream cuDF ``map_batches`` actor. The fused
+            actor decodes each row-group range and immediately runs the UDF, so the
+            read and UDF share one task and retry boundary. Ineligible plans keep the
+            ordinary read and map operators. Disabled by default.
         parquet_chunker_target_chunk_size: Target chunk size in bytes used by
             ``ParquetFileChunker`` when splitting large Parquet files into
             multiple read tasks. When ``None``, the chunker's built-in default

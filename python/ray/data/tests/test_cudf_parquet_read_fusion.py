@@ -977,7 +977,7 @@ def test_skip_diagnostic_is_logged_once(
     assert len(calls) == 1
     message = calls[0][0][0]
     assert "positive integer batch_size" in message
-    assert "max_concurrency from 1 through 4" in message
+    assert "max_concurrency between 1 and 4" in message
 
 
 def test_lineage_op_map_and_replanning_are_stable(

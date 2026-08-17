@@ -481,8 +481,8 @@ def _infer_pyarrow_type(
     if dtype_with_timestamp_type is not None:
         return dtype_with_timestamp_type
 
-    # A nonempty 1-D NumPy array carries its fixed-width non-string type in its
-    # dtype. Skip scanning every value; objects and strings need the checks below.
+    # A 1-D NumPy array with a fixed-width non-string dtype maps directly to Arrow
+    # without scanning its values. Objects and strings need the checks below.
     if (
         type(column_values) is np.ndarray
         and column_values.ndim == 1
