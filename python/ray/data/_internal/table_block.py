@@ -182,7 +182,6 @@ class TableBlockAccessor(BlockAccessor):
 
     def to_cudf(self) -> Any:
         """Convert this block to a cudf.DataFrame (requires cudf to be installed)."""
-        from ray.data._internal.arrow_ops.transform_pyarrow import combine_chunks
         from ray.data.util.data_batch_conversion import _lazy_import_cudf
 
         cudf = _lazy_import_cudf()
@@ -193,11 +192,7 @@ class TableBlockAccessor(BlockAccessor):
                 "install cuDF (GPU required)."
             )
 
-        table = self.to_arrow()
-        if self.block_type() == BlockType.ARROW:
-            # Arrow blocks can hold buffers backed by Ray's object store.
-            table = combine_chunks(table, copy=True)
-        return cudf.DataFrame.from_arrow(table)
+        return cudf.DataFrame.from_arrow(self.to_arrow())
 
     def column_names(self) -> List[str]:
         raise NotImplementedError

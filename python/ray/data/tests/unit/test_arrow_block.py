@@ -2,7 +2,6 @@ import sys
 from typing import Union
 
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pytest
 
@@ -13,7 +12,6 @@ from ray.data._internal.arrow_block import (
     _get_max_chunk_size,
 )
 from ray.data._internal.arrow_ops.transform_pyarrow import combine_chunked_array, concat
-from ray.data._internal.pandas_block import PandasBlockAccessor
 from ray.data._internal.tensor_extensions.arrow import (
     ArrowTensorArray,
 )
@@ -219,58 +217,6 @@ def test_fill_column(input_block, fill_column_name, fill_value, expected_output_
     actual_output_block = block_accessor.fill_column(fill_column_name, fill_value)
 
     assert actual_output_block.equals(expected_output_block)
-
-
-def test_to_cudf_only_materializes_arrow_blocks(monkeypatch):
-    chunked = pa.concat_tables(
-        [
-            pa.table({"value": [1, None]}),
-            pa.table({"value": [3, 4]}),
-        ]
-    )
-    table = pa.Table.from_arrays(
-        [chunked.column("value"), pa.array([5, None, 7, 8])],
-        names=["chunked", "single"],
-    )
-    assert table.column("chunked").num_chunks == 2
-
-    source_buffer = table.column("single").chunk(0).buffers()[0]
-
-    converted = []
-
-    class FakeDataFrame:
-        @staticmethod
-        def from_arrow(table):
-            converted.append(table)
-            return table
-
-    class FakeCudf:
-        DataFrame = FakeDataFrame
-
-    monkeypatch.setattr(
-        "ray.data.util.data_batch_conversion._lazy_import_cudf", lambda: FakeCudf
-    )
-
-    result = ArrowBlockAccessor(table).to_cudf()
-
-    converted_arrow = converted.pop()
-    assert all(column.num_chunks == 1 for column in converted_arrow.columns)
-    assert (
-        converted_arrow.column("single").chunk(0).buffers()[0].address
-        != source_buffer.address
-    )
-    assert result.to_pydict() == {
-        "chunked": [1, None, 3, 4],
-        "single": [5, None, 7, 8],
-    }
-
-    pandas_table = pa.table({"value": [1, None]})
-    pandas_accessor = PandasBlockAccessor(pd.DataFrame({"value": [1, None]}))
-    monkeypatch.setattr(pandas_accessor, "to_arrow", lambda: pandas_table)
-
-    pandas_accessor.to_cudf()
-
-    assert converted == [pandas_table]
 
 
 def test_add_blocks_with_different_column_names():

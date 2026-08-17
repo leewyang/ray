@@ -77,6 +77,326 @@ class _CudfParquetReadConfig:
     retried_io_errors: Tuple[str, ...]
 
 
+class ConfigureCudfParquetReadForFusion(Rule):
+    """Choose exact row-group work units before physical planning.
+
+    Physical planning captures the ListFiles chunker before physical rules run, so
+    this pass replaces only the default chunker for an eligible linear read-map pair.
+    """
+
+    def apply(self, plan: LogicalPlan) -> LogicalPlan:
+        if getattr(plan.context, "enable_cudf_parquet_read_fusion", False) is not True:
+            return plan
+
+        consumers = _count_consumers(set(plan.dag.post_order_iter()))
+
+        def configure_map_input(operator: LogicalOperator) -> LogicalOperator:
+            if not isinstance(operator, MapBatches):
+                return operator
+            if len(operator.input_dependencies) != 1:
+                return operator
+            read = operator.input_dependencies[0]
+            if (
+                not isinstance(read, ReadFiles)
+                or consumers.get(operator, 0) > 1
+                or consumers.get(read, 0) != 1
+            ):
+                return operator
+
+            config = _logical_config_if_eligible(read, operator, plan.context)
+            if config is None:
+                return operator
+            list_files = read.input_dependencies[0]
+            if consumers.get(list_files, 0) != 1:
+                return operator
+
+            indexer = copy.deepcopy(list_files.file_indexer)
+            indexer._file_chunker = _CudfParquetFileChunker(config)
+            list_files = replace(list_files, file_indexer=indexer)
+            read = replace(read, input_dependencies=[list_files])
+            return replace(operator, input_dependencies=[read])
+
+        rewritten_dag = plan.dag._apply_transform(configure_map_input)
+        return (
+            plan
+            if rewritten_dag is plan.dag
+            else LogicalPlan(rewritten_dag, plan.context)
+        )
+
+
+class FuseCudfParquetReadIntoMapBatches(Rule):
+    """Fuse one compatible V2 Parquet read into its GPU actor consumer."""
+
+    def apply(self, plan: PhysicalPlan) -> PhysicalPlan:
+        """Rewrite every eligible read-map pair without changing the logical plan.
+
+        Return ``plan`` itself when nothing fuses.
+        """
+
+        if getattr(plan.context, "enable_cudf_parquet_read_fusion", False) is not True:
+            return plan
+
+        # Keep the input plan's operator map unchanged.
+        rewritten_op_map = plan.op_map.copy()
+        # Physical planning can introduce new sharing, so recount its consumers.
+        physical_consumers = _count_consumers(set(plan.dag.post_order_iter()))
+        # Cache rewrites so shared operators stay shared.
+        rewritten_operator_by_original: Dict[PhysicalOperator, PhysicalOperator] = {}
+        did_fuse = False
+
+        def rewrite_upstream_graph(
+            physical_op: PhysicalOperator,
+        ) -> PhysicalOperator:
+            """Return the rewritten subgraph ending at ``physical_op``."""
+
+            nonlocal did_fuse
+            if physical_op in rewritten_operator_by_original:
+                return rewritten_operator_by_original[physical_op]
+
+            # Check only the pair ending here; recursion finds earlier pairs.
+            pair = self._candidate_pair(physical_op, rewritten_op_map)
+            if pair is not None:
+                read_physical, read_logical, map_logical = pair
+                config = self._config_if_eligible(
+                    read_physical,
+                    read_logical,
+                    physical_op,
+                    map_logical,
+                    physical_consumers,
+                )
+                if config is not None:
+                    # Rewrite work before the pair, then replace the pair.
+                    rewritten_pair_input = rewrite_upstream_graph(
+                        read_physical.input_dependency
+                    )
+                    fused_physical_op, fused_logical_op = self._create_fused_operator(
+                        read_physical,
+                        read_logical,
+                        physical_op,
+                        map_logical,
+                        rewritten_pair_input,
+                        plan,
+                        config,
+                    )
+                    rewritten_op_map.pop(read_physical)
+                    rewritten_op_map.pop(physical_op)
+                    rewritten_op_map[fused_physical_op] = fused_logical_op
+                    rewritten_operator_by_original[physical_op] = fused_physical_op
+                    did_fuse = True
+                    return fused_physical_op
+                self._log_skip_once(physical_op, read_logical, map_logical)
+
+            # No replacement ends here, so rewrite each input.
+            rewritten_inputs = []
+            inputs_changed = False
+            for input_op in physical_op.input_dependencies:
+                rewritten_input = rewrite_upstream_graph(input_op)
+                rewritten_inputs.append(rewritten_input)
+                if rewritten_input is not input_op:
+                    inputs_changed = True
+            if inputs_changed:
+                # Output links are rebuilt after all input links are final.
+                physical_op._input_dependencies = rewritten_inputs
+            rewritten_operator_by_original[physical_op] = physical_op
+            return physical_op
+
+        rewritten_final_operator = rewrite_upstream_graph(plan.dag)
+        if not did_fuse:
+            return plan
+        self._rebuild_output_dependencies(rewritten_final_operator)
+        return PhysicalPlan(rewritten_final_operator, rewritten_op_map, plan.context)
+
+    @staticmethod
+    def _candidate_pair(
+        downstream: PhysicalOperator,
+        op_map: Mapping[PhysicalOperator, LogicalOperator],
+    ) -> Optional[Tuple[MapOperator, ReadFiles, MapBatches]]:
+        logical = op_map.get(downstream)
+        if (
+            not isinstance(logical, MapBatches)
+            or logical.batch_format != "cudf"
+            or len(downstream.input_dependencies) != 1
+        ):
+            return None
+        upstream = downstream.input_dependencies[0]
+        upstream_logical = op_map.get(upstream)
+        if not isinstance(upstream_logical, ReadFiles) or not isinstance(
+            upstream, MapOperator
+        ):
+            return None
+        return upstream, upstream_logical, logical
+
+    @staticmethod
+    def _config_if_eligible(
+        read_physical: MapOperator,
+        read_logical: ReadFiles,
+        downstream_physical: PhysicalOperator,
+        downstream_logical: MapBatches,
+        physical_consumers: Mapping[PhysicalOperator, int],
+    ) -> Optional[_CudfParquetReadConfig]:
+        """Return the read config when planning preserved the eligible pair.
+
+        The configured chunker proves that the logical rule accepted the pair. This
+        method checks only state added or changed by physical planning.
+        """
+
+        # Exact ranges are added by the logical rule before physical planning.
+        list_files = read_logical.input_dependencies[0]
+        chunker = list_files.file_indexer.file_chunker
+        if type(chunker) is not _CudfParquetFileChunker:
+            return None
+
+        # The read must be an ordinary, unshared V2 read.
+        read_transforms = read_physical.get_map_transformer().get_transform_fns()
+        if (
+            not isinstance(read_physical, TaskPoolMapOperator)
+            or not read_physical.supports_fusion()
+            or read_physical.get_max_concurrency_limit() is not None
+            or read_physical.get_additional_split_factor() != 1
+            or read_physical._on_start is not None
+            or read_physical._map_task_kwargs
+            or read_physical._map_task_kwargs_fns
+            or len(read_transforms) != 1
+            or type(read_transforms[0]) is not BlockMapTransformFn
+            or physical_consumers.get(read_physical, 0) != 1
+        ):
+            return None
+
+        # The physical pair must still match the logical actor-read shape.
+        if (
+            not isinstance(downstream_physical, ActorPoolMapOperator)
+            or not downstream_physical.supports_fusion()
+            or downstream_physical.get_additional_split_factor() != 1
+            or downstream_physical._on_start is not None
+            or downstream_physical._map_task_kwargs
+            or downstream_physical._map_task_kwargs_fns
+        ):
+            return None
+
+        downstream_transformer = downstream_physical.get_map_transformer()
+        transforms = downstream_transformer.get_transform_fns()
+        if len(transforms) != 1 or type(transforms[0]) is not BatchMapTransformFn:
+            return None
+        planned_batch_transform = transforms[0]
+        if (
+            planned_batch_transform._batch_format != "cudf"
+            or planned_batch_transform._batch_size != downstream_logical.batch_size
+        ):
+            return None
+
+        if (
+            read_physical.target_max_block_size_override is not None
+            or downstream_physical.target_max_block_size_override is not None
+        ):
+            return None
+
+        return chunker._config
+
+    @staticmethod
+    def _create_fused_operator(
+        read_physical: MapOperator,
+        read_logical: ReadFiles,
+        downstream_physical: PhysicalOperator,
+        downstream_logical: MapBatches,
+        input_physical_op: PhysicalOperator,
+        plan: PhysicalPlan,
+        config: _CudfParquetReadConfig,
+    ) -> Tuple[MapOperator, MapBatches]:
+        """Create one actor map that reads manifests and runs the planned GPU UDF.
+
+        The standard planner cannot batch cuDF frames read from manifests, so preserve
+        its planned UDF transform and replace only the input reader and batcher.
+        """
+
+        assert isinstance(downstream_physical, ActorPoolMapOperator)
+        downstream_transformer = downstream_physical.get_map_transformer()
+        (planned_batch_transform,) = downstream_transformer.get_transform_fns()
+        output_option = downstream_transformer._output_block_size_option_override
+
+        fused_map_transformer = MapTransformer(
+            [
+                BlockMapTransformFn(
+                    _CudfParquetReader(config),
+                    disable_block_shaping=True,
+                ),
+                _CudfBatchMapTransformFn(planned_batch_transform),
+            ],
+            init_fn=functools.partial(
+                _init_fused_actor, downstream_transformer._init_fn
+            ),
+            output_block_size_option_override=(
+                replace(output_option) if output_option is not None else None
+            ),
+        )
+
+        name = f"{read_physical.name}->{downstream_physical.name}"
+
+        fused_physical_op = MapOperator.create(
+            fused_map_transformer,
+            input_physical_op,
+            plan.context,
+            name=name,
+            compute_strategy=downstream_logical.compute,
+            # The input rows are manifest entries, not decoded dataset rows.
+            min_rows_per_bundle=None,
+            # Do not offer this custom transform to another fusion rule.
+            supports_fusion=False,
+            ray_remote_args=dict(downstream_logical.ray_remote_args),
+        )
+
+        # Keep original operators as lineage only; op_map gets a synthetic node.
+        fused_physical_op.set_logical_operators(read_logical, downstream_logical)
+        fused_logical_op = replace(
+            downstream_logical,
+            input_dependencies=list(read_logical.input_dependencies),
+            # Relative to ListFiles, this operator expands manifest entries into
+            # decoded dataset rows even when the user UDF preserves row count.
+            can_modify_num_rows=True,
+            min_rows_per_bundled_input=None,
+            ray_remote_args=dict(downstream_logical.ray_remote_args),
+        )
+        object.__setattr__(fused_logical_op, "_name", name)
+        return fused_physical_op, fused_logical_op
+
+    @staticmethod
+    def _log_skip_once(
+        physical: PhysicalOperator,
+        read: ReadFiles,
+        downstream: MapBatches,
+    ) -> None:
+        if getattr(physical, _DIAGNOSTIC_LOGGED_ATTR, False):
+            return
+        logger.debug(
+            "Skipping direct cuDF Parquet read fusion for %s -> %s. Fusion "
+            "requires a default local read or an S3 read using ambient AWS "
+            "credentials, followed by a synchronous callable-class map_batches with "
+            "batch_format='cudf', a positive integer batch_size, "
+            "zero_copy_batch=True, num_gpus=1, and max_concurrency from 1 through "
+            "4 when set. The physical pair must also be "
+            "linear, callback-free, and have no block-size override.",
+            read.name,
+            downstream.name,
+        )
+        setattr(physical, _DIAGNOSTIC_LOGGED_ATTR, True)
+
+    @staticmethod
+    def _rebuild_output_dependencies(
+        final_physical_operator: PhysicalOperator,
+    ) -> None:
+        """Rebuild reverse links after rewriting input dependencies.
+
+        Ray stores every edge in both directions, but traversal updates only consumer
+        input links. Treat those links as authoritative and recreate producer links.
+        """
+
+        physical_operators = set(final_physical_operator.post_order_iter())
+        for physical_op in physical_operators:
+            physical_op._output_dependencies = []
+        for physical_op in physical_operators:
+            for input_physical_op in physical_op.input_dependencies:
+                input_physical_op._output_dependencies.append(physical_op)
+
+
 class _CudfParquetFileChunker(FileChunker):
     """Split one Parquet file into GPU-sized row-group ranges."""
 
@@ -159,6 +479,11 @@ class _CudfParquetReader:
         import cudf
 
         can_read_s3_directly = self._direct_s3_read_is_available()
+        storage_options = (
+            {"client_kwargs": {"region_name": self._config.scanner.filesystem.region}}
+            if self._is_s3
+            else None
+        )
         for manifest_block in manifest_blocks:
             manifest = FileManifest(manifest_block)
             for path, size, chunk_metadata in zip(
@@ -169,7 +494,12 @@ class _CudfParquetReader:
                 path = str(path)
                 if chunk_metadata["needs_arrow_fallback"] or not can_read_s3_directly:
                     # Preserve Arrow's schema and partition handling in this actor.
-                    yield from self._read_with_arrow(path, int(size), chunk_metadata)
+                    single_file = FileManifest.construct_manifest(
+                        [path], [int(size)], [chunk_metadata]
+                    )
+                    for table in self._config.scanner.create_reader().read(single_file):
+                        if table.num_rows:
+                            yield table
                     continue
 
                 # PyArrow stores S3 paths without a scheme; cuDF expects an S3 URI.
@@ -185,7 +515,7 @@ class _CudfParquetReader:
                         cudf_path,
                         columns=list(self._config.columns),
                         row_groups=row_groups,
-                        storage_options=self._s3_storage_options(),
+                        storage_options=storage_options,
                         use_pandas_metadata=False,
                         dataset_kwargs={"partitioning": None},
                     ),
@@ -209,27 +539,6 @@ class _CudfParquetReader:
             else:
                 self._can_read_s3_directly = True
         return self._can_read_s3_directly
-
-    def _s3_storage_options(self) -> Optional[Dict[str, Any]]:
-        if not self._is_s3:
-            return None
-        # Let s3fs discover and refresh the actor's ambient AWS credentials.
-        return {
-            "client_kwargs": {"region_name": self._config.scanner.filesystem.region},
-        }
-
-    def _read_with_arrow(
-        self,
-        path: str,
-        size: int,
-        chunk_metadata: ChunkMetadata,
-    ) -> Iterator[pa.Table]:
-        """Run one manifest entry through the original V2 reader in this actor."""
-
-        single_file = FileManifest.construct_manifest([path], [size], [chunk_metadata])
-        for table in self._config.scanner.create_reader().read(single_file):
-            if table.num_rows:
-                yield table
 
 
 class _CudfBatchMapTransformFn(BatchMapTransformFn):
@@ -452,13 +761,14 @@ def _logical_config_if_eligible(
         return None
 
     remote_args = downstream.ray_remote_args
+    # Actor-option allow-list: add an option only when fusion preserves its behavior.
     if type(remote_args) is not dict or set(remote_args) - {
         "max_concurrency",
         "num_gpus",
     }:
         return None
     max_concurrency = remote_args.get("max_concurrency", 1)
-    if type(max_concurrency) is not int or max_concurrency not in (1, 2, 3):
+    if type(max_concurrency) is not int or max_concurrency not in (1, 2, 3, 4):
         return None
     num_gpus = remote_args.get("num_gpus")
     if type(num_gpus) not in (int, float) or num_gpus != 1:
@@ -470,326 +780,3 @@ def _logical_config_if_eligible(
         batch_size=downstream.batch_size,
         retried_io_errors=tuple(context.retried_io_errors),
     )
-
-
-class ConfigureCudfParquetReadForFusion(Rule):
-    """Choose exact row-group work units before physical planning.
-
-    Physical planning captures the ListFiles chunker before physical rules run, so
-    this pass replaces only the default chunker for an eligible linear read-map pair.
-    """
-
-    def apply(self, plan: LogicalPlan) -> LogicalPlan:
-        if getattr(plan.context, "enable_cudf_parquet_read_fusion", False) is not True:
-            return plan
-
-        consumers = _count_consumers(set(plan.dag.post_order_iter()))
-
-        def configure_map_input(operator: LogicalOperator) -> LogicalOperator:
-            if not isinstance(operator, MapBatches):
-                return operator
-            if len(operator.input_dependencies) != 1:
-                return operator
-            read = operator.input_dependencies[0]
-            if (
-                not isinstance(read, ReadFiles)
-                or consumers.get(operator, 0) > 1
-                or consumers.get(read, 0) != 1
-            ):
-                return operator
-
-            config = _logical_config_if_eligible(read, operator, plan.context)
-            if config is None:
-                return operator
-            list_files = read.input_dependencies[0]
-            if consumers.get(list_files, 0) != 1:
-                return operator
-
-            indexer = copy.deepcopy(list_files.file_indexer)
-            indexer._file_chunker = _CudfParquetFileChunker(config)
-            list_files = replace(list_files, file_indexer=indexer)
-            read = replace(read, input_dependencies=[list_files])
-            return replace(operator, input_dependencies=[read])
-
-        rewritten_dag = plan.dag._apply_transform(configure_map_input)
-        return (
-            plan
-            if rewritten_dag is plan.dag
-            else LogicalPlan(rewritten_dag, plan.context)
-        )
-
-
-class FuseCudfParquetReadIntoMapBatches(Rule):
-    """Fuse one compatible V2 Parquet read into its GPU actor consumer."""
-
-    def apply(self, plan: PhysicalPlan) -> PhysicalPlan:
-        """Rewrite every eligible read-map pair without changing the logical plan.
-
-        Return ``plan`` itself when nothing fuses.
-        """
-
-        if getattr(plan.context, "enable_cudf_parquet_read_fusion", False) is not True:
-            return plan
-
-        # Keep the input plan's operator map unchanged.
-        rewritten_op_map = plan.op_map.copy()
-        # Check both graphs because physical planning can copy logical operators.
-        logical_consumers = _count_consumers(set(rewritten_op_map.values()))
-        physical_consumers = _count_consumers(set(plan.dag.post_order_iter()))
-        # Cache rewrites so shared operators stay shared.
-        rewritten_operator_by_original: Dict[PhysicalOperator, PhysicalOperator] = {}
-        did_fuse = False
-
-        def rewrite_upstream_graph(
-            physical_op: PhysicalOperator,
-        ) -> PhysicalOperator:
-            """Return the rewritten subgraph ending at ``physical_op``."""
-
-            nonlocal did_fuse
-            if physical_op in rewritten_operator_by_original:
-                return rewritten_operator_by_original[physical_op]
-
-            # Check only the pair ending here; recursion finds earlier pairs.
-            pair = self._candidate_pair(physical_op, rewritten_op_map)
-            if pair is not None:
-                read_physical, read_logical, map_logical = pair
-                config = self._config_if_eligible(
-                    read_physical,
-                    read_logical,
-                    physical_op,
-                    map_logical,
-                    logical_consumers,
-                    physical_consumers,
-                )
-                if config is not None:
-                    # Rewrite work before the pair, then replace the pair.
-                    rewritten_pair_input = rewrite_upstream_graph(
-                        read_physical.input_dependency
-                    )
-                    fused_physical_op, fused_logical_op = self._create_fused_operator(
-                        read_physical,
-                        read_logical,
-                        physical_op,
-                        map_logical,
-                        rewritten_pair_input,
-                        plan,
-                        config,
-                    )
-                    rewritten_op_map.pop(read_physical)
-                    rewritten_op_map.pop(physical_op)
-                    rewritten_op_map[fused_physical_op] = fused_logical_op
-                    rewritten_operator_by_original[physical_op] = fused_physical_op
-                    did_fuse = True
-                    return fused_physical_op
-                self._log_skip_once(physical_op, read_logical, map_logical)
-
-            # No replacement ends here, so rewrite each input.
-            rewritten_inputs = []
-            inputs_changed = False
-            for input_op in physical_op.input_dependencies:
-                rewritten_input = rewrite_upstream_graph(input_op)
-                rewritten_inputs.append(rewritten_input)
-                if rewritten_input is not input_op:
-                    inputs_changed = True
-            if inputs_changed:
-                # Output links are rebuilt after all input links are final.
-                physical_op._input_dependencies = rewritten_inputs
-            rewritten_operator_by_original[physical_op] = physical_op
-            return physical_op
-
-        rewritten_final_operator = rewrite_upstream_graph(plan.dag)
-        if not did_fuse:
-            return plan
-        self._rebuild_output_dependencies(rewritten_final_operator)
-        return PhysicalPlan(rewritten_final_operator, rewritten_op_map, plan.context)
-
-    @staticmethod
-    def _candidate_pair(
-        downstream: PhysicalOperator,
-        op_map: Mapping[PhysicalOperator, LogicalOperator],
-    ) -> Optional[Tuple[MapOperator, ReadFiles, MapBatches]]:
-        logical = op_map.get(downstream)
-        if (
-            not isinstance(logical, MapBatches)
-            or logical.batch_format != "cudf"
-            or len(downstream.input_dependencies) != 1
-        ):
-            return None
-        upstream = downstream.input_dependencies[0]
-        upstream_logical = op_map.get(upstream)
-        if not isinstance(upstream_logical, ReadFiles) or not isinstance(
-            upstream, MapOperator
-        ):
-            return None
-        return upstream, upstream_logical, logical
-
-    @staticmethod
-    def _config_if_eligible(
-        read_physical: MapOperator,
-        read_logical: ReadFiles,
-        downstream_physical: PhysicalOperator,
-        downstream_logical: MapBatches,
-        logical_consumers: Mapping[LogicalOperator, int],
-        physical_consumers: Mapping[PhysicalOperator, int],
-    ) -> Optional[_CudfParquetReadConfig]:
-        """Return the read config when planning preserved the eligible pair.
-
-        The configured chunker proves that the logical rule accepted the pair. This
-        method checks only state added or changed by physical planning.
-        """
-
-        # Exact ranges are added by the logical rule before physical planning.
-        list_files = read_logical.input_dependencies[0]
-        chunker = list_files.file_indexer.file_chunker
-        if type(chunker) is not _CudfParquetFileChunker:
-            return None
-
-        # The read must be an ordinary, unshared V2 read.
-        read_transforms = read_physical.get_map_transformer().get_transform_fns()
-        if (
-            not isinstance(read_physical, TaskPoolMapOperator)
-            or not read_physical.supports_fusion()
-            or read_physical.get_max_concurrency_limit() is not None
-            or read_physical.get_additional_split_factor() != 1
-            or read_physical._on_start is not None
-            or read_physical._map_task_kwargs
-            or read_physical._map_task_kwargs_fns
-            or len(read_transforms) != 1
-            or type(read_transforms[0]) is not BlockMapTransformFn
-            or logical_consumers.get(read_logical, 0) != 1
-            or physical_consumers.get(read_physical, 0) != 1
-        ):
-            return None
-
-        # The physical pair must still match the logical actor-read shape.
-        if (
-            not isinstance(downstream_physical, ActorPoolMapOperator)
-            or not downstream_physical.supports_fusion()
-            or downstream_physical.get_additional_split_factor() != 1
-            or downstream_physical._on_start is not None
-            or downstream_physical._map_task_kwargs
-            or downstream_physical._map_task_kwargs_fns
-        ):
-            return None
-
-        downstream_transformer = downstream_physical.get_map_transformer()
-        transforms = downstream_transformer.get_transform_fns()
-        if len(transforms) != 1 or type(transforms[0]) is not BatchMapTransformFn:
-            return None
-        planned_batch_transform = transforms[0]
-        if (
-            planned_batch_transform._batch_format != "cudf"
-            or planned_batch_transform._batch_size != downstream_logical.batch_size
-        ):
-            return None
-
-        if (
-            read_physical.target_max_block_size_override is not None
-            or downstream_physical.target_max_block_size_override is not None
-        ):
-            return None
-
-        return chunker._config
-
-    @staticmethod
-    def _create_fused_operator(
-        read_physical: MapOperator,
-        read_logical: ReadFiles,
-        downstream_physical: PhysicalOperator,
-        downstream_logical: MapBatches,
-        input_physical_op: PhysicalOperator,
-        plan: PhysicalPlan,
-        config: _CudfParquetReadConfig,
-    ) -> Tuple[MapOperator, MapBatches]:
-        """Create one actor map that reads manifests and runs the planned GPU UDF.
-
-        The standard planner cannot batch cuDF frames read from manifests, so preserve
-        its planned UDF transform and replace only the input reader and batcher.
-        """
-
-        assert isinstance(downstream_physical, ActorPoolMapOperator)
-        downstream_transformer = downstream_physical.get_map_transformer()
-        (planned_batch_transform,) = downstream_transformer.get_transform_fns()
-        output_option = downstream_transformer._output_block_size_option_override
-
-        fused_map_transformer = MapTransformer(
-            [
-                BlockMapTransformFn(
-                    _CudfParquetReader(config),
-                    disable_block_shaping=True,
-                ),
-                _CudfBatchMapTransformFn(planned_batch_transform),
-            ],
-            init_fn=functools.partial(
-                _init_fused_actor, downstream_transformer._init_fn
-            ),
-            output_block_size_option_override=(
-                replace(output_option) if output_option is not None else None
-            ),
-        )
-
-        name = f"{read_physical.name}->{downstream_physical.name}"
-
-        fused_physical_op = MapOperator.create(
-            fused_map_transformer,
-            input_physical_op,
-            plan.context,
-            name=name,
-            compute_strategy=downstream_logical.compute,
-            # The input rows are manifest entries, not decoded dataset rows.
-            min_rows_per_bundle=None,
-            # Do not offer this custom transform to another fusion rule.
-            supports_fusion=False,
-            ray_remote_args=dict(downstream_logical.ray_remote_args),
-        )
-
-        # Keep original operators as lineage only; op_map gets a synthetic node.
-        fused_physical_op.set_logical_operators(read_logical, downstream_logical)
-        fused_logical_op = replace(
-            downstream_logical,
-            input_dependencies=list(read_logical.input_dependencies),
-            # Relative to ListFiles, this operator expands manifest entries into
-            # decoded dataset rows even when the user UDF preserves row count.
-            can_modify_num_rows=True,
-            min_rows_per_bundled_input=None,
-            ray_remote_args=dict(downstream_logical.ray_remote_args),
-        )
-        object.__setattr__(fused_logical_op, "_name", name)
-        return fused_physical_op, fused_logical_op
-
-    @staticmethod
-    def _log_skip_once(
-        physical: PhysicalOperator,
-        read: ReadFiles,
-        downstream: MapBatches,
-    ) -> None:
-        if getattr(physical, _DIAGNOSTIC_LOGGED_ATTR, False):
-            return
-        logger.debug(
-            "Skipping direct cuDF Parquet read fusion for %s -> %s. Fusion "
-            "requires a default local read or an S3 read using ambient AWS "
-            "credentials, followed by a synchronous callable-class map_batches with "
-            "batch_format='cudf', "
-            "zero_copy_batch=True, and num_gpus=1. The physical pair must also be "
-            "linear, callback-free, and have no block-size override.",
-            read.name,
-            downstream.name,
-        )
-        setattr(physical, _DIAGNOSTIC_LOGGED_ATTR, True)
-
-    @staticmethod
-    def _rebuild_output_dependencies(
-        final_physical_operator: PhysicalOperator,
-    ) -> None:
-        """Rebuild reverse links after rewriting input dependencies.
-
-        Ray stores every edge in both directions, but traversal updates only consumer
-        input links. Treat those links as authoritative and recreate producer links.
-        """
-
-        physical_operators = set(final_physical_operator.post_order_iter())
-        for physical_op in physical_operators:
-            physical_op._output_dependencies = []
-        for physical_op in physical_operators:
-            for input_physical_op in physical_op.input_dependencies:
-                input_physical_op._output_dependencies.append(physical_op)

@@ -548,9 +548,7 @@ class DataContext:
         enable_cudf_parquet_read_fusion: Whether to decode compatible DataSourceV2
             Parquet reads with cuDF inside a downstream GPU ``map_batches`` actor.
             Fusion changes task-level batch boundaries and makes the read and UDF one
-            retry unit. Each actor reserves one GPU. If RMM still uses its standard
-            CUDA resource, the actor uses asynchronous allocation and releases excess
-            unused pool memory at synchronization points. Disabled by default.
+            retry unit. Each actor reserves one GPU. Disabled by default.
         parquet_chunker_target_chunk_size: Target chunk size in bytes used by
             ``ParquetFileChunker`` when splitting large Parquet files into
             multiple read tasks. When ``None``, the chunker's built-in default

@@ -387,7 +387,7 @@ def test_logical_rule_preserves_nondefault_configuration(tmp_path, case):
 
 @pytest.mark.parametrize(
     ("max_concurrency", "expected_tasks_in_flight"),
-    [(None, 2), (2, 4), (3, 6)],
+    [(None, 2), (2, 4), (3, 6), (4, 8)],
 )
 def test_public_api_shape_selects_direct_cudf_decode(
     ray_start_regular_shared_2_cpus,
@@ -732,7 +732,7 @@ def test_incompatible_file_uses_arrow_fallback(
 
 
 @pytest.mark.parametrize("tasks_in_flight_source", ["actor-pool", "context"])
-@pytest.mark.parametrize("max_concurrency", [1, 2, 3])
+@pytest.mark.parametrize("max_concurrency", [1, 2, 3, 4])
 def test_fusion_preserves_planned_udf_and_actor_pool(
     ray_start_regular_shared_2_cpus,
     tmp_path,
@@ -822,7 +822,7 @@ def test_nondefault_context_settings_fail_closed(
         {"num_gpus": float("nan")},
         {"num_gpus": 1, "max_concurrency": True},
         {"num_gpus": 1, "max_concurrency": 2.0},
-        {"num_gpus": 1, "max_concurrency": 4},
+        {"num_gpus": 1, "max_concurrency": 5},
     ],
 )
 def test_unsupported_remote_args_fail_closed(
@@ -975,6 +975,9 @@ def test_skip_diagnostic_is_logged_once(
     assert rule.apply(raw) is raw
     rule.apply(raw)
     assert len(calls) == 1
+    message = calls[0][0][0]
+    assert "positive integer batch_size" in message
+    assert "max_concurrency from 1 through 4" in message
 
 
 def test_lineage_op_map_and_replanning_are_stable(
