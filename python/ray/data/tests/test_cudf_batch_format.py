@@ -9,14 +9,24 @@ https://docs.rapids.ai/api/cudf/latest/developer_guide/testing/).
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import ray
 from ray.data._internal.block_batching.block_batching import batch_blocks
+from ray.data._internal.logical.optimizers import get_execution_plan
+from ray.data._internal.logical.rules.cudf_parquet_read_fusion import (
+    _CudfParquetReader,
+)
 from ray.data.expressions import col
 from ray.data.tests.conftest import *  # noqa
 
 cudf = pytest.importorskip("cudf")
+
+
+class _IncrementValue:
+    def __call__(self, batch):
+        return batch.assign(value=batch["value"] + 1)
 
 
 def block_generator(num_rows: int, num_blocks: int):
@@ -285,6 +295,29 @@ class TestCudfAddColumn:
             {"id": 3, "doubled": 6},
             {"id": 4, "doubled": 8},
         ]
+
+
+def test_read_parquet_map_batches_direct_cudf_fusion(
+    ray_start_regular_shared, tmp_path, monkeypatch
+):
+    path = tmp_path / "input.parquet"
+    pq.write_table(pa.table({"value": list(range(10))}), path, row_group_size=2)
+
+    context = ray.data.DataContext.get_current()
+    monkeypatch.setattr(context, "use_datasource_v2", True)
+    monkeypatch.setattr(context, "enable_cudf_parquet_read_fusion", True)
+
+    dataset = ray.data.read_parquet(str(path)).map_batches(
+        _IncrementValue,
+        batch_format="cudf",
+        batch_size=3,
+        num_gpus=1,
+    )
+    physical_plan, _ = get_execution_plan(dataset._logical_plan)
+    transforms = physical_plan.dag.get_map_transformer().get_transform_fns()
+
+    assert isinstance(transforms[0]._fn, _CudfParquetReader)
+    assert dataset.take_all() == [{"value": value} for value in range(1, 11)]
 
 
 if __name__ == "__main__":

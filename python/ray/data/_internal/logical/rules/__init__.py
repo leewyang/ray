@@ -6,6 +6,10 @@ from .configure_map_task_memory import (
     ConfigureMapTaskMemoryRule,
     ConfigureMapTaskMemoryUsingOutputSize,
 )
+from .cudf_parquet_read_fusion import (
+    ConfigureCudfParquetReadForFusion,
+    FuseCudfParquetReadIntoMapBatches,
+)
 from .inherit_target_max_block_size import InheritTargetMaxBlockSizeRule
 from .limit_pushdown import LimitPushdownRule
 from .operator_fusion import FuseOperators, are_remote_args_compatible
@@ -22,6 +26,8 @@ __all__ = [
     "CommonSubExprElimination",
     "ConfigureMapTaskMemoryRule",
     "ConfigureMapTaskMemoryUsingOutputSize",
+    "ConfigureCudfParquetReadForFusion",
+    "FuseCudfParquetReadIntoMapBatches",
     "FuseOperators",
     "InheritTargetMaxBlockSizeRule",
     "LimitPushdownRule",

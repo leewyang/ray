@@ -15,7 +15,9 @@ from ray.data._internal.logical.interfaces import (
 from ray.data._internal.logical.rules import (
     CombineShuffles,
     CommonSubExprElimination,
+    ConfigureCudfParquetReadForFusion,
     ConfigureMapTaskMemoryUsingOutputSize,
+    FuseCudfParquetReadIntoMapBatches,
     FuseOperators,
     InheritTargetMaxBlockSizeRule,
     LimitPushdownRule,
@@ -33,6 +35,7 @@ _LOGICAL_RULESET = Ruleset(
         PredicatePushdown,
         CombineShuffles,
         PushdownCountFiles,
+        ConfigureCudfParquetReadForFusion,
     ]
 )
 
@@ -40,6 +43,7 @@ _PHYSICAL_RULESET = Ruleset(
     [
         InheritTargetMaxBlockSizeRule,
         SetReadParallelismRule,
+        FuseCudfParquetReadIntoMapBatches,
         FuseOperators,
         ConfigureMapTaskMemoryUsingOutputSize,
     ]

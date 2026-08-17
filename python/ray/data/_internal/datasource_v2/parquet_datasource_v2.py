@@ -83,6 +83,8 @@ class ParquetDatasourceV2(DataSourceV2[FileManifest]):
         file_chunker: Optional[FileChunker] = None,
     ):
         super().__init__(name="ParquetV2", category=DatasourceCategory.FILE_BASED)
+        # Save this before resolution so fusion can reject caller-supplied filesystems.
+        self._has_custom_read_behavior = filesystem is not None
         # Capture the ``local://`` check against the *original* paths;
         # ``_resolve_paths_and_filesystem`` below strips the scheme, so
         # introspecting ``self._paths`` after construction can't tell a
@@ -305,5 +307,11 @@ class ParquetDatasourceV2(DataSourceV2[FileManifest]):
             shuffle=self._shuffle,
             ignore_prefixes=options.get("ignore_prefixes"),
             target_block_size=DataContext.get_current().target_max_block_size,
+            has_custom_read_behavior=bool(
+                self._has_custom_read_behavior
+                or self._user_schema is not None
+                or self._arrow_parquet_args
+                or self._parquet_format_kwargs
+            ),
             parquet_format_kwargs=dict(self._parquet_format_kwargs),
         )
