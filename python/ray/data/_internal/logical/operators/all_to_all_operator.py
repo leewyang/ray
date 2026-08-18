@@ -1,5 +1,5 @@
 from dataclasses import InitVar, dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 from ray.data._internal.logical.interfaces import (
     LogicalOperator,
@@ -189,11 +189,18 @@ class Sort(
     """Logical operator for sort."""
 
     sort_key: SortKey
+    backend: Literal["cpu", "gpu"] = "cpu"
     ray_remote_args: Dict[str, Any] = field(default_factory=dict)
     sub_progress_bar_names: Optional[List[str]] = None
     input_dependencies: List[LogicalOperator] = field(repr=False, kw_only=True)
 
     def __post_init__(self):
+        if self.backend not in ("cpu", "gpu"):
+            raise ValueError(
+                f"`backend` must be either 'cpu' or 'gpu', but got {self.backend!r}."
+            )
+        if self.backend == "gpu" and self.sort_key.boundaries is not None:
+            raise ValueError("GPU sort does not support explicit `boundaries`.")
         assert len(self.input_dependencies) == 1, len(self.input_dependencies)
         object.__setattr__(
             self,
