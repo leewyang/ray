@@ -80,6 +80,7 @@ class CombineShuffles(Rule):
         elif isinstance(input_op, Sort) and isinstance(op, Sort):
             return Sort(
                 sort_key=op.sort_key,
+                backend=op.backend,
                 input_dependencies=[input_op.input_dependencies[0]],
             )
 
