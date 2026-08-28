@@ -340,6 +340,16 @@ def plan_all_to_all_op(
         )
 
     elif isinstance(op, Sort):
+        if op.backend == "gpu":
+            # Keep RAPIDS dependencies optional for every CPU-only Ray Data
+            # process. Importing this module doesn't initialize CUDA.
+            from ray.data._internal.gpu_sort.operator import GPUSortOperator
+
+            return GPUSortOperator(
+                input_physical_dag,
+                data_context,
+                sort_key=op.sort_key,
+            )
         debug_limit_shuffle_execution_to_num_blocks = data_context.get_config(
             "debug_limit_shuffle_execution_to_num_blocks", None
         )

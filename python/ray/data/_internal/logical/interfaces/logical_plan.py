@@ -38,9 +38,13 @@ class LogicalPlan(Plan):
 
     def require_preserve_order(self) -> bool:
         """Whether this plan requires to preserve order."""
-        from ray.data._internal.logical.operators import Zip
+        from ray.data._internal.logical.operators import Sort, Zip
 
-        return any(isinstance(op, Zip) for op in self.dag.post_order_iter())
+        # GPU sort seeds its deterministic sample with logical block ordinals.
+        return any(
+            isinstance(op, Zip) or (isinstance(op, Sort) and op.backend == "gpu")
+            for op in self.dag.post_order_iter()
+        )
 
     def input_files(self) -> Optional[List[str]]:
         """Get the input files of the dataset, if available."""
