@@ -4269,6 +4269,8 @@ class Dataset:
         key: Union[str, List[str]],
         descending: Union[bool, List[bool]] = False,
         boundaries: List[Union[int, float]] = None,
+        *,
+        backend: Literal["cpu", "gpu"] = "cpu",
     ) -> "Dataset":
         """Sort the dataset by the specified key column or key function.
         The `key` parameter must be specified (i.e., it cannot be `None`).
@@ -4316,19 +4318,59 @@ class Dataset:
                 will be divided into the third block. If not provided, the
                 boundaries will be sampled from the input blocks. This feature
                 only supports numeric columns right now.
+            backend: ``"cpu"`` uses Ray Data's standard distributed sort.
+                ``"gpu"`` uses the experimental distributed GPU sort. GPU
+                dependencies are imported only when this backend executes.
 
         Returns:
             A new, sorted :class:`Dataset`.
 
         Raises:
-            ``ValueError``: if the sort key is None.
+            ``ValueError``: if the sort key is None or ``backend`` is invalid.
         """
         if key is None:
             raise ValueError("The 'key' parameter cannot be None for sorting.")
+        if backend not in ("cpu", "gpu"):
+            raise ValueError(
+                f"`backend` must be either 'cpu' or 'gpu', but got {backend!r}."
+            )
+        if backend == "gpu" and boundaries is not None:
+            raise ValueError("GPU sort does not support explicit `boundaries`.")
+
+        # Reject schemas that the GPU implementation cannot round-trip before
+        # actor startup whenever upstream metadata makes the schema available.
+        # The operator repeats this validation after materialization for plans
+        # whose schema is not known yet.
+        if backend == "gpu":
+            schema = self.schema(fetch_if_missing=False)
+            base_schema = getattr(schema, "base_schema", None)
+            if base_schema is not None:
+                import pyarrow as pa
+
+                if not isinstance(base_schema, pa.Schema):
+                    raise NotImplementedError(
+                        "GPU sort currently requires Arrow-backed input blocks."
+                    )
+                unsupported = [
+                    field.name
+                    for field in base_schema
+                    if (
+                        pa.types.is_nested(field.type)
+                        or pa.types.is_union(field.type)
+                        or pa.types.is_dictionary(field.type)
+                        or isinstance(field.type, pa.ExtensionType)
+                    )
+                ]
+                if unsupported:
+                    raise NotImplementedError(
+                        "GPU sort supports flat Arrow scalar columns only; "
+                        f"unsupported columns: {unsupported}."
+                    )
         sort_key = SortKey(key, descending, boundaries)
         op = Sort(
             sort_key=sort_key,
             input_dependencies=[self._logical_plan.dag],
+            backend=backend,
         )
         logical_plan = LogicalPlan(op, self.context)
         return Dataset._from_parent(self, logical_plan)
