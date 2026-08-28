@@ -1235,7 +1235,6 @@ class GPUChain(SerializablePreprocessorBase):
         num_cpus: Optional[float] = None,
         memory: Optional[float] = None,
         concurrency: Optional[int] = None,
-        output_batch_format: Optional[str] = None,
     ) -> "Dataset":
         """Transform a dataset in one fused GPU actor stage."""
         if num_cpus is not None:
@@ -1247,7 +1246,6 @@ class GPUChain(SerializablePreprocessorBase):
             "batch_format": "cudf",
             "batch_size": batch_size or self._batch_size,
             "num_gpus": self._num_gpus_per_worker,
-            "output_batch_format": output_batch_format,
             "zero_copy_batch": True,
             "udf_modifying_row_count": False,
         }
@@ -1268,9 +1266,8 @@ class GPUChain(SerializablePreprocessorBase):
         num_cpus: Optional[float] = None,
         memory: Optional[float] = None,
         concurrency: Optional[int] = None,
-        output_batch_format: Optional[str] = None,
     ) -> "Dataset":
-        """Transform a dataset and optionally convert GPU outputs to a block format."""
+        """Transform a dataset using one fused GPU actor stage."""
         fit_status = self.fit_status()
         if fit_status in (
             Preprocessor.FitStatus.PARTIALLY_FITTED,
@@ -1288,7 +1285,6 @@ class GPUChain(SerializablePreprocessorBase):
             num_cpus=num_cpus,
             memory=memory,
             concurrency=concurrency,
-            output_batch_format=output_batch_format,
         )
 
     def transform_cudf(self, df: cudf.DataFrame) -> cudf.DataFrame:

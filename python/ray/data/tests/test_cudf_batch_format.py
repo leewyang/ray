@@ -16,7 +16,7 @@ from ray.data._internal.block_batching.block_batching import batch_blocks
 from ray.data._internal.execution.interfaces.ref_bundle import (
     _ref_bundles_iterator_to_block_refs_list,
 )
-from ray.data.block import BlockAccessor, BlockType
+from ray.data.block import BlockAccessor
 from ray.data.expressions import col
 from ray.data.tests.conftest import *  # noqa
 
@@ -108,12 +108,12 @@ class TestCudfTakeBatch:
 class TestCudfBatchBlocks:
     """Tests for batch_blocks with batch_format='cudf'."""
 
-    def test_batch_to_block_preserves_cudf(self):
+    def test_batch_to_block_converts_cudf_to_arrow(self):
         df = cudf.DataFrame({"foo": [1, 2, 3]})
         block = BlockAccessor.batch_to_block(df)
 
-        assert isinstance(block, cudf.DataFrame)
-        assert BlockAccessor.for_block(block).block_type() == BlockType.CUDF
+        assert isinstance(block, pa.Table)
+        assert block.to_pydict() == {"foo": [1, 2, 3]}
 
     def test_batch_blocks_cudf(self):
         blocks = block_generator(num_rows=3, num_blocks=2)
@@ -134,7 +134,7 @@ class TestCudfBatchBlocks:
 class TestCudfMapBatches:
     """Tests for map_batches with various batch formats (cuDF in/out)."""
 
-    def test_map_batches_cudf_output_batch_format_pyarrow(
+    def test_map_batches_cudf_output_is_arrow_block(
         self, ray_start_regular_shared, batch_format
     ):
         if batch_format != "cudf":
@@ -144,7 +144,6 @@ class TestCudfMapBatches:
         result = ds.map_batches(
             lambda batch: batch,
             batch_format="cudf",
-            output_batch_format="pyarrow",
             batch_size=5,
             num_gpus=0.001,
         ).materialize()
@@ -155,31 +154,6 @@ class TestCudfMapBatches:
         assert blocks
         assert all(isinstance(block, pa.Table) for block in blocks)
         assert result.take_all() == [{"id": i} for i in range(5)]
-
-    def test_map_batches_cudf_output_not_converted_to_arrow(
-        self, ray_start_regular_shared, monkeypatch, batch_format
-    ):
-        if batch_format != "cudf":
-            pytest.skip("This regression is specific to cuDF block preservation.")
-
-        original_to_arrow = cudf.DataFrame.to_arrow
-
-        def fail_nonempty_to_arrow(self, *args, **kwargs):
-            if len(self) > 0:
-                raise AssertionError("nonempty cudf.DataFrame.to_arrow() called")
-            return original_to_arrow(self, *args, **kwargs)
-
-        monkeypatch.setattr(cudf.DataFrame, "to_arrow", fail_nonempty_to_arrow)
-        ds = ray.data.range(5, override_num_blocks=1)
-
-        result = ds.map_batches(
-            lambda batch: batch,
-            batch_format="cudf",
-            batch_size=5,
-            num_gpus=0.001,
-        ).take()
-
-        assert result == [{"id": i} for i in range(5)]
 
     def test_map_batches_cudf_receive_and_return(
         self, ray_start_regular_shared, batch_format
@@ -264,12 +238,12 @@ class TestCudfMapBatches:
     ],
 )
 class TestCudfFilterExpressions:
-    """Tests for filter with expressions on cuDF blocks."""
+    """Tests for expressions around cuDF batch transforms."""
 
     def test_filter_expr_after_map_batches_cudf(
         self, ray_start_regular_shared, predicate_expr, test_data, expected_ids
     ):
-        """filter(expr=...) works on cuDF blocks from map_batches(batch_format='cudf')."""
+        """filter(expr=...) works after a cuDF batch transform returns Arrow."""
         if test_data is not None:
             ds = ray.data.from_items(test_data)
             ds = ds.map_batches(

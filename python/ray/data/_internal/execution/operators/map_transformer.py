@@ -20,7 +20,7 @@ from ray._common.utils import env_integer
 from ray.data._internal.block_batching.block_batching import batch_blocks
 from ray.data._internal.execution.interfaces.task_context import TaskContext
 from ray.data._internal.output_buffer import BlockOutputBuffer, OutputBlockSizeOption
-from ray.data.block import BatchFormat, Block, BlockAccessor, BlockType, DataBatch
+from ray.data.block import BatchFormat, Block, BlockAccessor, DataBatch
 
 _DEFAULT_BATCH_SIZE_BYTES: int = env_integer(
     "RAY_DATA_DEFAULT_BATCH_SIZE_BYTES", 16 * 1024 * 1024  # 16 MiB
@@ -357,7 +357,6 @@ class BatchMapTransformFn(MapTransformFn):
         is_udf: bool = False,
         batch_size: Union[Optional[int], Literal["auto"]] = None,
         batch_format: Optional[BatchFormat] = None,
-        output_batch_format: Optional[BatchFormat] = None,
         zero_copy_batch: bool = True,
         output_block_size_option: Optional[OutputBlockSizeOption] = None,
         target_batch_size_bytes: int = _DEFAULT_BATCH_SIZE_BYTES,
@@ -370,19 +369,6 @@ class BatchMapTransformFn(MapTransformFn):
 
         self._batch_size = batch_size
         self._batch_format = batch_format
-        if output_batch_format is None:
-            self._output_block_type = None
-        elif output_batch_format == BatchFormat.ARROW:
-            self._output_block_type = BlockType.ARROW
-        elif output_batch_format == BatchFormat.PANDAS:
-            self._output_block_type = BlockType.PANDAS
-        elif output_batch_format == BatchFormat.CUDF:
-            self._output_block_type = BlockType.CUDF
-        else:
-            raise ValueError(
-                "`output_batch_format` must be one of 'pyarrow', 'pandas', "
-                f"'cudf', or None; got {output_batch_format!r}."
-            )
         self._zero_copy_batch = zero_copy_batch
         self._target_batch_size_bytes = target_batch_size_bytes
 
@@ -412,19 +398,10 @@ class BatchMapTransformFn(MapTransformFn):
         return self._batch_fn(batches, ctx)
 
     def _post_process(self, results: Iterable[MapTransformFnData]) -> Iterable[Block]:
-        return _BlockShapingIterator(
-            results,
-            self._input_type,
-            self._output_block_size_option,
-            output_block_type=self._output_block_type,
-        )
+        return self._shape_blocks(results)
 
     def __repr__(self) -> str:
-        return (
-            f"BatchMapTransformFn({self._batch_fn=}, {self._batch_format=}, "
-            f"{self._batch_size=}, {self._zero_copy_batch=}, "
-            f"{self._output_block_type=})"
-        )
+        return f"BatchMapTransformFn({self._batch_fn=}, {self._batch_format=}, {self._batch_size=}, {self._zero_copy_batch=})"
 
 
 class BlockMapTransformFn(MapTransformFn):
@@ -492,14 +469,9 @@ class _BlockShapingIterator(Iterator[Block]):
         results: Iterable[MapTransformFnData],
         input_type: MapTransformFnDataType,
         output_block_size_option: Optional[OutputBlockSizeOption],
-        *,
-        output_block_type: Optional[BlockType] = None,
     ):
         self._results_iter = iter(results)
-        self._buffer = BlockOutputBuffer(
-            output_block_size_option,
-            output_block_type=output_block_type,
-        )
+        self._buffer = BlockOutputBuffer(output_block_size_option)
         self._finalized = False
 
         if input_type == MapTransformFnDataType.Block:

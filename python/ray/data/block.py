@@ -52,7 +52,7 @@ AggType = TypeVar("AggType")
 #
 # Block data can be accessed in a uniform way via ``BlockAccessors`` like`
 # ``ArrowBlockAccessor``.
-Block = Union["pyarrow.Table", "pandas.DataFrame", "cudf.DataFrame"]
+Block = Union["pyarrow.Table", "pandas.DataFrame"]
 
 # Represents the schema of a block, which can be either a Python type or a
 # pyarrow schema. This is used to describe the structure of the data in a block.
@@ -63,16 +63,11 @@ BlockColumn = Union[
     "pyarrow.ChunkedArray",
     "pyarrow.Array",
     "pandas.Series",
-    "cudf.Series",
 ]
 
 # Represents a single column of the ``Batch``
 BatchColumn = Union[
-    "pandas.Series",
-    "np.ndarray",
-    "pyarrow.Array",
-    "pyarrow.ChunkedArray",
-    "cudf.Series",
+    "pandas.Series", "np.ndarray", "pyarrow.Array", "pyarrow.ChunkedArray"
 ]
 
 
@@ -83,7 +78,6 @@ logger = logging.getLogger(__name__)
 class BlockType(Enum):
     ARROW = "arrow"
     PANDAS = "pandas"
-    CUDF = "cudf"
 
 
 @DeveloperAPI
@@ -580,28 +574,13 @@ class BlockAccessor:
             )
 
         # Handle cudf.DataFrame before Mapping check, since cudf.DataFrame
-        # implements the Mapping protocol.
+        # implements the Mapping protocol. Use bulk GPU->CPU transfer via
+        # to_arrow() instead of the slow column-by-column Mapping path.
         elif _is_cudf_dataframe(batch):
-            if block_type == BlockType.ARROW:
-                return batch.to_arrow(preserve_index=False)
-            elif block_type == BlockType.PANDAS:
-                return batch.to_pandas()
-            else:
-                return batch
+            return batch.to_arrow(preserve_index=False)
 
         elif isinstance(batch, pandas.DataFrame):
-            if block_type == BlockType.CUDF:
-                from ray.data.util.data_batch_conversion import _lazy_import_cudf
-
-                cudf = _lazy_import_cudf()
-                if cudf is None:
-                    raise ValueError(
-                        "Attempted to convert data to cuDF DataFrame but cuDF "
-                        "is not installed. Please do `pip install cudf-cu12` to "
-                        "install cuDF (GPU required)."
-                    )
-                return cudf.from_pandas(batch)
-            elif (block_type == BlockType.ARROW) or (
+            if (block_type == BlockType.ARROW) or (
                 block_type is None
                 and DataContext.get_current().batch_to_block_arrow_format
             ):
@@ -609,18 +588,7 @@ class BlockAccessor:
             return batch
 
         elif isinstance(batch, collections.abc.Mapping):
-            if block_type == BlockType.CUDF:
-                from ray.data.util.data_batch_conversion import _lazy_import_cudf
-
-                cudf = _lazy_import_cudf()
-                if cudf is None:
-                    raise ValueError(
-                        "Attempted to convert data to cuDF DataFrame but cuDF "
-                        "is not installed. Please do `pip install cudf-cu12` to "
-                        "install cuDF (GPU required)."
-                    )
-                return cudf.DataFrame(batch)
-            elif block_type is None or block_type == BlockType.ARROW:
+            if block_type is None or block_type == BlockType.ARROW:
                 from ray.data._internal.tensor_extensions.arrow import (
                     ArrowConversionError,
                 )
@@ -641,14 +609,6 @@ class BlockAccessor:
             else:
                 assert block_type == BlockType.PANDAS
                 return cls.batch_to_pandas_block(batch)
-
-        elif isinstance(batch, (pa.Table, pa.RecordBatch)):
-            if block_type == BlockType.CUDF:
-                return cls.for_block(batch).to_cudf()
-            elif block_type == BlockType.PANDAS:
-                return cls.for_block(batch).to_pandas()
-            else:
-                return cls.for_block(batch).to_arrow()
 
         return batch
 
@@ -681,10 +641,6 @@ class BlockAccessor:
             from ray.data._internal.pandas_block import PandasBlockAccessor
 
             return PandasBlockAccessor(block)
-        elif _is_cudf_dataframe(block):
-            from ray.data._internal.cudf_block import CudfBlockAccessor
-
-            return CudfBlockAccessor(block)
         elif isinstance(block, bytes):
             from ray.data._internal.arrow_block import ArrowBlockAccessor
 
@@ -952,18 +908,11 @@ class BlockColumnAccessor:
             from ray.data._internal.pandas_block import PandasBlockColumnAccessor
 
             return PandasBlockColumnAccessor(col)
-        elif "cudf" in sys.modules:
-            import cudf
-
-            if isinstance(col, cudf.Series):
-                from ray.data._internal.cudf_block import CudfBlockColumnAccessor
-
-                return CudfBlockColumnAccessor(col)
-
-        raise TypeError(
-            f"Expected a pandas.Series, cudf.Series, or pyarrow.Array "
-            f"(ChunkedArray) (got {type(col)})"
-        )
+        else:
+            raise TypeError(
+                f"Expected either a pandas.Series or pyarrow.Array "
+                f"(ChunkedArray) (got {type(col)})"
+            )
 
 
 def _get_group_boundaries_sorted_numpy(columns: list[np.ndarray]) -> np.ndarray:
