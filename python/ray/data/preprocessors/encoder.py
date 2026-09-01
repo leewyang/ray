@@ -21,6 +21,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from ray.data._internal.util import is_null
+from ray.data.aggregate import ValueCounter
 from ray.data.block import BlockAccessor
 from ray.data.preprocessor import (
     Preprocessor,
@@ -149,6 +150,9 @@ class OrdinalEncoder(SerializablePreprocessorBase):
             columns will be the same as the input columns. If not None, the length of
             ``output_columns`` must match the length of ``columns``, othwerwise an error
             will be raised.
+        min_evidence: Minimum number of occurrences across the fitted dataset
+            required for a category to be included. Categories below this threshold
+            are treated as unseen during transformation. Defaults to 1.
 
     .. seealso::
 
@@ -162,11 +166,17 @@ class OrdinalEncoder(SerializablePreprocessorBase):
         *,
         encode_lists: bool = True,
         output_columns: Optional[List[str]] = None,
+        min_evidence: int = 1,
     ):
         super().__init__()
+        if min_evidence < 1:
+            raise ValueError(
+                f"`min_evidence` must be a positive integer, got {min_evidence!r}."
+            )
         # TODO: allow user to specify order of values within each column.
         self._columns = columns
         self._encode_lists = encode_lists
+        self._min_evidence = min_evidence
         self._output_columns = Preprocessor._derive_and_validate_output_columns(
             columns, output_columns
         )
@@ -183,19 +193,56 @@ class OrdinalEncoder(SerializablePreprocessorBase):
     def output_columns(self) -> Optional[List[str]]:
         return self._output_columns
 
+    @property
+    def min_evidence(self) -> int:
+        return self._min_evidence
+
     def _fit(self, dataset: "Dataset") -> Preprocessor:
-        self._stat_computation_plan.add_callable_stat(
-            stat_fn=lambda key_gen: compute_unique_value_indices(
-                dataset=dataset,
+        schema = dataset.schema().base_schema
+        if isinstance(schema, pa.Schema):
+            has_list_columns = any(
+                pa.types.is_list(schema.field(column).type)
+                or pa.types.is_large_list(schema.field(column).type)
+                or pa.types.is_fixed_size_list(schema.field(column).type)
+                for column in self._columns
+            )
+        else:
+            # Pandas represents scalar strings and list values with the same object
+            # dtype. Inspect one row so scalar object columns can still use the
+            # distributed ValueCounter path without regressing list-column support.
+            sample = dataset.take(1)
+            has_list_columns = bool(sample) and any(
+                isinstance(sample[0][column], (list, tuple, np.ndarray))
+                for column in self._columns
+            )
+        if has_list_columns:
+            # ValueCounter currently operates on scalar column values. Preserve the
+            # legacy list-column implementation until it supports list flattening.
+            self._stat_computation_plan.add_callable_stat(
+                stat_fn=lambda key_gen: compute_unique_value_indices(
+                    dataset=dataset,
+                    columns=self._columns,
+                    encode_lists=self._encode_lists,
+                    key_gen=key_gen,
+                    min_evidence=self._min_evidence,
+                ),
+                post_process_fn=unique_post_fn(),
+                stat_key_fn=lambda col: f"unique({col})",
+                post_key_fn=lambda col: f"unique_values({col})",
                 columns=self._columns,
-                encode_lists=self._encode_lists,
-                key_gen=key_gen,
-            ),
-            post_process_fn=unique_post_fn(),
-            stat_key_fn=lambda col: f"unique({col})",
-            post_key_fn=lambda col: f"unique_values({col})",
-            columns=self._columns,
-        )
+            )
+        else:
+            self._stat_computation_plan.add_aggregator(
+                aggregator_fn=lambda col: ValueCounter(
+                    on=col,
+                    ignore_nulls=False,
+                    alias_name=f"unique_values({col})",
+                ),
+                post_process_fn=value_counts_post_fn(
+                    min_evidence=self._min_evidence,
+                ),
+                columns=self._columns,
+            )
         return self
 
     def _get_ordinal_map(self, column_name: str) -> Dict[Any, int]:
@@ -302,6 +349,7 @@ class OrdinalEncoder(SerializablePreprocessorBase):
             "columns": self._columns,
             "output_columns": self._output_columns,
             "encode_lists": self._encode_lists,
+            "min_evidence": self._min_evidence,
             "_fitted": getattr(self, "_fitted", None),
         }
 
@@ -310,6 +358,7 @@ class OrdinalEncoder(SerializablePreprocessorBase):
         self._columns = fields["columns"]
         self._output_columns = fields["output_columns"]
         self._encode_lists = fields["encode_lists"]
+        self._min_evidence = fields.get("min_evidence", 1)
         # optional fields
         self._fitted = fields.get("_fitted")
 
@@ -327,6 +376,7 @@ class OrdinalEncoder(SerializablePreprocessorBase):
                 "_encode_lists": _PublicField(
                     public_field="encode_lists", default=True
                 ),
+                "_min_evidence": _PublicField(public_field="min_evidence", default=1),
             },
         )
 
@@ -1175,6 +1225,7 @@ def compute_unique_value_indices(
     key_gen: Callable,
     encode_lists: bool = True,
     max_categories: Optional[Dict[str, int]] = None,
+    min_evidence: int = 1,
 ):
     """Compute the set of unique values for each column across the full dataset.
 
@@ -1198,6 +1249,8 @@ def compute_unique_value_indices(
             of unique values to keep. Only the most frequent values (by global
             count) are retained. Columns not present in the mapping keep all
             unique values.
+        min_evidence: Minimum global count required to retain a value.
+            Defaults to 1.
 
     Returns:
         Dict[str, Set]: A mapping from ``key_gen(col)`` to the set of unique
@@ -1264,6 +1317,9 @@ def compute_unique_value_indices(
     unique_values_by_col: Dict[str, Set] = {key_gen(col): set() for col in columns}
     for col in columns:
         counter = global_counters[col]
+        counter = Counter(
+            {value: count for value, count in counter.items() if count >= min_evidence}
+        )
         if col in max_categories:
             top_k_values = dict(counter.most_common(max_categories[col]))
             unique_values_by_col[key_gen(col)].update(top_k_values.keys())
@@ -1271,6 +1327,35 @@ def compute_unique_value_indices(
             unique_values_by_col[key_gen(col)].update(counter.keys())
 
     return unique_values_by_col
+
+
+def value_counts_post_fn(
+    *,
+    min_evidence: int = 1,
+    drop_na_values: bool = False,
+) -> Callable:
+    """Build an ordinal map from a globally aggregated ValueCounter result."""
+    make_value_index = unique_post_fn(drop_na_values=drop_na_values)
+
+    def post_process(value_counts: Dict[str, List]) -> Dict[Any, int]:
+        values = value_counts["values"]
+        counts = value_counts["counts"]
+        if len(values) != len(counts):
+            raise ValueError(
+                "ValueCounter returned different numbers of values and counts."
+            )
+
+        # Preserve OrdinalEncoder's existing behavior: any null in the fit data
+        # raises, even when that value would fall below min_evidence.
+        if not drop_na_values and any(is_null(value) for value in values):
+            return make_value_index(values)
+
+        retained_values = [
+            value for value, count in zip(values, counts) if count >= min_evidence
+        ]
+        return make_value_index(retained_values)
+
+    return post_process
 
 
 # FIXME: the arrow format path is broken: https://anyscale1.atlassian.net/browse/DATA-1788

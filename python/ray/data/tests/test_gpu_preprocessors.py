@@ -66,6 +66,23 @@ def test_chain_builds_fused_gpu_chain_from_standard_preprocessors():
     assert all(p._concurrency == 2 for p in gpu_chain.preprocessors)
 
 
+def test_chain_gpu_lowering_preserves_ordinal_min_evidence():
+    preprocessor = Chain(
+        OrdinalEncoder(columns=["cat_0"], encode_lists=False, min_evidence=750)
+    )
+
+    gpu_chain = preprocessor._build_gpu_chain(
+        batch_size=1024,
+        num_gpus_per_worker=1,
+        concurrency=2,
+        copy_fitted_state=False,
+    )
+
+    gpu_encoder = gpu_chain.preprocessors[0]
+    assert isinstance(gpu_encoder, GPUOrdinalEncoder)
+    assert gpu_encoder.min_evidence == 750
+
+
 def test_gpu_ordinal_encoder_min_evidence_filters_global_counts():
     encoder = GPUOrdinalEncoder(
         columns=["cat_0"],
