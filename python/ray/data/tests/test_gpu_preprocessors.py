@@ -6,13 +6,19 @@ import pandas as pd
 import pytest
 
 from ray.data._internal.compute import ActorPoolStrategy
+from ray.data.preprocessor import Preprocessor
 from ray.data.preprocessors import (
+    Chain,
     GPUChain,
     GPUColumnCaster,
     GPUOrdinalEncoder,
     GPUPowerTransformer,
     GPUSimpleImputer,
     GPUStandardScaler,
+    OrdinalEncoder,
+    PowerTransformer,
+    SimpleImputer,
+    StandardScaler,
 )
 from ray.data.preprocessors.gpu._fusion import (
     _FusedGPUCategoricalOrdinalOp,
@@ -32,6 +38,32 @@ def _require_cudf_with_cuda():
     if device_count == 0:
         pytest.skip("CUDA device is not available.")
     return cudf
+
+
+def test_chain_builds_fused_gpu_chain_from_standard_preprocessors():
+    preprocessor = Chain(
+        PowerTransformer(columns=["num_0"], power=0, method="yeo-johnson"),
+        StandardScaler(columns=["num_0"]),
+        SimpleImputer(columns=["num_0"], strategy="constant", fill_value=0.0),
+        OrdinalEncoder(columns=["cat_0"]),
+    )
+
+    gpu_chain = preprocessor._build_gpu_chain(
+        batch_size=1024,
+        num_gpus_per_worker=1,
+        concurrency=2,
+        copy_fitted_state=False,
+    )
+
+    assert isinstance(gpu_chain, GPUChain)
+    assert [type(p) for p in gpu_chain.preprocessors] == [
+        GPUPowerTransformer,
+        GPUStandardScaler,
+        GPUSimpleImputer,
+        GPUOrdinalEncoder,
+    ]
+    assert all(p._batch_size == 1024 for p in gpu_chain.preprocessors)
+    assert all(p._concurrency == 2 for p in gpu_chain.preprocessors)
 
 
 def test_gpu_ordinal_encoder_min_evidence_filters_global_counts():
@@ -281,6 +313,35 @@ def test_gpu_chain_fits_moments_and_ordinals_in_one_distributed_pass():
         context.gpu_shuffle_num_actors = original_actors
         if started_ray:
             ray.shutdown()
+
+
+def test_chain_gpu_lowering_copies_fitted_standard_stats():
+    scaler = StandardScaler(columns=["num_0"])
+    scaler.stats_ = {"mean(num_0)": 2.0, "std(num_0)": 4.0}
+    scaler._fitted = True
+
+    encoder = OrdinalEncoder(columns=["cat_0"])
+    encoder.stats_ = {"unique_values(cat_0)": {"a": 0, "b": 1}}
+    encoder._fitted = True
+
+    preprocessor = Chain(scaler, encoder)
+    gpu_chain = preprocessor._build_gpu_chain(
+        batch_size=None,
+        num_gpus_per_worker=1,
+        concurrency=None,
+        copy_fitted_state=True,
+    )
+
+    gpu_scaler, gpu_encoder = gpu_chain.preprocessors
+    assert gpu_scaler.stats_ == scaler.stats_
+    assert gpu_scaler.fit_status() == Preprocessor.FitStatus.FITTED
+    assert gpu_encoder.stats_ == encoder.stats_
+    assert gpu_encoder.fit_status() == Preprocessor.FitStatus.FITTED
+
+
+def test_chain_gpu_lowering_rejects_unknown_accelerator():
+    with pytest.raises(ValueError, match="Unsupported accelerator"):
+        Chain().fit_transform(None, accelerator="tpu")
 
 
 def test_gpu_preprocessors_transform_cudf_batch():
