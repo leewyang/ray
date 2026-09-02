@@ -1391,11 +1391,26 @@ class ValueCounter(AggregateFnV2):
         )
 
     def aggregate_block(self, block: Block) -> Dict[str, List]:
-        column = block[self._target_col_name]
-        col_accessor = BlockColumnAccessor.for_column(column)
-        if self._ignore_nulls:
-            col_accessor = BlockColumnAccessor.for_column(col_accessor.dropna())
-        return col_accessor.value_counts()
+        col_accessor = BlockColumnAccessor.for_column(block[self._target_col_name])
+        non_null_accessor = BlockColumnAccessor.for_column(col_accessor.dropna())
+
+        result = non_null_accessor.value_counts()
+        if result is None:
+            result = {"values": [], "counts": []}
+
+        if not self._ignore_nulls:
+            # Nulls are counted here, since Pandas and Arrow disagree on whether
+            # nulls are a distinct value. Pandas also yields a distinct NaN object
+            # per block, which ``combine`` (keying off equality) would fail to merge,
+            # so nulls are normalized to a single ``None``.
+            num_nulls = col_accessor.count(ignore_nulls=False) - col_accessor.count(
+                ignore_nulls=True
+            )
+            if num_nulls:
+                result["values"].append(None)
+                result["counts"].append(num_nulls)
+
+        return result
 
     def combine(
         self,

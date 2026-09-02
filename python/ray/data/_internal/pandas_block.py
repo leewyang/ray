@@ -324,7 +324,7 @@ class PandasBlockColumnAccessor(BlockColumnAccessor):
         return self._column.quantile(q=q)
 
     def value_counts(self) -> Optional[Dict[str, List]]:
-        value_counts = self._column.value_counts(dropna=False)
+        value_counts = self._column.value_counts()
         if len(value_counts) == 0:
             return None
         return {

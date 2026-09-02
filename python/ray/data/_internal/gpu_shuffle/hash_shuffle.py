@@ -702,6 +702,9 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         ``_shuffle_metrics`` rather than the unused base metrics object, so the
         resource manager must read this stage's metrics to see the GPU shuffle's
         downstream capacity.
+
+        The finalize metrics are added to the shuffle metrics for reporting purposes
+        only.
         """
         self._shuffle_metrics._extra_metrics = self._extra_metrics()
         return self._shuffle_metrics

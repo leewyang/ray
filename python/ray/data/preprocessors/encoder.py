@@ -208,13 +208,9 @@ class OrdinalEncoder(SerializablePreprocessorBase):
             )
         else:
             # Pandas represents scalar strings and list values with the same object
-            # dtype. Inspect one row so scalar object columns can still use the
-            # distributed ValueCounter path without regressing list-column support.
-            sample = dataset.take(1)
-            has_list_columns = bool(sample) and any(
-                isinstance(sample[0][column], (list, tuple, np.ndarray))
-                for column in self._columns
-            )
+            # dtype. Scan until each column has a non-null sample so a leading null
+            # does not hide list columns from the legacy explode path.
+            has_list_columns = _pandas_columns_contain_lists(dataset, self._columns)
         if has_list_columns:
             # ValueCounter currently operates on scalar column values. Preserve the
             # legacy list-column implementation until it supports list flattening.
@@ -1495,6 +1491,28 @@ def _validate_arrow(table: pa.Table, *columns: str) -> None:
             f"Unable to transform columns {null_columns} because they contain "
             f"null values. Consider imputing missing values first."
         )
+
+
+def _pandas_columns_contain_lists(dataset: "Dataset", columns: List[str]) -> bool:
+    """Return whether any pandas object column stores list-like values.
+
+    Skips leading nulls so the first row being null does not hide list columns.
+    """
+    unresolved = set(columns)
+    for batch in dataset.iter_batches(batch_size=None, batch_format="pandas"):
+        for column in list(unresolved):
+            first_not_none = next(
+                (element for element in batch[column] if element is not None),
+                None,
+            )
+            if first_not_none is None:
+                continue
+            unresolved.discard(column)
+            if isinstance(first_not_none, (list, tuple, np.ndarray)):
+                return True
+        if not unresolved:
+            break
+    return False
 
 
 def _is_series_composed_of_lists(series: pd.Series) -> bool:

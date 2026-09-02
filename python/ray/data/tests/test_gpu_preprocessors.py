@@ -25,7 +25,11 @@ from ray.data.preprocessors.gpu._fusion import (
     _FusedGPUNumericColumnOp,
     _plan_gpu_transform_ops,
 )
-from ray.data.preprocessors.gpu._runtime import _apply_gpu_ops
+from ray.data.preprocessors.gpu._runtime import (
+    _apply_gpu_preprocessors,
+    _GPUPreprocessorOp,
+)
+from ray.data.preprocessors.gpu.chain import gpu_concurrency
 
 
 def _require_cudf_with_cuda():
@@ -48,7 +52,8 @@ def test_chain_builds_fused_gpu_chain_from_standard_preprocessors():
         OrdinalEncoder(columns=["cat_0"]),
     )
 
-    gpu_chain = preprocessor._build_gpu_chain(
+    gpu_chain = GPUChain.from_cpu_preprocessors(
+        preprocessor.preprocessors,
         batch_size=1024,
         num_gpus_per_worker=1,
         concurrency=2,
@@ -71,7 +76,8 @@ def test_chain_gpu_lowering_preserves_ordinal_min_evidence():
         OrdinalEncoder(columns=["cat_0"], encode_lists=False, min_evidence=750)
     )
 
-    gpu_chain = preprocessor._build_gpu_chain(
+    gpu_chain = GPUChain.from_cpu_preprocessors(
+        preprocessor.preprocessors,
         batch_size=1024,
         num_gpus_per_worker=1,
         concurrency=2,
@@ -209,6 +215,20 @@ def test_gpu_ordinal_encoder_requires_gpu_shuffle_for_fit():
         encoder._fit_gpu(dataset, ())
 
 
+def test_gpu_chain_distributed_combined_fit_requires_gpu_shuffle():
+    from ray.data.context import ShuffleStrategy
+
+    dataset = MagicMock()
+    dataset.context.shuffle_strategy = ShuffleStrategy.HASH_SHUFFLE
+    chain = GPUChain(
+        GPUStandardScaler(columns=["num"]),
+        GPUOrdinalEncoder(columns=["cat"]),
+    )
+
+    with pytest.raises(ValueError, match="GPU_SHUFFLE"):
+        chain._fit_distributed_combined(dataset)
+
+
 @pytest.mark.gpu
 def test_gpu_ordinal_encoder_distributed_fit_end_to_end():
     _require_cudf_with_cuda()
@@ -342,7 +362,8 @@ def test_chain_gpu_lowering_copies_fitted_standard_stats():
     encoder._fitted = True
 
     preprocessor = Chain(scaler, encoder)
-    gpu_chain = preprocessor._build_gpu_chain(
+    gpu_chain = GPUChain.from_cpu_preprocessors(
+        preprocessor.preprocessors,
         batch_size=None,
         num_gpus_per_worker=1,
         concurrency=None,
@@ -356,9 +377,42 @@ def test_chain_gpu_lowering_copies_fitted_standard_stats():
     assert gpu_encoder.fit_status() == Preprocessor.FitStatus.FITTED
 
 
+def test_chain_gpu_transform_reuses_fitted_gpu_chain():
+    scaler = StandardScaler(columns=["num_0"])
+    scaler.stats_ = {"mean(num_0)": 2.0, "std(num_0)": 4.0}
+    scaler._fitted = True
+
+    preprocessor = Chain(scaler)
+    gpu_chain = MagicMock()
+    gpu_chain.transform.return_value = "transformed"
+    preprocessor._gpu_chain = gpu_chain
+    dataset = MagicMock()
+
+    with patch.object(GPUChain, "from_cpu_preprocessors") as from_cpu_preprocessors:
+        result = preprocessor.transform(dataset, accelerator="gpu")
+
+    from_cpu_preprocessors.assert_not_called()
+    gpu_chain.transform.assert_called_once_with(
+        dataset, batch_size=None, concurrency=None
+    )
+    assert result == "transformed"
+
+
 def test_chain_gpu_lowering_rejects_unknown_accelerator():
     with pytest.raises(ValueError, match="Unsupported accelerator"):
         Chain().fit_transform(None, accelerator="tpu")
+
+
+def test_gpu_concurrency_resolves_num_gpus():
+    assert gpu_concurrency(num_gpus=None, concurrency=None) is None
+    assert gpu_concurrency(num_gpus=None, concurrency=3) == 3
+    assert gpu_concurrency(num_gpus=2, concurrency=None) == 2
+    assert gpu_concurrency(num_gpus=2, concurrency=2) == 2
+
+    with pytest.raises(ValueError, match="num_gpus must be positive"):
+        gpu_concurrency(num_gpus=0, concurrency=None)
+    with pytest.raises(ValueError, match="Specify either num_gpus or concurrency"):
+        gpu_concurrency(num_gpus=2, concurrency=3)
 
 
 def test_gpu_preprocessors_transform_cudf_batch():
@@ -464,6 +518,10 @@ def test_gpu_chain_plans_generic_fused_transform_ops():
     )
 
     assert [type(op) for op in unfused] == [
+        _GPUPreprocessorOp,
+        _GPUPreprocessorOp,
+    ]
+    assert [type(op._preprocessor) for op in unfused] == [
         GPUPowerTransformer,
         GPUStandardScaler,
     ]
@@ -518,7 +576,7 @@ def test_gpu_chain_fused_transform_matches_sequential_cudf_batch():
         encoder,
     )
 
-    sequential = _apply_gpu_ops(
+    sequential = _apply_gpu_preprocessors(
         df.copy(deep=True), preprocessor.preprocessors
     ).to_pandas()
     fused = preprocessor.transform_cudf(df.copy(deep=True)).to_pandas()

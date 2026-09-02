@@ -1,18 +1,14 @@
 from __future__ import annotations
 
 import pickle
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
+from ray.data._internal.compute import ActorPoolStrategy
 from ray.data.preprocessor import SerializablePreprocessorBase
 from ray.data.preprocessors.gpu._runtime import (
-    _COMBINED_FIT_INDEX_COLUMN,
-    _COMBINED_FIT_STATS_COLUMN,
-    _DEFAULT_GPU_BATCH_SIZE,
-    _apply_gpu_ops,
-    _deserialize_pandas_fit_stats,
-    _gpu_actor_compute_strategy,
+    _apply_gpu_preprocessors,
     _GPUTransformContext,
 )
 from ray.util.annotations import DeveloperAPI
@@ -22,17 +18,38 @@ if TYPE_CHECKING:
 
     from ray.data.dataset import Dataset
 
+_COMBINED_FIT_INDEX_COLUMN = "__preprocessor_index"
+_COMBINED_FIT_STATS_COLUMN = "__fit_stats"
+_DEFAULT_GPU_BATCH_SIZE = 4096
 
-class _SingleGPUPreprocessorUDF:
+
+def _gpu_actor_compute_strategy(
+    concurrency: Optional[int],
+) -> Dict[str, ActorPoolStrategy]:
+    if concurrency is None:
+        return {}
+    return {
+        "compute": ActorPoolStrategy(
+            size=concurrency,
+            max_tasks_in_flight_per_actor=2,
+        )
+    }
+
+
+class _GPUTransformUDF:
+    """Actor class for applying a single GPU preprocessor transform to a cuDF batch."""
+
     def __init__(self, preprocessor: "GPUPreprocessor"):
         self._preprocessor = preprocessor
         self._preprocessor._prepare_gpu_state()
 
     def __call__(self, batch: cudf.DataFrame) -> cudf.DataFrame:
-        return _apply_gpu_ops(batch, (self._preprocessor,), prepare=False)
+        return _apply_gpu_preprocessors(batch, (self._preprocessor,), prepare=False)
 
 
 class _GPUFitStatsUDF:
+    """Actor class for computing fit statistics for a GPU preprocessor."""
+
     def __init__(
         self,
         fit_entries: Sequence[
@@ -53,7 +70,7 @@ class _GPUFitStatsUDF:
         rows: List[Dict[str, Any]] = []
         for index, preprocessor, prefix in self._fit_entries:
             if prefix not in prefix_cache:
-                prefix_cache[prefix] = _apply_gpu_ops(batch, prefix)
+                prefix_cache[prefix] = _apply_gpu_preprocessors(batch, prefix)
             stats = preprocessor._gpu_fit_stats_cudf(prefix_cache[prefix])
             if stats.empty:
                 continue
@@ -152,10 +169,8 @@ class GPUPreprocessor(SerializablePreprocessorBase):
     def _serialize_gpu_fit_stats(self, stats: pd.DataFrame) -> bytes:
         return pickle.dumps(stats, protocol=pickle.HIGHEST_PROTOCOL)
 
-    def _deserialize_gpu_fit_stats(
-        self, payload: Union[bytes, memoryview]
-    ) -> pd.DataFrame:
-        return _deserialize_pandas_fit_stats(payload)
+    def _deserialize_gpu_fit_stats(self, payload: bytes) -> pd.DataFrame:
+        return pickle.loads(payload)
 
     def _finalize_gpu_fit_stat_batches(
         self, partial_batches: Sequence[pd.DataFrame]
@@ -279,17 +294,13 @@ class GPUPreprocessor(SerializablePreprocessorBase):
         kwargs.update(_gpu_actor_compute_strategy(effective_concurrency))
 
         return ds.map_batches(
-            _SingleGPUPreprocessorUDF,
+            _GPUTransformUDF,
             fn_constructor_args=(self,),
             **kwargs,
         )
 
-    def _base_serializable_fields(self) -> Dict[str, Any]:
-        """Return GPU execution settings shared by all GPU preprocessors.
-
-        Returns:
-            Dictionary of base GPU preprocessor configuration fields.
-        """
+    def _get_serializable_fields(self) -> Dict[str, Any]:
+        """Return GPU execution settings shared by all GPU preprocessors."""
         return {
             "batch_size": self._batch_size,
             "num_gpus_per_worker": self._num_gpus_per_worker,
@@ -297,30 +308,9 @@ class GPUPreprocessor(SerializablePreprocessorBase):
             "_fitted": getattr(self, "_fitted", None),
         }
 
-    def _set_base_serializable_fields(self, fields: Dict[str, Any]) -> None:
-        """Restore GPU execution settings from serialized data.
-
-        Args:
-            fields: Dictionary containing base GPU preprocessor fields.
-        """
+    def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
+        """Restore GPU execution settings from deserialized data."""
         self._batch_size = fields.get("batch_size", _DEFAULT_GPU_BATCH_SIZE)
         self._num_gpus_per_worker = fields.get("num_gpus_per_worker", 1)
         self._concurrency = fields.get("concurrency")
         self._fitted = fields.get("_fitted")
-
-    def _get_serializable_fields(self) -> Dict[str, Any]:
-        """Return instance fields that should be serialized.
-
-        Returns:
-            Dictionary mapping field names to their values.
-        """
-        return self._base_serializable_fields()
-
-    def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
-        """Restore instance fields from deserialized data.
-
-        Args:
-            fields: Dictionary of field names to values.
-            version: Version of the serialized data.
-        """
-        self._set_base_serializable_fields(fields)

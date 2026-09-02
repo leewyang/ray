@@ -8,7 +8,7 @@ from ray.data._internal.gpu_shuffle.hash_aggregate import (
 )
 from ray.data.block import Schema
 from ray.data.datatype import DataType
-from ray.data.preprocessors.gpu._runtime import _apply_gpu_ops
+from ray.data.preprocessors.gpu._runtime import _apply_gpu_preprocessors
 
 if TYPE_CHECKING:
     import cudf
@@ -93,7 +93,7 @@ class GPUOrdinalValueCounter(GPUAggregateFn):
             )
         for preprocessor in self.prefix:
             preprocessor._prepare_gpu_state()
-        df = _apply_gpu_ops(df, self.prefix)
+        df = _apply_gpu_preprocessors(df, self.prefix)
 
         acc_col = accumulator_columns[0]
         frames = []
@@ -257,7 +257,7 @@ class GPUPreprocessorFitAggregate(GPUAggregateFn):
         acc_col = accumulator_columns[0]
         frames: List[cudf.DataFrame] = []
         for fit_index, columns, prefix, _ in self.ordinal_entries:
-            transformed = _apply_gpu_ops(df, prefix)
+            transformed = _apply_gpu_preprocessors(df, prefix)
             for column in columns:
                 counts = (
                     transformed[column]
@@ -273,7 +273,7 @@ class GPUPreprocessorFitAggregate(GPUAggregateFn):
                 frames.append(counts[list(self.KEY_COLUMNS) + [acc_col]])
 
         for fit_index, columns, prefix in self.moment_entries:
-            transformed = _apply_gpu_ops(df, prefix)
+            transformed = _apply_gpu_preprocessors(df, prefix)
             numeric = transformed[list(columns)].astype("float64")
             metrics = (
                 (self.COUNT_METRIC, numeric.count()),

@@ -5,7 +5,6 @@ import functools
 import logging
 import pickle
 import time
-import types
 import typing
 from collections import defaultdict
 from typing import (
@@ -205,6 +204,59 @@ class GPUAggregateFn(abc.ABC):
         """Aggregate shuffled GPU accumulator columns into final output."""
         ...
 
+    def required_input_columns(self) -> Tuple[str, ...]:
+        """Columns that must be projected from each original input block to be used
+        in the aggregation.
+
+        For example, for groupby("x").sum("y"), this should be ("y",).
+        """
+        return (self.target_column,) if self.target_column is not None else ()
+
+    def generated_key_columns(self) -> Tuple[str, ...]:
+        """Group keys created by ``partial_aggregate`` instead of read from input."""
+        return ()
+
+    def preferred_input_batch_rows(self) -> Optional[int]:
+        """Preferred number of source rows per GPU partial aggregation.
+
+        Aggregates with substantial per-partial overhead can request a minimum number
+        of rows to coalesce from adjacent source blocks before converting them to cuDF
+        for aggregation.
+
+        ``None`` preserves the one-input-block-per-partial behavior.
+        """
+        return None
+
+    def supports_local_combine(self) -> bool:
+        """Whether partial accumulator rows can be combined before shuffling.
+
+        Aggregates should opt in only when combining partials is associative and
+        preserves every accumulator needed by ``final_aggregate``. The GPU hash
+        aggregate actor uses this to compact repeated keys locally and avoid
+        sending duplicate accumulator rows through the network.
+        """
+        return False
+
+    def max_local_combine_partials(self) -> Optional[int]:
+        """Maximum partials to compact into one pre-shuffle run.
+
+        High-cardinality aggregations can use a finite value to limit the number of
+        partials to compact before shuffling in order to bound actor device memory.
+
+        ``None`` retains all compacted partials in device memory until the input
+        finishes.
+        """
+        return None
+
+    def combine_partial_aggregates(
+        self,
+        df: cudf.DataFrame,
+        key_columns: Tuple[str, ...],
+        accumulator_columns: Tuple[str, ...],
+    ) -> cudf.DataFrame:
+        """Combine partial accumulator rows without applying final filtering."""
+        raise NotImplementedError
+
     def _accumulator_columns(self, accumulator_prefix: str) -> Tuple[str, ...]:
         """Return the final, unique names of the GPU accumulator columns per
         aggregation by concatenating the accumulator_prefix and the accumulator columns.
@@ -220,53 +272,6 @@ class GPUAggregateFn(abc.ABC):
         return tuple(
             f"{accumulator_prefix}_{accumulator}" for accumulator in self._accumulators
         )
-
-    def required_input_columns(self) -> Tuple[str, ...]:
-        """Columns that must be projected from each original input block."""
-        return (self.target_column,) if self.target_column is not None else ()
-
-    def generated_key_columns(self) -> Tuple[str, ...]:
-        """Group keys created by ``partial_aggregate`` instead of read from input."""
-        return ()
-
-    def supports_local_combine(self) -> bool:
-        """Whether partial accumulator rows can be combined before shuffling.
-
-        Aggregates should opt in only when combining partials is associative and
-        preserves every accumulator needed by ``final_aggregate``. The GPU hash
-        aggregate actor uses this to compact repeated keys locally and avoid
-        sending duplicate accumulator rows through the network.
-        """
-        return False
-
-    def preferred_input_batch_rows(self) -> Optional[int]:
-        """Preferred number of source rows per GPU partial aggregation.
-
-        Returning ``None`` preserves the one-input-block-per-partial behavior.
-        Aggregates with substantial fixed per-partial overhead can request that
-        the actor coalesce adjacent source blocks before converting them to
-        cuDF. This is only a batching hint and does not change aggregation
-        semantics.
-        """
-        return None
-
-    def max_local_combine_partials(self) -> Optional[int]:
-        """Maximum partials to compact into one pre-shuffle run.
-
-        ``None`` retains compacted state until input finishes. High-cardinality
-        aggregates can return a finite value to bound actor device memory while
-        still reducing shuffle fragmentation.
-        """
-        return None
-
-    def combine_partial_aggregates(
-        self,
-        df: cudf.DataFrame,
-        key_columns: Tuple[str, ...],
-        accumulator_columns: Tuple[str, ...],
-    ) -> cudf.DataFrame:
-        """Combine partial accumulator rows without applying final filtering."""
-        raise NotImplementedError
 
     def _empty_global_partial_values(self, accumulator_prefix: str) -> Dict[str, Any]:
         """Return accumulator values for an empty block during a global aggregation
@@ -1337,7 +1342,7 @@ class GPUAggregationPlan:
 
     @property
     def required_columns(self) -> Tuple[str, ...]:
-        """Return all required columns for the GPU aggregation plan.
+        """Return all required input columns for the GPU aggregation plan.
 
         These include the key columns and aggregation target columns, e.g.
         groupby("col1").sum("col2")
@@ -1347,9 +1352,11 @@ class GPUAggregationPlan:
             for agg in self._gpu_aggregates
             for column in agg.generated_key_columns()
         }
+        # filter out generated key columns
         columns = [
             column for column in self._key_columns if column not in generated_keys
         ]
+        # add required input columns from the aggregates
         for agg in self._gpu_aggregates:
             for input_column in agg.required_input_columns():
                 if input_column not in columns:
@@ -1388,8 +1395,6 @@ class GPUAggregationPlan:
 
     def combine_partial_aggregates(self, df: cudf.DataFrame) -> cudf.DataFrame:
         """Combine duplicate partial rows while retaining accumulator schema."""
-        if not self.supports_local_combine:
-            raise ValueError("Aggregation plan does not support local combining.")
         if len(df) == 0:
             return df[list(self._shuffle_key_columns) + list(self.accumulator_columns)]
 
@@ -1411,7 +1416,6 @@ class GPUAggregationPlan:
                 )
             )
 
-        assert result is not None
         return result[list(self._shuffle_key_columns) + list(self.accumulator_columns)]
 
     def normalize_output_arrow(
@@ -1434,7 +1438,7 @@ class GPUAggregationPlan:
     def partial_aggregate(
         self, df: cudf.DataFrame, input_schema: Optional[Schema] = None
     ) -> cudf.DataFrame:
-        import cudf as cudf_module
+        import cudf
 
         if self._is_global:
             df = df.copy(deep=False)
@@ -1451,7 +1455,7 @@ class GPUAggregationPlan:
                     empty_values = agg._empty_global_partial_values(accumulator_prefix)
                     for column, value in empty_values.items():
                         values[column] = [value]
-                result = cudf_module.DataFrame(values)[
+                result = cudf.DataFrame(values)[
                     list(key_columns) + list(self.accumulator_columns)
                 ]
                 for column, dtype in self._partial_accumulator_dtypes(
@@ -1460,7 +1464,6 @@ class GPUAggregationPlan:
                     _cast_cudf_column_dtype(result, column, dtype)
                 return result
             return self._empty_dataframe(
-                cudf_module,
                 list(key_columns) + list(self.accumulator_columns),
                 dtypes=self._partial_accumulator_dtypes(
                     df, key_columns, input_schema=input_schema
@@ -1496,8 +1499,6 @@ class GPUAggregationPlan:
         df: cudf.DataFrame,
         input_schema: Optional[Schema] = None,
     ) -> cudf.DataFrame:
-        import cudf as cudf_module
-
         key_columns = self._shuffle_key_columns
         output_columns = ([] if self._is_global else list(key_columns)) + list(
             self.output_names
@@ -1505,7 +1506,6 @@ class GPUAggregationPlan:
 
         if len(df) == 0:
             return self._empty_dataframe(
-                cudf_module,
                 output_columns,
                 dtypes=self._final_cudf_dtypes(
                     df,
@@ -1701,13 +1701,14 @@ class GPUAggregationPlan:
 
     @staticmethod
     def _empty_dataframe(
-        cudf_module: types.ModuleType,
         columns: Sequence[str],
         dtypes: Optional[Dict[str, Optional[DataType]]] = None,
     ) -> cudf.DataFrame:
         """Create an empty cuDF DataFrame with the requested columns and dtypes."""
+        import cudf
+
         dtypes = dtypes or {}
-        df = cudf_module.DataFrame()
+        df = cudf.DataFrame()
         for column in columns:
             df[column] = []
             _cast_cudf_column_dtype(df, column, dtypes.get(column))
@@ -1820,10 +1821,8 @@ class GPUHashAggregateActor:
             spill_memory_limit=spill_memory_limit,
         )
         self._shuffle_columns: Optional[List[str]] = None
-        # Associative partial aggregations can be compacted in an LSM-style
-        # hierarchy before the distributed shuffle. A run at level N represents
-        # 2**N input partials. This bounds temporary device memory while ensuring
-        # each input row participates in only O(log(num_blocks)) local combines.
+        # Associative partial aggregations can be locally compacted before the
+        # distributed shuffle to bound temporary device memory.
         self._local_partial_runs: List[Optional[Any]] = []
         self._local_partial_count = 0
         self._local_partial_input_rows = 0
@@ -1870,8 +1869,10 @@ class GPUHashAggregateActor:
             self._runtime_input_schema,
             table.schema,
         )
+
         batch_rows = self._aggregation_plan.preferred_input_batch_rows
         if batch_rows is not None:
+            # coalesce input tables to meet preferred batch size
             self._pending_input_tables.append(table)
             self._pending_input_rows += num_rows
             if self._pending_input_rows < batch_rows:

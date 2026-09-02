@@ -1,9 +1,7 @@
-import warnings
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 from ray.data.preprocessor import (
     Preprocessor,
-    PreprocessorNotFittedException,
     SerializablePreprocessorBase,
 )
 from ray.data.preprocessors.utils import (
@@ -16,7 +14,6 @@ from ray.data.util.data_batch_conversion import BatchFormat
 if TYPE_CHECKING:
     from ray.air.data_batch_type import DataBatchType
     from ray.data.dataset import Dataset
-    from ray.data.preprocessors.gpu import GPUChain
 
 
 @SerializablePreprocessor(version=1, identifier="io.ray.preprocessors.chain")
@@ -118,37 +115,20 @@ class Chain(SerializablePreprocessorBase):
         Returns:
             This fitted chain.
         """
-        if not self._use_gpu_accelerator(accelerator):
-            self._gpu_chain = None
-            return super().fit(ds)
+        from ray.data.preprocessors.gpu.chain import gpu_fit, use_gpu_accelerator
 
-        fit_status = self.fit_status()
-        if fit_status in (
-            Preprocessor.FitStatus.FITTED,
-            Preprocessor.FitStatus.PARTIALLY_FITTED,
-        ):
-            warnings.warn(
-                "`fit` has already been called on the preprocessor (or at least one "
-                "contained preprocessors if this is a chain). "
-                "All previously fitted state will be overwritten!"
+        if use_gpu_accelerator(accelerator):
+            return gpu_fit(
+                self,
+                ds,
+                batch_size=batch_size,
+                num_gpus=num_gpus,
+                num_gpus_per_worker=num_gpus_per_worker,
+                concurrency=concurrency,
             )
 
-        self._stat_computation_plan.reset()
-        self.stats_ = {}
-        gpu_chain = self._build_gpu_chain(
-            batch_size=batch_size,
-            num_gpus_per_worker=num_gpus_per_worker,
-            concurrency=self._gpu_concurrency(
-                num_gpus=num_gpus,
-                concurrency=concurrency,
-            ),
-            copy_fitted_state=False,
-        )
-        gpu_chain.fit(ds)
-        self._sync_fitted_state_from_gpu_chain(gpu_chain)
-        self._gpu_chain = gpu_chain
-        self._fitted = True
-        return self
+        self._gpu_chain = None
+        return super().fit(ds)
 
     def fit_transform(
         self,
@@ -168,178 +148,32 @@ class Chain(SerializablePreprocessorBase):
         :class:`GPUChain`; the default path retains the standard sequential
         behavior.
         """
-        if not self._use_gpu_accelerator(accelerator):
-            for preprocessor in self._preprocessors:
-                ds = preprocessor.fit_transform(
-                    ds,
-                    transform_num_cpus=transform_num_cpus,
-                    transform_memory=transform_memory,
-                    transform_batch_size=transform_batch_size,
-                    transform_concurrency=transform_concurrency,
-                )
-            return ds
-
-        if transform_num_cpus is not None:
-            raise ValueError("GPU Chain preprocessing does not support num_cpus.")
-        if transform_memory is not None:
-            raise ValueError("GPU Chain preprocessing does not support memory.")
-
-        self.fit(
-            ds,
-            accelerator=accelerator,
-            batch_size=transform_batch_size,
-            num_gpus=num_gpus,
-            num_gpus_per_worker=num_gpus_per_worker,
-            concurrency=transform_concurrency,
-        )
-        return self.transform(
-            ds,
-            batch_size=transform_batch_size,
-            accelerator=accelerator,
-            num_gpus=num_gpus,
-            num_gpus_per_worker=num_gpus_per_worker,
-            concurrency=transform_concurrency,
+        from ray.data.preprocessors.gpu.chain import (
+            gpu_fit_transform,
+            use_gpu_accelerator,
         )
 
-    @staticmethod
-    def _use_gpu_accelerator(accelerator: Optional[str]) -> bool:
-        if accelerator is None:
-            return False
-        if accelerator != "gpu":
-            raise ValueError(
-                f"Unsupported accelerator {accelerator!r}. Only 'gpu' is supported."
+        if use_gpu_accelerator(accelerator):
+            return gpu_fit_transform(
+                self,
+                ds,
+                transform_num_cpus=transform_num_cpus,
+                transform_memory=transform_memory,
+                transform_batch_size=transform_batch_size,
+                transform_concurrency=transform_concurrency,
+                num_gpus=num_gpus,
+                num_gpus_per_worker=num_gpus_per_worker,
             )
-        return True
 
-    @staticmethod
-    def _gpu_concurrency(
-        *,
-        num_gpus: Optional[int],
-        concurrency: Optional[int],
-    ) -> Optional[int]:
-        if num_gpus is None:
-            return concurrency
-        if num_gpus <= 0:
-            raise ValueError("num_gpus must be positive when accelerator='gpu'.")
-        if concurrency is not None and concurrency != num_gpus:
-            raise ValueError(
-                "Specify either num_gpus or concurrency for GPU Chain preprocessing, "
-                "or set them to the same value."
-            )
-        return num_gpus
-
-    def _build_gpu_chain(
-        self,
-        *,
-        batch_size: Optional[int],
-        num_gpus_per_worker: float,
-        concurrency: Optional[int],
-        copy_fitted_state: bool,
-    ) -> "GPUChain":
-        """Build the GPU equivalent of this chain.
-
-        Args:
-            batch_size: Rows per cuDF batch, or ``None`` for the GPU default.
-            num_gpus_per_worker: GPUs reserved for each worker.
-            concurrency: Maximum number of concurrent GPU workers.
-            copy_fitted_state: Whether to copy fitted statistics into the GPU
-                preprocessors.
-
-        Returns:
-            A fused GPU chain with equivalent supported preprocessors.
-
-        Raises:
-            TypeError: If the chain contains a preprocessor without a GPU
-                equivalent.
-        """
-        from ray.data.preprocessors.encoder import OrdinalEncoder
-        from ray.data.preprocessors.gpu import (
-            GPUChain,
-            GPUOrdinalEncoder,
-            GPUPowerTransformer,
-            GPUSimpleImputer,
-            GPUStandardScaler,
-        )
-        from ray.data.preprocessors.gpu._runtime import _DEFAULT_GPU_BATCH_SIZE
-        from ray.data.preprocessors.imputer import SimpleImputer
-        from ray.data.preprocessors.scaler import StandardScaler
-        from ray.data.preprocessors.transformer import PowerTransformer
-
-        gpu_batch_size = batch_size or _DEFAULT_GPU_BATCH_SIZE
-        gpu_preprocessors: List[SerializablePreprocessorBase] = []
         for preprocessor in self._preprocessors:
-            if isinstance(preprocessor, PowerTransformer):
-                gpu_preprocessor = GPUPowerTransformer(
-                    columns=preprocessor.columns,
-                    power=preprocessor.power,
-                    method=preprocessor.method,
-                    output_columns=preprocessor.output_columns,
-                    batch_size=gpu_batch_size,
-                    num_gpus_per_worker=num_gpus_per_worker,
-                    concurrency=concurrency,
-                )
-            elif isinstance(preprocessor, StandardScaler):
-                gpu_preprocessor = GPUStandardScaler(
-                    columns=preprocessor.columns,
-                    output_columns=preprocessor.output_columns,
-                    batch_size=gpu_batch_size,
-                    num_gpus_per_worker=num_gpus_per_worker,
-                    concurrency=concurrency,
-                )
-            elif isinstance(preprocessor, SimpleImputer):
-                gpu_preprocessor = GPUSimpleImputer(
-                    columns=preprocessor.columns,
-                    strategy=preprocessor.strategy,
-                    fill_value=preprocessor.fill_value,
-                    output_columns=preprocessor.output_columns,
-                    batch_size=gpu_batch_size,
-                    num_gpus_per_worker=num_gpus_per_worker,
-                    concurrency=concurrency,
-                )
-            elif isinstance(preprocessor, OrdinalEncoder):
-                gpu_preprocessor = GPUOrdinalEncoder(
-                    columns=preprocessor.columns,
-                    encode_lists=preprocessor.encode_lists,
-                    output_columns=preprocessor.output_columns,
-                    min_evidence=getattr(preprocessor, "min_evidence", 1),
-                    batch_size=gpu_batch_size,
-                    num_gpus_per_worker=num_gpus_per_worker,
-                    concurrency=concurrency,
-                )
-            else:
-                raise TypeError(
-                    "Chain accelerator='gpu' supports PowerTransformer, "
-                    "StandardScaler, SimpleImputer, and OrdinalEncoder. "
-                    f"Got {type(preprocessor).__name__}."
-                )
-
-            if (
-                copy_fitted_state
-                and preprocessor.fit_status() == Preprocessor.FitStatus.FITTED
-                and gpu_preprocessor.fit_status() != Preprocessor.FitStatus.NOT_FITTABLE
-            ):
-                gpu_preprocessor.stats_ = dict(preprocessor.stats_)
-                gpu_preprocessor._fitted = True
-            gpu_preprocessors.append(gpu_preprocessor)
-
-        return GPUChain(
-            *gpu_preprocessors,
-            batch_size=gpu_batch_size,
-            num_gpus_per_worker=num_gpus_per_worker,
-            concurrency=concurrency,
-        )
-
-    def _sync_fitted_state_from_gpu_chain(self, gpu_chain: "GPUChain") -> None:
-        """Copy fitted statistics from a GPU chain to the CPU preprocessors."""
-        for preprocessor, gpu_preprocessor in zip(
-            self._preprocessors, gpu_chain.preprocessors
-        ):
-            if (
-                gpu_preprocessor.fit_status() == Preprocessor.FitStatus.FITTED
-                and preprocessor.fit_status() != Preprocessor.FitStatus.NOT_FITTABLE
-            ):
-                preprocessor.stats_ = dict(gpu_preprocessor.stats_)
-                preprocessor._fitted = True
+            ds = preprocessor.fit_transform(
+                ds,
+                transform_num_cpus=transform_num_cpus,
+                transform_memory=transform_memory,
+                transform_batch_size=transform_batch_size,
+                transform_concurrency=transform_concurrency,
+            )
+        return ds
 
     def _transform(
         self,
@@ -386,40 +220,27 @@ class Chain(SerializablePreprocessorBase):
         Returns:
             The lazily transformed dataset.
         """
-        if not self._use_gpu_accelerator(accelerator):
-            return super().transform(
+        from ray.data.preprocessors.gpu.chain import gpu_transform, use_gpu_accelerator
+
+        if use_gpu_accelerator(accelerator):
+            return gpu_transform(
+                self,
                 ds,
                 batch_size=batch_size,
                 num_cpus=num_cpus,
                 memory=memory,
                 concurrency=concurrency,
-            )
-
-        if num_cpus is not None:
-            raise ValueError("GPU Chain preprocessing does not support num_cpus.")
-        if memory is not None:
-            raise ValueError("GPU Chain preprocessing does not support memory.")
-
-        fit_status = self.fit_status()
-        if fit_status in (
-            Preprocessor.FitStatus.PARTIALLY_FITTED,
-            Preprocessor.FitStatus.NOT_FITTED,
-        ):
-            raise PreprocessorNotFittedException(
-                "`fit` must be called before `transform`, "
-                "or simply use fit_transform() to run both steps"
-            )
-
-        gpu_chain = self._build_gpu_chain(
-            batch_size=batch_size,
-            num_gpus_per_worker=num_gpus_per_worker,
-            concurrency=self._gpu_concurrency(
                 num_gpus=num_gpus,
-                concurrency=concurrency,
-            ),
-            copy_fitted_state=True,
+                num_gpus_per_worker=num_gpus_per_worker,
+            )
+
+        return super().transform(
+            ds,
+            batch_size=batch_size,
+            num_cpus=num_cpus,
+            memory=memory,
+            concurrency=concurrency,
         )
-        return gpu_chain.transform(ds, batch_size=batch_size)
 
     def _transform_batch(self, df: "DataBatchType") -> "DataBatchType":
         for preprocessor in self._preprocessors:

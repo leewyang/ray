@@ -4,15 +4,10 @@ from numbers import Number
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 from ray.data.preprocessors.gpu._runtime import (
-    _apply_gpu_ops,
-    _assign_dataframe_columns,
-    _cudf_dataframe_from_cupy,
+    _apply_gpu_preprocessors,
     _GPUPhysicalOp,
+    _GPUPreprocessorOp,
     _GPUTransformContext,
-    _import_cudf,
-    _import_cupy,
-    _ordinal_map_from_stats,
-    _power_transform_values,
 )
 from ray.data.preprocessors.gpu.base import GPUPreprocessor
 from ray.data.preprocessors.gpu.ops import (
@@ -21,34 +16,16 @@ from ray.data.preprocessors.gpu.ops import (
     GPUPowerTransformer,
     GPUSimpleImputer,
     GPUStandardScaler,
+    _ordinal_map_from_stats,
+    _power_transform_values,
+    _standard_scale_values,
 )
-from ray.data.preprocessors.scaler import _EPSILON
 
 if TYPE_CHECKING:
     import cudf
 
 
-def _is_in_place_column_transform(preprocessor: "GPUPreprocessor") -> bool:
-    return preprocessor.get_input_columns() == preprocessor.get_output_columns()
-
-
-def _is_constant_numeric_imputer(preprocessor: "GPUPreprocessor") -> bool:
-    if not isinstance(preprocessor, GPUSimpleImputer):
-        return False
-    return (
-        preprocessor.strategy == "constant"
-        and isinstance(preprocessor.fill_value, Number)
-        and _is_in_place_column_transform(preprocessor)
-    )
-
-
-def _is_fusible_numeric_transform(preprocessor: "GPUPreprocessor") -> bool:
-    if isinstance(preprocessor, (GPUPowerTransformer, GPUStandardScaler)):
-        return _is_in_place_column_transform(preprocessor)
-    return _is_constant_numeric_imputer(preprocessor)
-
-
-class _FusedGPUNumericColumnOp:
+class _FusedGPUNumericColumnOp(_GPUPhysicalOp):
     def __init__(self, preprocessors: Sequence["GPUPreprocessor"]):
         self._preprocessors = tuple(preprocessors)
         self._columns = self._preprocessors[0].get_input_columns()
@@ -61,42 +38,20 @@ class _FusedGPUNumericColumnOp:
     def _transform_cudf(
         self, df: cudf.DataFrame, context: Optional[_GPUTransformContext] = None
     ) -> cudf.DataFrame:
-        """Apply a compatible sequence of numeric transforms in one CuPy array."""
-        cp = _import_cupy()
-        values = df[self._columns].astype("float64").to_cupy(na_value=cp.nan)
+        """Apply a compatible sequence of numeric transforms on one working frame."""
+        values = df[self._columns].astype("float64")
 
         for preprocessor in self._preprocessors:
             if isinstance(preprocessor, GPUPowerTransformer):
                 values = _power_transform_values(
-                    values, preprocessor.power, preprocessor.method, cp
+                    values, preprocessor.power, preprocessor.method
                 )
             elif isinstance(preprocessor, GPUStandardScaler):
-                means = cp.asarray(
-                    [
-                        (
-                            float(preprocessor.stats_.get(f"mean({column})"))
-                            if preprocessor.stats_.get(f"mean({column})") is not None
-                            else cp.nan
-                        )
-                        for column in preprocessor.columns
-                    ],
-                    dtype=cp.float64,
+                values = _standard_scale_values(
+                    values, preprocessor.columns, preprocessor.stats_
                 )
-                stds = cp.asarray(
-                    [
-                        (
-                            float(preprocessor.stats_.get(f"std({column})"))
-                            if preprocessor.stats_.get(f"std({column})") is not None
-                            and preprocessor.stats_.get(f"std({column})") >= _EPSILON
-                            else 1.0
-                        )
-                        for column in preprocessor.columns
-                    ],
-                    dtype=cp.float64,
-                )
-                values = (values - means) / stds
             elif isinstance(preprocessor, GPUSimpleImputer):
-                fill_values: List[Any] = []
+                fill_values: Dict[str, Any] = {}
                 for column in preprocessor.columns:
                     value = preprocessor._get_fill_value(column)
                     if value is None:
@@ -104,9 +59,8 @@ class _FusedGPUNumericColumnOp:
                             f"Column {column} has no fill value. "
                             "Check the data used to fit the SimpleImputer."
                         )
-                    fill_values.append(value)
-                fill_array = cp.asarray(fill_values, dtype=values.dtype).reshape(1, -1)
-                values = cp.where(cp.isnan(values), fill_array, values)
+                    fill_values[column] = value
+                values = values.fillna(fill_values)
             else:
                 raise TypeError(
                     f"Unsupported fused GPU numeric transform: {preprocessor!r}."
@@ -116,14 +70,14 @@ class _FusedGPUNumericColumnOp:
             if output_dtype is not None:
                 values = values.astype(output_dtype)
 
-        output = _cudf_dataframe_from_cupy(values, self._output_columns, df.index)
-        return _assign_dataframe_columns(df, self._output_columns, output)
+        df[list(self._output_columns)] = values
+        return df
 
     def _gpu_modified_columns(self) -> List[str]:
         return list(self._output_columns)
 
 
-class _FusedGPUCategoricalOrdinalOp:
+class _FusedGPUCategoricalOrdinalOp(_GPUPhysicalOp):
     def __init__(
         self,
         preprocessors: Sequence["GPUPreprocessor"],
@@ -152,9 +106,10 @@ class _FusedGPUCategoricalOrdinalOp:
     ) -> cudf.DataFrame:
         """Apply cast, imputation, and ordinal encoding to one working frame."""
         if any(column not in df.columns for column in self._columns):
-            return _apply_gpu_ops(df, self._preprocessors)
+            return _apply_gpu_preprocessors(df, self._preprocessors)
 
-        cudf = _import_cudf()
+        import cudf
+
         working = df[self._columns].copy(deep=False)
 
         if self._caster is not None:
@@ -210,7 +165,8 @@ class _FusedGPUCategoricalOrdinalOp:
 
         encoded = cudf.DataFrame(dict(zip(output_columns, encoded_columns)))
         encoded.index = df.index
-        return _assign_dataframe_columns(df, output_columns, encoded)
+        df[list(output_columns)] = encoded
+        return df
 
     def _gpu_modified_columns(self) -> List[str]:
         return list(self._output_columns)
@@ -221,17 +177,24 @@ def _match_fused_numeric_ops(
     start: int,
 ) -> Optional[Tuple[_FusedGPUNumericColumnOp, int]]:
     """Match a contiguous run of compatible in-place numeric transforms."""
-    if not _is_fusible_numeric_transform(preprocessors[start]):
-        return None
-
     ops: List[GPUPreprocessor] = []
     columns: Optional[List[str]] = None
     index = start
     while index < len(preprocessors):
         preprocessor = preprocessors[index]
-        if not _is_fusible_numeric_transform(preprocessor):
-            break
         input_columns = preprocessor.get_input_columns()
+        if input_columns != preprocessor.get_output_columns():
+            break
+        is_numeric_transform = isinstance(
+            preprocessor, (GPUPowerTransformer, GPUStandardScaler)
+        )
+        is_constant_imputer = (
+            isinstance(preprocessor, GPUSimpleImputer)
+            and preprocessor.strategy == "constant"
+            and isinstance(preprocessor.fill_value, Number)
+        )
+        if not is_numeric_transform and not is_constant_imputer:
+            break
         if columns is None:
             columns = input_columns
         elif input_columns != columns:
@@ -258,7 +221,7 @@ def _match_fused_categorical_ordinal_ops(
 
     if isinstance(preprocessors[index], GPUColumnCaster):
         caster = preprocessors[index]
-        if not _is_in_place_column_transform(caster):
+        if caster.get_input_columns() != caster.get_output_columns():
             return None
         ops.append(caster)
         index += 1
@@ -267,7 +230,7 @@ def _match_fused_categorical_ordinal_ops(
 
     if isinstance(preprocessors[index], GPUSimpleImputer):
         imputer = preprocessors[index]
-        if not _is_in_place_column_transform(imputer):
+        if imputer.get_input_columns() != imputer.get_output_columns():
             return None
         ops.append(imputer)
         index += 1
@@ -278,7 +241,7 @@ def _match_fused_categorical_ordinal_ops(
         return None
 
     encoder = preprocessors[index]
-    if not _is_in_place_column_transform(encoder):
+    if encoder.get_input_columns() != encoder.get_output_columns():
         return None
 
     encoder_columns = encoder.get_input_columns()
@@ -312,6 +275,6 @@ def _plan_gpu_transform_ops(
             planned.append(op)
             continue
 
-        planned.append(preprocessors[index])
+        planned.append(_GPUPreprocessorOp(preprocessors[index]))
         index += 1
     return tuple(planned)

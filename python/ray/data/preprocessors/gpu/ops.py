@@ -5,28 +5,13 @@ from collections import Counter
 from numbers import Number
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 
 from ray.data.preprocessor import Preprocessor
 from ray.data.preprocessors.gpu._aggregates import GPUOrdinalValueCounter
-from ray.data.preprocessors.gpu._runtime import (
-    _DEFAULT_GPU_BATCH_SIZE,
-    _DEFAULT_TOKEN_PATTERN,
-    _DEFAULT_WORD_PATTERN,
-    _GPU_ORDINAL_FIT_NUM_PARTITIONS,
-    _append_hashing_columns_from_tokens,
-    _assign_dataframe_columns,
-    _cudf_dataframe_from_cupy,
-    _GPUTransformContext,
-    _import_cudf,
-    _import_cupy,
-    _is_missing_value,
-    _ordinal_map_from_stats,
-    _power_transform_values,
-    _str_count,
-    _to_pandas_dict,
-)
-from ray.data.preprocessors.gpu.base import GPUPreprocessor
+from ray.data.preprocessors.gpu._runtime import _GPUTransformContext
+from ray.data.preprocessors.gpu.base import _DEFAULT_GPU_BATCH_SIZE, GPUPreprocessor
 from ray.data.preprocessors.scaler import _EPSILON
 from ray.data.preprocessors.utils import _Computed, _PublicField, migrate_private_fields
 from ray.data.preprocessors.version_support import SerializablePreprocessor
@@ -37,20 +22,86 @@ if TYPE_CHECKING:
 
     from ray.data.dataset import Dataset
 
+_DEFAULT_WORD_PATTERN = r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?"
+_DEFAULT_TOKEN_PATTERN = r"[A-Za-z]+|[0-9]+|[^A-Za-z0-9\s]"
+_GPU_ORDINAL_FIT_NUM_PARTITIONS = 256
+
+
+def _append_hashing_columns_from_tokens(
+    df: cudf.DataFrame,
+    tokens: cudf.Series,
+    lengths: cudf.Series,
+    output_col: str,
+    num_features: int,
+) -> cudf.DataFrame:
+    """Append dense hashing-vectorizer columns from tokenized cuDF strings."""
+    import cudf
+    import cupy as cp
+
+    lengths = lengths.fillna(0).astype("int32")
+    lengths_gpu = lengths.to_cupy()
+    dense = cp.zeros((len(df), num_features), dtype=cp.int32)
+    total_tokens = int(lengths.sum())
+    if total_tokens:
+        leaves = tokens.list.leaves
+        flat_tokens = leaves() if callable(leaves) else leaves
+        try:
+            hashed = flat_tokens.hash_values(method="murmur3")
+        except TypeError:
+            hashed = flat_tokens.hash_values()
+        token_hashes = hashed.astype("uint64").to_cupy() % num_features
+        offsets = cp.cumsum(lengths_gpu)
+        token_offsets = cp.arange(total_tokens, dtype=cp.int64)
+        row_ids = cp.searchsorted(offsets, token_offsets, side="right").astype(cp.int32)
+        cp.add.at(dense, (row_ids, token_hashes.astype(cp.int32)), 1)
+    for idx in range(num_features):
+        df[f"{output_col}_{idx}"] = cudf.Series(dense[:, idx], index=df.index)
+    return df
+
+
+def _is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    try:
+        return bool(missing)
+    except (TypeError, ValueError):
+        return False
+
+
+def _ordinal_map_from_stats(stats: Dict[str, Any], column: str) -> Dict[Any, int]:
+    stat_value = stats[f"unique_values({column})"]
+    if isinstance(stat_value, dict):
+        return stat_value
+    keys_array, values_array = stat_value
+    return {key.as_py(): value.as_py() for key, value in zip(keys_array, values_array)}
+
+
+def _str_count(series: cudf.Series, pattern: str) -> cudf.Series:
+    try:
+        return series.str.count(pattern)
+    except AttributeError:
+        return series.str.count_re(pattern)
+
 
 @PublicAPI(stability="alpha")
-@SerializablePreprocessor(version=1, identifier="io.ray.preprocessors.gpu_text_stats")
-class GPUTextStatsPreprocessor(GPUPreprocessor):
-    """Append GPU-computed text count features for string columns."""
+@SerializablePreprocessor(
+    version=1, identifier="io.ray.preprocessors.gpu_column_caster"
+)
+class GPUColumnCaster(GPUPreprocessor):
+    """Cast one or more columns inside a fused GPU preprocessing stage."""
 
     _is_fittable = False
 
     def __init__(
         self,
-        text_column: str,
+        columns: List[str],
+        output_dtype: Any,
         *,
-        word_pattern: str = _DEFAULT_WORD_PATTERN,
-        token_pattern: str = _DEFAULT_TOKEN_PATTERN,
+        output_columns: Optional[List[str]] = None,
         batch_size: int = _DEFAULT_GPU_BATCH_SIZE,
         num_gpus_per_worker: float = 1,
         concurrency: Optional[int] = None,
@@ -60,67 +111,229 @@ class GPUTextStatsPreprocessor(GPUPreprocessor):
             num_gpus_per_worker=num_gpus_per_worker,
             concurrency=concurrency,
         )
-        self._text_column = text_column
-        self._word_pattern = word_pattern
-        self._token_pattern = token_pattern
+        self._columns = columns
+        if isinstance(output_dtype, list):
+            if len(output_dtype) != len(columns):
+                raise ValueError(
+                    f"Expected {len(columns)} values, but got "
+                    f"{len(output_dtype)} values: {output_dtype!r}."
+                )
+            self._output_dtypes = output_dtype
+        else:
+            self._output_dtypes = [output_dtype for _ in columns]
+        self._output_columns = Preprocessor._derive_and_validate_output_columns(
+            columns, output_columns
+        )
+
+    @property
+    def columns(self) -> List[str]:
+        return self._columns
+
+    @property
+    def output_columns(self) -> List[str]:
+        return self._output_columns
+
+    @property
+    def output_dtypes(self) -> List[Any]:
+        return self._output_dtypes
 
     def _transform_cudf(
         self, df: cudf.DataFrame, context: Optional[_GPUTransformContext] = None
     ) -> cudf.DataFrame:
-        """Append word, line, and tokenizer-token counts for one text column."""
-        context = context or _GPUTransformContext()
-        text = context.string_column(df, self._text_column)
-        _, token_lengths = context.tokenized_text(
-            df, self._text_column, self._token_pattern
-        )
-        df["word_count"] = (
-            _str_count(text, self._word_pattern).fillna(0).astype("int64")
-        )
-        newline_count = _str_count(text, r"\n").fillna(0).astype("int64")
-        non_empty = text.str.len().fillna(0) > 0
-        df["line_count"] = (newline_count + 1).where(non_empty, 0).astype("int64")
-        df["tokenizer_token_count"] = token_lengths.astype("int64")
+        """Cast configured columns to their requested cuDF dtypes."""
+        cast_map = dict(zip(self._columns, self._output_dtypes))
+        casted = df[self._columns].astype(cast_map)
+        casted.columns = self._output_columns
+        df[list(self._output_columns)] = casted
         return df
 
     def get_input_columns(self) -> List[str]:
-        return [self._text_column]
+        return list(self._columns)
 
     def get_output_columns(self) -> List[str]:
-        return ["word_count", "line_count", "tokenizer_token_count"]
+        return list(self._output_columns)
 
     def _get_serializable_fields(self) -> Dict[str, Any]:
         return {
-            **self._base_serializable_fields(),
-            "text_column": self._text_column,
-            "word_pattern": self._word_pattern,
-            "token_pattern": self._token_pattern,
+            **super()._get_serializable_fields(),
+            "columns": self._columns,
+            "output_dtypes": self._output_dtypes,
+            "output_columns": self._output_columns,
         }
 
     def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
-        self._set_base_serializable_fields(fields)
-        self._text_column = fields["text_column"]
-        self._word_pattern = fields.get("word_pattern", _DEFAULT_WORD_PATTERN)
-        self._token_pattern = fields.get("token_pattern", _DEFAULT_TOKEN_PATTERN)
+        super()._set_serializable_fields(fields, version)
+        self._columns = fields["columns"]
+        self._output_dtypes = fields["output_dtypes"]
+        self._output_columns = fields["output_columns"]
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(text_column={self._text_column!r})"
+        return (
+            f"{self.__class__.__name__}(columns={self._columns!r}, "
+            f"output_dtypes={self._output_dtypes!r}, "
+            f"output_columns={self._output_columns!r})"
+        )
 
 
 @PublicAPI(stability="alpha")
 @SerializablePreprocessor(
-    version=1, identifier="io.ray.preprocessors.gpu_standard_scaler"
+    version=1, identifier="io.ray.preprocessors.gpu_column_dropper"
 )
-class GPUStandardScaler(GPUPreprocessor):
-    """GPU-native variant of :class:`StandardScaler`."""
+class GPUColumnDropper(GPUPreprocessor):
+    """Drop columns inside a fused GPU preprocessing stage."""
+
+    _is_fittable = False
+
+    def __init__(
+        self,
+        columns: List[str],
+        *,
+        batch_size: int = _DEFAULT_GPU_BATCH_SIZE,
+        num_gpus_per_worker: float = 1,
+        concurrency: Optional[int] = None,
+    ):
+        super().__init__(
+            batch_size=batch_size,
+            num_gpus_per_worker=num_gpus_per_worker,
+            concurrency=concurrency,
+        )
+        self._columns = columns
+
+    def _transform_cudf(
+        self, df: cudf.DataFrame, context: Optional[_GPUTransformContext] = None
+    ) -> cudf.DataFrame:
+        """Drop configured columns that are present in the batch."""
+        existing = [column for column in self._columns if column in df.columns]
+        if not existing:
+            return df
+        return df.drop(columns=existing)
+
+    def get_input_columns(self) -> List[str]:
+        return list(self._columns)
+
+    def get_output_columns(self) -> List[str]:
+        return []
+
+    def _gpu_modified_columns(self) -> List[str]:
+        return list(self._columns)
+
+    def _get_serializable_fields(self) -> Dict[str, Any]:
+        return {**super()._get_serializable_fields(), "columns": self._columns}
+
+    def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
+        super()._set_serializable_fields(fields, version)
+        self._columns = fields["columns"]
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(columns={self._columns!r})"
+
+
+@PublicAPI(stability="alpha")
+@SerializablePreprocessor(
+    version=1, identifier="io.ray.preprocessors.gpu_hashing_vectorizer"
+)
+class GPUHashingVectorizer(GPUPreprocessor):
+    """GPU hashing vectorizer that emits dense scalar feature columns."""
+
+    _is_fittable = False
+
+    def __init__(
+        self,
+        columns: List[str],
+        num_features: int,
+        *,
+        token_pattern: str = _DEFAULT_TOKEN_PATTERN,
+        output_columns: Optional[List[str]] = None,
+        batch_size: int = _DEFAULT_GPU_BATCH_SIZE,
+        num_gpus_per_worker: float = 1,
+        concurrency: Optional[int] = None,
+    ):
+        super().__init__(
+            batch_size=batch_size,
+            num_gpus_per_worker=num_gpus_per_worker,
+            concurrency=concurrency,
+        )
+        if num_features <= 0:
+            raise ValueError("num_features must be positive")
+        self._columns = columns
+        self._num_features = num_features
+        self._token_pattern = token_pattern
+        self._output_columns = Preprocessor._derive_and_validate_output_columns(
+            columns, output_columns
+        )
+
+    def _transform_cudf(
+        self, df: cudf.DataFrame, context: Optional[_GPUTransformContext] = None
+    ) -> cudf.DataFrame:
+        """Tokenize string columns and append dense hashed-count features."""
+        context = context or _GPUTransformContext()
+        for input_col, output_col in zip(self._columns, self._output_columns):
+            tokens, lengths = context.tokenized_text(df, input_col, self._token_pattern)
+            df = _append_hashing_columns_from_tokens(
+                df, tokens, lengths, output_col, self._num_features
+            )
+            if output_col == input_col and input_col in df.columns:
+                df = df.drop(columns=[input_col])
+        return df
+
+    def _gpu_modified_columns(self) -> List[str]:
+        modified = self.get_output_columns()
+        modified.extend(
+            input_col
+            for input_col, output_col in zip(self._columns, self._output_columns)
+            if input_col == output_col
+        )
+        return modified
+
+    def get_input_columns(self) -> List[str]:
+        return list(self._columns)
+
+    def get_output_columns(self) -> List[str]:
+        return [
+            f"{output_col}_{idx}"
+            for output_col in self._output_columns
+            for idx in range(self._num_features)
+        ]
+
+    def _get_serializable_fields(self) -> Dict[str, Any]:
+        return {
+            **super()._get_serializable_fields(),
+            "columns": self._columns,
+            "num_features": self._num_features,
+            "token_pattern": self._token_pattern,
+            "output_columns": self._output_columns,
+        }
+
+    def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
+        super()._set_serializable_fields(fields, version)
+        self._columns = fields["columns"]
+        self._num_features = fields["num_features"]
+        self._token_pattern = fields.get("token_pattern", _DEFAULT_TOKEN_PATTERN)
+        self._output_columns = fields["output_columns"]
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(columns={self._columns!r}, "
+            f"num_features={self._num_features!r}, "
+            f"output_columns={self._output_columns!r})"
+        )
+
+
+@PublicAPI(stability="alpha")
+@SerializablePreprocessor(
+    version=1, identifier="io.ray.preprocessors.gpu_one_hot_encoder"
+)
+class GPUOneHotEncoder(GPUPreprocessor):
+    """GPU-native one-hot encoder that emits dense scalar indicator columns."""
 
     _is_fittable = True
 
     def __init__(
         self,
         columns: List[str],
-        output_columns: Optional[List[str]] = None,
         *,
-        output_dtype: Optional[Any] = None,
+        max_categories: Optional[Dict[str, int]] = None,
+        output_columns: Optional[List[str]] = None,
         batch_size: int = _DEFAULT_GPU_BATCH_SIZE,
         num_gpus_per_worker: float = 1,
         concurrency: Optional[int] = None,
@@ -131,10 +344,11 @@ class GPUStandardScaler(GPUPreprocessor):
             concurrency=concurrency,
         )
         self._columns = columns
+        self._max_categories = max_categories or {}
         self._output_columns = Preprocessor._derive_and_validate_output_columns(
             columns, output_columns
         )
-        self._output_dtype = output_dtype
+        self._gpu_maps: Dict[str, Dict[Any, int]] = {}
 
     @property
     def columns(self) -> List[str]:
@@ -143,451 +357,121 @@ class GPUStandardScaler(GPUPreprocessor):
     @property
     def output_columns(self) -> List[str]:
         return self._output_columns
-
-    @property
-    def output_dtype(self) -> Optional[Any]:
-        return self._output_dtype
 
     def _supports_gpu_combined_fit(self) -> bool:
         return True
 
     def _gpu_fit_stats_cudf(self, df: cudf.DataFrame) -> pd.DataFrame:
-        numeric = df[self._columns].astype("float64")
-        counts = _to_pandas_dict(numeric.count())
-        sums = _to_pandas_dict(numeric.sum())
-        sum_sqs = _to_pandas_dict((numeric * numeric).sum())
-        rows = [
-            {
-                "column": column,
-                "count": int(counts.get(column, 0) or 0),
-                "sum": float(sums.get(column, 0.0) or 0.0),
-                "sum_sq": float(sum_sqs.get(column, 0.0) or 0.0),
-            }
-            for column in self._columns
-        ]
-        return pd.DataFrame(rows, columns=["column", "count", "sum", "sum_sq"])
-
-    def _finalize_gpu_fit_stats(self, partials: pd.DataFrame) -> None:
-        """Combine partial count, sum, and squared-sum statistics."""
-        counts = {column: 0 for column in self._columns}
-        sums = {column: 0.0 for column in self._columns}
-        sum_sqs = {column: 0.0 for column in self._columns}
-        if not partials.empty:
-            for column, count, col_sum, col_sum_sq in partials[
-                ["column", "count", "sum", "sum_sq"]
-            ].itertuples(index=False, name=None):
-                if column not in counts:
-                    continue
-                if _is_missing_value(count):
-                    continue
-                counts[column] += int(count)
-                sums[column] += float(col_sum)
-                sum_sqs[column] += float(col_sum_sq)
-
-        self.stats_ = {}
-        for column in self._columns:
-            count = counts[column]
-            if count == 0:
-                self.stats_[f"mean({column})"] = None
-                self.stats_[f"std({column})"] = None
-                continue
-            mean = sums[column] / count
-            variance = max((sum_sqs[column] / count) - (mean * mean), 0.0)
-            self.stats_[f"mean({column})"] = mean
-            self.stats_[f"std({column})"] = math.sqrt(variance)
-
-    def _fit_gpu(
-        self, dataset: "Dataset", prefix: Sequence[GPUPreprocessor]
-    ) -> "GPUStandardScaler":
-        return self._fit_gpu_with_stats(dataset, prefix)
-
-    def _transform_cudf(
-        self, df: cudf.DataFrame, context: Optional[_GPUTransformContext] = None
-    ) -> cudf.DataFrame:
-        """Standardize configured columns using fitted GPU statistics."""
-        cp = _import_cupy()
-        values = df[self._columns].astype("float64").to_cupy(na_value=cp.nan)
-        means = cp.asarray(
-            [
-                (
-                    float(self.stats_.get(f"mean({column})"))
-                    if self.stats_.get(f"mean({column})") is not None
-                    else cp.nan
-                )
-                for column in self._columns
-            ],
-            dtype=cp.float64,
-        )
-        stds = cp.asarray(
-            [
-                (
-                    float(self.stats_.get(f"std({column})"))
-                    if self.stats_.get(f"std({column})") is not None
-                    and self.stats_.get(f"std({column})") >= _EPSILON
-                    else 1.0
-                )
-                for column in self._columns
-            ],
-            dtype=cp.float64,
-        )
-        scaled = (values - means) / stds
-        if self._output_dtype is not None:
-            scaled = scaled.astype(self._output_dtype)
-        output = _cudf_dataframe_from_cupy(scaled, self._output_columns, df.index)
-        return _assign_dataframe_columns(df, self._output_columns, output)
-
-    def get_input_columns(self) -> List[str]:
-        return list(self._columns)
-
-    def get_output_columns(self) -> List[str]:
-        return list(self._output_columns)
-
-    def _get_serializable_fields(self) -> Dict[str, Any]:
-        return {
-            **self._base_serializable_fields(),
-            "columns": self._columns,
-            "output_columns": self._output_columns,
-            "output_dtype": self._output_dtype,
-        }
-
-    def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
-        self._set_base_serializable_fields(fields)
-        self._columns = fields["columns"]
-        self._output_columns = fields["output_columns"]
-        self._output_dtype = fields.get("output_dtype")
-
-    def __setstate__(self, state: Dict[str, Any]) -> None:
-        super().__setstate__(state)
-        migrate_private_fields(
-            self,
-            fields={
-                "_columns": _PublicField(public_field="columns"),
-                "_output_columns": _PublicField(
-                    public_field="output_columns",
-                    default=_Computed(lambda obj: obj._columns),
-                ),
-                "_output_dtype": _PublicField(
-                    public_field="output_dtype",
-                    default=None,
-                ),
-            },
-        )
-
-    def __repr__(self) -> str:
-        return (
-            f"{self.__class__.__name__}(columns={self._columns!r}, "
-            f"output_columns={self._output_columns!r}, "
-            f"output_dtype={self._output_dtype!r})"
-        )
-
-
-@PublicAPI(stability="alpha")
-@SerializablePreprocessor(
-    version=1, identifier="io.ray.preprocessors.gpu_power_transformer"
-)
-class GPUPowerTransformer(GPUPreprocessor):
-    """GPU-native variant of :class:`PowerTransformer`."""
-
-    _valid_methods = ["yeo-johnson", "box-cox"]
-    _is_fittable = False
-
-    def __init__(
-        self,
-        columns: List[str],
-        power: float,
-        method: str = "yeo-johnson",
-        *,
-        output_columns: Optional[List[str]] = None,
-        output_dtype: Optional[Any] = None,
-        batch_size: int = _DEFAULT_GPU_BATCH_SIZE,
-        num_gpus_per_worker: float = 1,
-        concurrency: Optional[int] = None,
-    ):
-        super().__init__(
-            batch_size=batch_size,
-            num_gpus_per_worker=num_gpus_per_worker,
-            concurrency=concurrency,
-        )
-        if method not in self._valid_methods:
-            raise ValueError(
-                f"Method {method} is not supported."
-                f"Supported values are: {self._valid_methods}"
-            )
-        self._columns = columns
-        self._method = method
-        self._power = power
-        self._output_columns = Preprocessor._derive_and_validate_output_columns(
-            columns, output_columns
-        )
-        self._output_dtype = output_dtype
-
-    @property
-    def columns(self) -> List[str]:
-        return self._columns
-
-    @property
-    def method(self) -> str:
-        return self._method
-
-    @property
-    def power(self) -> float:
-        return self._power
-
-    @property
-    def output_columns(self) -> List[str]:
-        return self._output_columns
-
-    @property
-    def output_dtype(self) -> Optional[Any]:
-        return self._output_dtype
-
-    def _transform_cudf(
-        self, df: cudf.DataFrame, context: Optional[_GPUTransformContext] = None
-    ) -> cudf.DataFrame:
-        """Apply the configured Yeo-Johnson or Box-Cox power transform."""
-        cp = _import_cupy()
-        values = df[self._columns].astype("float64").to_cupy(na_value=cp.nan)
-        transformed = _power_transform_values(values, self._power, self._method, cp)
-
-        if self._output_dtype is not None:
-            transformed = transformed.astype(self._output_dtype)
-        output = _cudf_dataframe_from_cupy(transformed, self._output_columns, df.index)
-        return _assign_dataframe_columns(df, self._output_columns, output)
-
-    def get_input_columns(self) -> List[str]:
-        return list(self._columns)
-
-    def get_output_columns(self) -> List[str]:
-        return list(self._output_columns)
-
-    def _get_serializable_fields(self) -> Dict[str, Any]:
-        return {
-            **self._base_serializable_fields(),
-            "columns": self._columns,
-            "power": self._power,
-            "method": self._method,
-            "output_columns": self._output_columns,
-            "output_dtype": self._output_dtype,
-        }
-
-    def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
-        self._set_base_serializable_fields(fields)
-        self._columns = fields["columns"]
-        self._power = fields["power"]
-        self._method = fields.get("method", "yeo-johnson")
-        self._output_columns = fields["output_columns"]
-        self._output_dtype = fields.get("output_dtype")
-
-    def __repr__(self) -> str:
-        return (
-            f"{self.__class__.__name__}(columns={self._columns!r}, "
-            f"power={self._power!r}, method={self._method!r}, "
-            f"output_columns={self._output_columns!r}, "
-            f"output_dtype={self._output_dtype!r})"
-        )
-
-
-@PublicAPI(stability="alpha")
-@SerializablePreprocessor(
-    version=1, identifier="io.ray.preprocessors.gpu_simple_imputer"
-)
-class GPUSimpleImputer(GPUPreprocessor):
-    """GPU-native variant of :class:`SimpleImputer`."""
-
-    _valid_strategies = ["mean", "most_frequent", "constant"]
-
-    def __init__(
-        self,
-        columns: List[str],
-        strategy: str = "mean",
-        fill_value: Optional[Number] = None,
-        *,
-        output_columns: Optional[List[str]] = None,
-        output_dtype: Optional[Any] = None,
-        batch_size: int = _DEFAULT_GPU_BATCH_SIZE,
-        num_gpus_per_worker: float = 1,
-        concurrency: Optional[int] = None,
-    ):
-        super().__init__(
-            batch_size=batch_size,
-            num_gpus_per_worker=num_gpus_per_worker,
-            concurrency=concurrency,
-        )
-        if strategy not in self._valid_strategies:
-            raise ValueError(
-                f"Strategy {strategy} is not supported."
-                f"Supported values are: {self._valid_strategies}"
-            )
-        if strategy == "constant" and fill_value is None:
-            raise ValueError('`fill_value` must be set when using "constant" strategy.')
-        self._is_fittable = strategy != "constant"
-        self._columns = columns
-        self._strategy = strategy
-        self._fill_value = fill_value
-        self._output_columns = Preprocessor._derive_and_validate_output_columns(
-            columns, output_columns
-        )
-        self._output_dtype = output_dtype
-
-    @property
-    def columns(self) -> List[str]:
-        return self._columns
-
-    @property
-    def strategy(self) -> str:
-        return self._strategy
-
-    @property
-    def fill_value(self) -> Optional[Number]:
-        return self._fill_value
-
-    @property
-    def output_columns(self) -> List[str]:
-        return self._output_columns
-
-    @property
-    def output_dtype(self) -> Optional[Any]:
-        return self._output_dtype
-
-    def _supports_gpu_combined_fit(self) -> bool:
-        return self._strategy in {"mean", "most_frequent"}
-
-    def _gpu_fit_stats_cudf(self, df: cudf.DataFrame) -> pd.DataFrame:
-        """Compute per-batch mean or most-frequent imputation statistics."""
-        if self._strategy == "mean":
-            numeric = df[self._columns].astype("float64")
-            counts = _to_pandas_dict(numeric.count())
-            sums = _to_pandas_dict(numeric.sum())
-            rows = [
-                {
-                    "column": column,
-                    "count": int(counts.get(column, 0) or 0),
-                    "sum": float(sums.get(column, 0.0) or 0.0),
-                }
-                for column in self._columns
-            ]
-            return pd.DataFrame(rows, columns=["column", "count", "sum"])
-
         rows: List[Dict[str, Any]] = []
         for column in self._columns:
             counts = df[column].value_counts(dropna=False)
             keys = counts.index.to_pandas().tolist()
-            values = counts.to_pandas().tolist()
+            vals = counts.to_pandas().tolist()
             rows.extend(
                 {"column": column, "value": key, "count": int(value)}
-                for key, value in zip(keys, values)
+                for key, value in zip(keys, vals)
                 if not _is_missing_value(key) and not _is_missing_value(value)
             )
         return pd.DataFrame(rows, columns=["column", "value", "count"])
 
     def _finalize_gpu_fit_stats(self, partials: pd.DataFrame) -> None:
-        """Combine partials into one fitted fill value per input column."""
-        self.stats_ = {}
-        if self._strategy == "mean":
-            counts = {column: 0 for column in self._columns}
-            sums = {column: 0.0 for column in self._columns}
-            if not partials.empty:
-                for column, count, col_sum in partials[
-                    ["column", "count", "sum"]
-                ].itertuples(index=False, name=None):
-                    if column not in counts or _is_missing_value(count):
-                        continue
-                    counts[column] += int(count)
-                    sums[column] += float(col_sum)
-            for column in self._columns:
-                count = counts[column]
-                self.stats_[f"mean({column})"] = sums[column] / count if count else None
-            return
-
+        """Combine category counts into deterministic one-hot mappings."""
         counters: Dict[str, Counter] = {column: Counter() for column in self._columns}
         if not partials.empty:
             for column, value, count in partials[
                 ["column", "value", "count"]
             ].itertuples(index=False, name=None):
-                if column in counters and not _is_missing_value(value):
-                    counters[column][value] += int(count)
+                if column not in counters:
+                    continue
+                if _is_missing_value(value) or _is_missing_value(count):
+                    continue
+                counters[column][value] += int(count)
+
+        self.stats_ = {}
         for column in self._columns:
-            self.stats_[f"most_frequent({column})"] = (
-                counters[column].most_common(1)[0][0] if counters[column] else None
-            )
+            counter = counters[column]
+            if column in self._max_categories:
+                values = list(dict(counter.most_common(self._max_categories[column])))
+            else:
+                values = list(counter.keys())
+            self.stats_[f"unique_values({column})"] = {
+                value: index for index, value in enumerate(sorted(values))
+            }
+        self._gpu_maps = {}
 
     def _fit_gpu(
         self, dataset: "Dataset", prefix: Sequence[GPUPreprocessor]
-    ) -> "GPUSimpleImputer":
+    ) -> "GPUOneHotEncoder":
         return self._fit_gpu_with_stats(dataset, prefix)
 
-    def _get_fill_value(self, column: str) -> Any:
-        if self._strategy == "mean":
-            return self.stats_[f"mean({column})"]
-        if self._strategy == "most_frequent":
-            return self.stats_[f"most_frequent({column})"]
-        if self._strategy == "constant":
-            return self._fill_value
-        raise ValueError(
-            f"Strategy {self._strategy} is not supported. "
-            f"Supported values are: {self._valid_strategies}"
-        )
+    def _prepare_gpu_state(self) -> None:
+        self._gpu_maps = {
+            column: self.stats_.get(f"unique_values({column})", {})
+            for column in self._columns
+        }
 
     def _transform_cudf(
         self, df: cudf.DataFrame, context: Optional[_GPUTransformContext] = None
     ) -> cudf.DataFrame:
-        """Fill nulls in configured columns and write the requested outputs."""
-        existing_columns: List[str] = []
-        existing_outputs: List[str] = []
-        fill_values: Dict[str, Any] = {}
-        for column, output_column in zip(self._columns, self._output_columns):
-            value = self._get_fill_value(column)
-            if value is None:
+        """Expand categorical columns into one-hot indicator columns."""
+        for input_col, output_col in zip(self._columns, self._output_columns):
+            if bool(df[input_col].isnull().any()):
                 raise ValueError(
-                    f"Column {column} has no fill value. "
-                    "Check the data used to fit the SimpleImputer."
+                    f"Unable to transform column {input_col!r} because it contains "
+                    "null values. Consider imputing missing values first."
                 )
-            if column in df.columns:
-                existing_columns.append(column)
-                existing_outputs.append(output_column)
-                fill_values[column] = value
-            else:
-                df[output_column] = value
-
-        if existing_columns:
-            filled = df[existing_columns].copy(deep=False).fillna(fill_values)
-            if self._output_dtype is not None:
-                filled = filled.astype(self._output_dtype)
-            filled.columns = existing_outputs
-            df = _assign_dataframe_columns(df, existing_outputs, filled)
+            mapping = (
+                self._gpu_maps.get(input_col)
+                or self.stats_[f"unique_values({input_col})"]
+            )
+            codes = df[input_col].map(mapping).fillna(-1).astype("int32")
+            for idx in range(len(mapping)):
+                df[f"{output_col}_{idx}"] = (codes == idx).astype("uint8")
+            if output_col == input_col and input_col in df.columns:
+                df = df.drop(columns=[input_col])
         return df
 
     def get_input_columns(self) -> List[str]:
         return list(self._columns)
 
     def get_output_columns(self) -> List[str]:
-        return list(self._output_columns)
+        outputs: List[str] = []
+        for input_col, output_col in zip(self._columns, self._output_columns):
+            mapping = self.stats_.get(f"unique_values({input_col})")
+            if mapping is None:
+                outputs.append(output_col)
+            else:
+                outputs.extend(f"{output_col}_{idx}" for idx in range(len(mapping)))
+        return outputs
+
+    def _gpu_modified_columns(self) -> List[str]:
+        modified = self.get_output_columns()
+        modified.extend(
+            input_col
+            for input_col, output_col in zip(self._columns, self._output_columns)
+            if input_col == output_col
+        )
+        return modified
 
     def _get_serializable_fields(self) -> Dict[str, Any]:
         return {
-            **self._base_serializable_fields(),
+            **super()._get_serializable_fields(),
             "columns": self._columns,
-            "strategy": self._strategy,
-            "fill_value": self._fill_value,
+            "max_categories": self._max_categories,
             "output_columns": self._output_columns,
-            "output_dtype": self._output_dtype,
         }
 
     def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
-        self._set_base_serializable_fields(fields)
+        super()._set_serializable_fields(fields, version)
         self._columns = fields["columns"]
-        self._strategy = fields["strategy"]
-        self._fill_value = fields.get("fill_value")
+        self._max_categories = fields.get("max_categories", {})
         self._output_columns = fields["output_columns"]
-        self._output_dtype = fields.get("output_dtype")
-        self._is_fittable = self._strategy != "constant"
+        self._gpu_maps = {}
 
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}(columns={self._columns!r}, "
-            f"strategy={self._strategy!r}, fill_value={self._fill_value!r}, "
-            f"output_columns={self._output_columns!r}, "
-            f"output_dtype={self._output_dtype!r})"
+            f"output_columns={self._output_columns!r})"
         )
 
 
@@ -596,7 +480,7 @@ class GPUSimpleImputer(GPUPreprocessor):
     version=1, identifier="io.ray.preprocessors.gpu_ordinal_encoder"
 )
 class GPUOrdinalEncoder(GPUPreprocessor):
-    """GPU-native variant of :class:`OrdinalEncoder` for scalar columns."""
+    """GPU-native variant of :class:`~ray.data.preprocessors.OrdinalEncoder` for scalar columns."""
 
     _is_fittable = True
 
@@ -822,10 +706,12 @@ class GPUOrdinalEncoder(GPUPreprocessor):
             output_columns.append(output_col)
             encoded_columns.append(codes)
 
-        cudf = _import_cudf()
+        import cudf
+
         encoded = cudf.DataFrame(dict(zip(output_columns, encoded_columns)))
         encoded.index = df.index
-        return _assign_dataframe_columns(df, output_columns, encoded)
+        df[list(output_columns)] = encoded
+        return df
 
     def get_input_columns(self) -> List[str]:
         return list(self._columns)
@@ -835,7 +721,7 @@ class GPUOrdinalEncoder(GPUPreprocessor):
 
     def _get_serializable_fields(self) -> Dict[str, Any]:
         return {
-            **self._base_serializable_fields(),
+            **super()._get_serializable_fields(),
             "columns": self._columns,
             "encode_lists": self._encode_lists,
             "output_columns": self._output_columns,
@@ -847,7 +733,7 @@ class GPUOrdinalEncoder(GPUPreprocessor):
         }
 
     def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
-        self._set_base_serializable_fields(fields)
+        super()._set_serializable_fields(fields, version)
         self._columns = fields["columns"]
         self._encode_lists = fields.get("encode_lists", True)
         self._output_columns = fields["output_columns"]
@@ -871,21 +757,82 @@ class GPUOrdinalEncoder(GPUPreprocessor):
         )
 
 
+def _power_transform_series(
+    values: cudf.Series, power: float, method: str
+) -> cudf.Series:
+    """Apply a Yeo-Johnson or Box-Cox transform to a cuDF series."""
+    if method == "yeo-johnson":
+        positive = values >= 0
+        if power != 0:
+            positive_values = ((values + 1).pow(power) - 1) / power
+        else:
+            positive_values = np.log(values + 1)
+
+        if power != 2:
+            negative_values = -((-values + 1).pow(2 - power) - 1) / (2 - power)
+        else:
+            negative_values = -np.log(-values + 1)
+
+        return positive_values.where(positive, negative_values)
+
+    if power != 0:
+        return (values.pow(power) - 1) / power
+    return np.log(values)
+
+
+def _power_transform_values(
+    values: cudf.DataFrame,
+    power: float,
+    method: str,
+) -> cudf.DataFrame:
+    """Apply a Yeo-Johnson or Box-Cox transform to a numeric cuDF frame."""
+    import cudf
+
+    return cudf.DataFrame(
+        {
+            column: _power_transform_series(values[column], power, method)
+            for column in values.columns
+        },
+        index=values.index,
+    )
+
+
+def _standard_scale_values(
+    values: cudf.DataFrame,
+    columns: Sequence[str],
+    stats: Dict[str, Any],
+) -> cudf.DataFrame:
+    """Standardize columns with fitted mean/std statistics."""
+    import cudf
+
+    scaled = {}
+    for column in columns:
+        mean = stats.get(f"mean({column})")
+        std = stats.get(f"std({column})")
+        mean_value = float(mean) if mean is not None else float("nan")
+        std_value = float(std) if std is not None and std >= _EPSILON else 1.0
+        scaled[column] = (values[column] - mean_value) / std_value
+    return cudf.DataFrame(scaled, index=values.index)
+
+
 @PublicAPI(stability="alpha")
 @SerializablePreprocessor(
-    version=1, identifier="io.ray.preprocessors.gpu_column_caster"
+    version=1, identifier="io.ray.preprocessors.gpu_power_transformer"
 )
-class GPUColumnCaster(GPUPreprocessor):
-    """Cast one or more columns inside a fused GPU preprocessing stage."""
+class GPUPowerTransformer(GPUPreprocessor):
+    """GPU-native variant of :class:`~ray.data.preprocessors.PowerTransformer`."""
 
+    _valid_methods = ["yeo-johnson", "box-cox"]
     _is_fittable = False
 
     def __init__(
         self,
         columns: List[str],
-        output_dtype: Any,
+        power: float,
+        method: str = "yeo-johnson",
         *,
         output_columns: Optional[List[str]] = None,
+        output_dtype: Optional[Any] = None,
         batch_size: int = _DEFAULT_GPU_BATCH_SIZE,
         num_gpus_per_worker: float = 1,
         concurrency: Optional[int] = None,
@@ -895,40 +842,52 @@ class GPUColumnCaster(GPUPreprocessor):
             num_gpus_per_worker=num_gpus_per_worker,
             concurrency=concurrency,
         )
+        if method not in self._valid_methods:
+            raise ValueError(
+                f"Method {method} is not supported."
+                f"Supported values are: {self._valid_methods}"
+            )
         self._columns = columns
-        if isinstance(output_dtype, list):
-            if len(output_dtype) != len(columns):
-                raise ValueError(
-                    f"Expected {len(columns)} values, but got "
-                    f"{len(output_dtype)} values: {output_dtype!r}."
-                )
-            self._output_dtypes = output_dtype
-        else:
-            self._output_dtypes = [output_dtype for _ in columns]
+        self._method = method
+        self._power = power
         self._output_columns = Preprocessor._derive_and_validate_output_columns(
             columns, output_columns
         )
+        self._output_dtype = output_dtype
 
     @property
     def columns(self) -> List[str]:
         return self._columns
 
     @property
+    def method(self) -> str:
+        return self._method
+
+    @property
+    def power(self) -> float:
+        return self._power
+
+    @property
     def output_columns(self) -> List[str]:
         return self._output_columns
 
     @property
-    def output_dtypes(self) -> List[Any]:
-        return self._output_dtypes
+    def output_dtype(self) -> Optional[Any]:
+        return self._output_dtype
 
     def _transform_cudf(
         self, df: cudf.DataFrame, context: Optional[_GPUTransformContext] = None
     ) -> cudf.DataFrame:
-        """Cast configured columns to their requested cuDF dtypes."""
-        cast_map = dict(zip(self._columns, self._output_dtypes))
-        casted = df[self._columns].astype(cast_map)
-        casted.columns = self._output_columns
-        return _assign_dataframe_columns(df, self._output_columns, casted)
+        """Apply the configured Yeo-Johnson or Box-Cox power transform."""
+        transformed = _power_transform_values(
+            df[self._columns].astype("float64"), self._power, self._method
+        )
+        if self._output_dtype is not None:
+            transformed = transformed.astype(self._output_dtype)
+        output = transformed.copy(deep=False)
+        output.columns = list(self._output_columns)
+        df[list(self._output_columns)] = output
+        return df
 
     def get_input_columns(self) -> List[str]:
         return list(self._columns)
@@ -938,41 +897,250 @@ class GPUColumnCaster(GPUPreprocessor):
 
     def _get_serializable_fields(self) -> Dict[str, Any]:
         return {
-            **self._base_serializable_fields(),
+            **super()._get_serializable_fields(),
             "columns": self._columns,
-            "output_dtypes": self._output_dtypes,
+            "power": self._power,
+            "method": self._method,
             "output_columns": self._output_columns,
+            "output_dtype": self._output_dtype,
         }
 
     def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
-        self._set_base_serializable_fields(fields)
+        super()._set_serializable_fields(fields, version)
         self._columns = fields["columns"]
-        self._output_dtypes = fields["output_dtypes"]
+        self._power = fields["power"]
+        self._method = fields.get("method", "yeo-johnson")
         self._output_columns = fields["output_columns"]
+        self._output_dtype = fields.get("output_dtype")
 
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}(columns={self._columns!r}, "
-            f"output_dtypes={self._output_dtypes!r}, "
-            f"output_columns={self._output_columns!r})"
+            f"power={self._power!r}, method={self._method!r}, "
+            f"output_columns={self._output_columns!r}, "
+            f"output_dtype={self._output_dtype!r})"
         )
 
 
 @PublicAPI(stability="alpha")
 @SerializablePreprocessor(
-    version=1, identifier="io.ray.preprocessors.gpu_one_hot_encoder"
+    version=1, identifier="io.ray.preprocessors.gpu_simple_imputer"
 )
-class GPUOneHotEncoder(GPUPreprocessor):
-    """GPU-native one-hot encoder that emits dense scalar indicator columns."""
+class GPUSimpleImputer(GPUPreprocessor):
+    """GPU-native variant of :class:`~ray.data.preprocessors.SimpleImputer`."""
+
+    _valid_strategies = ["mean", "most_frequent", "constant"]
+
+    def __init__(
+        self,
+        columns: List[str],
+        strategy: str = "mean",
+        fill_value: Optional[Number] = None,
+        *,
+        output_columns: Optional[List[str]] = None,
+        output_dtype: Optional[Any] = None,
+        batch_size: int = _DEFAULT_GPU_BATCH_SIZE,
+        num_gpus_per_worker: float = 1,
+        concurrency: Optional[int] = None,
+    ):
+        super().__init__(
+            batch_size=batch_size,
+            num_gpus_per_worker=num_gpus_per_worker,
+            concurrency=concurrency,
+        )
+        if strategy not in self._valid_strategies:
+            raise ValueError(
+                f"Strategy {strategy} is not supported."
+                f"Supported values are: {self._valid_strategies}"
+            )
+        if strategy == "constant" and fill_value is None:
+            raise ValueError('`fill_value` must be set when using "constant" strategy.')
+        self._is_fittable = strategy != "constant"
+        self._columns = columns
+        self._strategy = strategy
+        self._fill_value = fill_value
+        self._output_columns = Preprocessor._derive_and_validate_output_columns(
+            columns, output_columns
+        )
+        self._output_dtype = output_dtype
+
+    @property
+    def columns(self) -> List[str]:
+        return self._columns
+
+    @property
+    def strategy(self) -> str:
+        return self._strategy
+
+    @property
+    def fill_value(self) -> Optional[Number]:
+        return self._fill_value
+
+    @property
+    def output_columns(self) -> List[str]:
+        return self._output_columns
+
+    @property
+    def output_dtype(self) -> Optional[Any]:
+        return self._output_dtype
+
+    def _supports_gpu_combined_fit(self) -> bool:
+        return self._strategy in {"mean", "most_frequent"}
+
+    def _gpu_fit_stats_cudf(self, df: cudf.DataFrame) -> pd.DataFrame:
+        """Compute per-batch mean or most-frequent imputation statistics."""
+        if self._strategy == "mean":
+            numeric = df[self._columns].astype("float64")
+            counts = numeric.count().to_pandas().to_dict()
+            sums = numeric.sum().to_pandas().to_dict()
+            rows = [
+                {
+                    "column": column,
+                    "count": int(counts.get(column, 0) or 0),
+                    "sum": float(sums.get(column, 0.0) or 0.0),
+                }
+                for column in self._columns
+            ]
+            return pd.DataFrame(rows, columns=["column", "count", "sum"])
+
+        rows: List[Dict[str, Any]] = []
+        for column in self._columns:
+            counts = df[column].value_counts(dropna=False)
+            keys = counts.index.to_pandas().tolist()
+            values = counts.to_pandas().tolist()
+            rows.extend(
+                {"column": column, "value": key, "count": int(value)}
+                for key, value in zip(keys, values)
+                if not _is_missing_value(key) and not _is_missing_value(value)
+            )
+        return pd.DataFrame(rows, columns=["column", "value", "count"])
+
+    def _finalize_gpu_fit_stats(self, partials: pd.DataFrame) -> None:
+        """Combine partials into one fitted fill value per input column."""
+        self.stats_ = {}
+        if self._strategy == "mean":
+            counts = {column: 0 for column in self._columns}
+            sums = {column: 0.0 for column in self._columns}
+            if not partials.empty:
+                for column, count, col_sum in partials[
+                    ["column", "count", "sum"]
+                ].itertuples(index=False, name=None):
+                    if column not in counts or _is_missing_value(count):
+                        continue
+                    counts[column] += int(count)
+                    sums[column] += float(col_sum)
+            for column in self._columns:
+                count = counts[column]
+                self.stats_[f"mean({column})"] = sums[column] / count if count else None
+            return
+
+        counters: Dict[str, Counter] = {column: Counter() for column in self._columns}
+        if not partials.empty:
+            for column, value, count in partials[
+                ["column", "value", "count"]
+            ].itertuples(index=False, name=None):
+                if column in counters and not _is_missing_value(value):
+                    counters[column][value] += int(count)
+        for column in self._columns:
+            self.stats_[f"most_frequent({column})"] = (
+                counters[column].most_common(1)[0][0] if counters[column] else None
+            )
+
+    def _fit_gpu(
+        self, dataset: "Dataset", prefix: Sequence[GPUPreprocessor]
+    ) -> "GPUSimpleImputer":
+        return self._fit_gpu_with_stats(dataset, prefix)
+
+    def _get_fill_value(self, column: str) -> Any:
+        if self._strategy == "mean":
+            return self.stats_[f"mean({column})"]
+        if self._strategy == "most_frequent":
+            return self.stats_[f"most_frequent({column})"]
+        if self._strategy == "constant":
+            return self._fill_value
+        raise ValueError(
+            f"Strategy {self._strategy} is not supported. "
+            f"Supported values are: {self._valid_strategies}"
+        )
+
+    def _transform_cudf(
+        self, df: cudf.DataFrame, context: Optional[_GPUTransformContext] = None
+    ) -> cudf.DataFrame:
+        """Fill nulls in configured columns and write the requested outputs."""
+        existing_columns: List[str] = []
+        existing_outputs: List[str] = []
+        fill_values: Dict[str, Any] = {}
+        for column, output_column in zip(self._columns, self._output_columns):
+            value = self._get_fill_value(column)
+            if value is None:
+                raise ValueError(
+                    f"Column {column} has no fill value. "
+                    "Check the data used to fit the SimpleImputer."
+                )
+            if column in df.columns:
+                existing_columns.append(column)
+                existing_outputs.append(output_column)
+                fill_values[column] = value
+            else:
+                df[output_column] = value
+
+        if existing_columns:
+            filled = df[existing_columns].copy(deep=False).fillna(fill_values)
+            if self._output_dtype is not None:
+                filled = filled.astype(self._output_dtype)
+            filled.columns = existing_outputs
+            df[list(existing_outputs)] = filled
+        return df
+
+    def get_input_columns(self) -> List[str]:
+        return list(self._columns)
+
+    def get_output_columns(self) -> List[str]:
+        return list(self._output_columns)
+
+    def _get_serializable_fields(self) -> Dict[str, Any]:
+        return {
+            **super()._get_serializable_fields(),
+            "columns": self._columns,
+            "strategy": self._strategy,
+            "fill_value": self._fill_value,
+            "output_columns": self._output_columns,
+            "output_dtype": self._output_dtype,
+        }
+
+    def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
+        super()._set_serializable_fields(fields, version)
+        self._columns = fields["columns"]
+        self._strategy = fields["strategy"]
+        self._fill_value = fields.get("fill_value")
+        self._output_columns = fields["output_columns"]
+        self._output_dtype = fields.get("output_dtype")
+        self._is_fittable = self._strategy != "constant"
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(columns={self._columns!r}, "
+            f"strategy={self._strategy!r}, fill_value={self._fill_value!r}, "
+            f"output_columns={self._output_columns!r}, "
+            f"output_dtype={self._output_dtype!r})"
+        )
+
+
+@PublicAPI(stability="alpha")
+@SerializablePreprocessor(
+    version=1, identifier="io.ray.preprocessors.gpu_standard_scaler"
+)
+class GPUStandardScaler(GPUPreprocessor):
+    """GPU-native variant of :class:`~ray.data.preprocessors.StandardScaler`."""
 
     _is_fittable = True
 
     def __init__(
         self,
         columns: List[str],
-        *,
-        max_categories: Optional[Dict[str, int]] = None,
         output_columns: Optional[List[str]] = None,
+        *,
+        output_dtype: Optional[Any] = None,
         batch_size: int = _DEFAULT_GPU_BATCH_SIZE,
         num_gpus_per_worker: float = 1,
         concurrency: Optional[int] = None,
@@ -983,11 +1151,10 @@ class GPUOneHotEncoder(GPUPreprocessor):
             concurrency=concurrency,
         )
         self._columns = columns
-        self._max_categories = max_categories or {}
         self._output_columns = Preprocessor._derive_and_validate_output_columns(
             columns, output_columns
         )
-        self._gpu_maps: Dict[str, Dict[Any, int]] = {}
+        self._output_dtype = output_dtype
 
     @property
     def columns(self) -> List[str]:
@@ -997,148 +1164,135 @@ class GPUOneHotEncoder(GPUPreprocessor):
     def output_columns(self) -> List[str]:
         return self._output_columns
 
+    @property
+    def output_dtype(self) -> Optional[Any]:
+        return self._output_dtype
+
     def _supports_gpu_combined_fit(self) -> bool:
         return True
 
     def _gpu_fit_stats_cudf(self, df: cudf.DataFrame) -> pd.DataFrame:
-        rows: List[Dict[str, Any]] = []
-        for column in self._columns:
-            counts = df[column].value_counts(dropna=False)
-            keys = counts.index.to_pandas().tolist()
-            vals = counts.to_pandas().tolist()
-            rows.extend(
-                {"column": column, "value": key, "count": int(value)}
-                for key, value in zip(keys, vals)
-                if not _is_missing_value(key) and not _is_missing_value(value)
-            )
-        return pd.DataFrame(rows, columns=["column", "value", "count"])
+        numeric = df[self._columns].astype("float64")
+        counts = numeric.count().to_pandas().to_dict()
+        sums = numeric.sum().to_pandas().to_dict()
+        sum_sqs = (numeric * numeric).sum().to_pandas().to_dict()
+        rows = [
+            {
+                "column": column,
+                "count": int(counts.get(column, 0) or 0),
+                "sum": float(sums.get(column, 0.0) or 0.0),
+                "sum_sq": float(sum_sqs.get(column, 0.0) or 0.0),
+            }
+            for column in self._columns
+        ]
+        return pd.DataFrame(rows, columns=["column", "count", "sum", "sum_sq"])
 
     def _finalize_gpu_fit_stats(self, partials: pd.DataFrame) -> None:
-        """Combine category counts into deterministic one-hot mappings."""
-        counters: Dict[str, Counter] = {column: Counter() for column in self._columns}
+        """Combine partial count, sum, and squared-sum statistics."""
+        counts = {column: 0 for column in self._columns}
+        sums = {column: 0.0 for column in self._columns}
+        sum_sqs = {column: 0.0 for column in self._columns}
         if not partials.empty:
-            for column, value, count in partials[
-                ["column", "value", "count"]
+            for column, count, col_sum, col_sum_sq in partials[
+                ["column", "count", "sum", "sum_sq"]
             ].itertuples(index=False, name=None):
-                if column not in counters:
+                if column not in counts:
                     continue
-                if _is_missing_value(value) or _is_missing_value(count):
+                if _is_missing_value(count):
                     continue
-                counters[column][value] += int(count)
+                counts[column] += int(count)
+                sums[column] += float(col_sum)
+                sum_sqs[column] += float(col_sum_sq)
 
         self.stats_ = {}
         for column in self._columns:
-            counter = counters[column]
-            if column in self._max_categories:
-                values = list(dict(counter.most_common(self._max_categories[column])))
-            else:
-                values = list(counter.keys())
-            self.stats_[f"unique_values({column})"] = {
-                value: index for index, value in enumerate(sorted(values))
-            }
-        self._gpu_maps = {}
+            count = counts[column]
+            if count == 0:
+                self.stats_[f"mean({column})"] = None
+                self.stats_[f"std({column})"] = None
+                continue
+            mean = sums[column] / count
+            variance = max((sum_sqs[column] / count) - (mean * mean), 0.0)
+            self.stats_[f"mean({column})"] = mean
+            self.stats_[f"std({column})"] = math.sqrt(variance)
 
     def _fit_gpu(
         self, dataset: "Dataset", prefix: Sequence[GPUPreprocessor]
-    ) -> "GPUOneHotEncoder":
+    ) -> "GPUStandardScaler":
         return self._fit_gpu_with_stats(dataset, prefix)
 
-    def _prepare_gpu_state(self) -> None:
-        self._gpu_maps = {
-            column: self.stats_.get(f"unique_values({column})", {})
-            for column in self._columns
-        }
-
     def _transform_cudf(
         self, df: cudf.DataFrame, context: Optional[_GPUTransformContext] = None
     ) -> cudf.DataFrame:
-        """Expand categorical columns into one-hot indicator columns."""
-        cudf = _import_cudf()
-        cp = _import_cupy()
-        for input_col, output_col in zip(self._columns, self._output_columns):
-            if bool(df[input_col].isnull().any()):
-                raise ValueError(
-                    f"Unable to transform column {input_col!r} because it contains "
-                    "null values. Consider imputing missing values first."
-                )
-            mapping = (
-                self._gpu_maps.get(input_col)
-                or self.stats_[f"unique_values({input_col})"]
-            )
-            num_categories = len(mapping)
-            codes = df[input_col].map(mapping).fillna(-1).astype("int32")
-            codes_gpu = codes.to_cupy()
-            one_hot = cp.zeros((len(df), num_categories), dtype=cp.uint8)
-            if len(df) and num_categories:
-                rows = cp.arange(len(df), dtype=cp.int32)
-                valid = codes_gpu >= 0
-                one_hot[rows[valid], codes_gpu[valid]] = 1
-            for idx in range(num_categories):
-                df[f"{output_col}_{idx}"] = cudf.Series(one_hot[:, idx], index=df.index)
-            if output_col == input_col and input_col in df.columns:
-                df = df.drop(columns=[input_col])
+        """Standardize configured columns using fitted GPU statistics."""
+        scaled = _standard_scale_values(
+            df[self._columns].astype("float64"), self._columns, self.stats_
+        )
+        if self._output_dtype is not None:
+            scaled = scaled.astype(self._output_dtype)
+        output = scaled.copy(deep=False)
+        output.columns = list(self._output_columns)
+        df[list(self._output_columns)] = output
         return df
 
     def get_input_columns(self) -> List[str]:
         return list(self._columns)
 
     def get_output_columns(self) -> List[str]:
-        outputs: List[str] = []
-        for input_col, output_col in zip(self._columns, self._output_columns):
-            mapping = self.stats_.get(f"unique_values({input_col})")
-            if mapping is None:
-                outputs.append(output_col)
-            else:
-                outputs.extend(f"{output_col}_{idx}" for idx in range(len(mapping)))
-        return outputs
-
-    def _gpu_modified_columns(self) -> List[str]:
-        modified = self.get_output_columns()
-        modified.extend(
-            input_col
-            for input_col, output_col in zip(self._columns, self._output_columns)
-            if input_col == output_col
-        )
-        return modified
+        return list(self._output_columns)
 
     def _get_serializable_fields(self) -> Dict[str, Any]:
         return {
-            **self._base_serializable_fields(),
+            **super()._get_serializable_fields(),
             "columns": self._columns,
-            "max_categories": self._max_categories,
             "output_columns": self._output_columns,
+            "output_dtype": self._output_dtype,
         }
 
     def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
-        self._set_base_serializable_fields(fields)
+        super()._set_serializable_fields(fields, version)
         self._columns = fields["columns"]
-        self._max_categories = fields.get("max_categories", {})
         self._output_columns = fields["output_columns"]
-        self._gpu_maps = {}
+        self._output_dtype = fields.get("output_dtype")
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        super().__setstate__(state)
+        migrate_private_fields(
+            self,
+            fields={
+                "_columns": _PublicField(public_field="columns"),
+                "_output_columns": _PublicField(
+                    public_field="output_columns",
+                    default=_Computed(lambda obj: obj._columns),
+                ),
+                "_output_dtype": _PublicField(
+                    public_field="output_dtype",
+                    default=None,
+                ),
+            },
+        )
 
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}(columns={self._columns!r}, "
-            f"output_columns={self._output_columns!r})"
+            f"output_columns={self._output_columns!r}, "
+            f"output_dtype={self._output_dtype!r})"
         )
 
 
 @PublicAPI(stability="alpha")
-@SerializablePreprocessor(
-    version=1, identifier="io.ray.preprocessors.gpu_hashing_vectorizer"
-)
-class GPUHashingVectorizer(GPUPreprocessor):
-    """GPU hashing vectorizer that emits dense scalar feature columns."""
+@SerializablePreprocessor(version=1, identifier="io.ray.preprocessors.gpu_text_stats")
+class GPUTextStatsPreprocessor(GPUPreprocessor):
+    """Append GPU-computed text count features for string columns."""
 
     _is_fittable = False
 
     def __init__(
         self,
-        columns: List[str],
-        num_features: int,
+        text_column: str,
         *,
+        word_pattern: str = _DEFAULT_WORD_PATTERN,
         token_pattern: str = _DEFAULT_TOKEN_PATTERN,
-        output_columns: Optional[List[str]] = None,
         batch_size: int = _DEFAULT_GPU_BATCH_SIZE,
         num_gpus_per_worker: float = 1,
         concurrency: Optional[int] = None,
@@ -1148,120 +1302,47 @@ class GPUHashingVectorizer(GPUPreprocessor):
             num_gpus_per_worker=num_gpus_per_worker,
             concurrency=concurrency,
         )
-        if num_features <= 0:
-            raise ValueError("num_features must be positive")
-        self._columns = columns
-        self._num_features = num_features
+        self._text_column = text_column
+        self._word_pattern = word_pattern
         self._token_pattern = token_pattern
-        self._output_columns = Preprocessor._derive_and_validate_output_columns(
-            columns, output_columns
-        )
 
     def _transform_cudf(
         self, df: cudf.DataFrame, context: Optional[_GPUTransformContext] = None
     ) -> cudf.DataFrame:
-        """Tokenize string columns and append dense hashed-count features."""
+        """Append word, line, and tokenizer-token counts for one text column."""
         context = context or _GPUTransformContext()
-        for input_col, output_col in zip(self._columns, self._output_columns):
-            tokens, lengths = context.tokenized_text(df, input_col, self._token_pattern)
-            df = _append_hashing_columns_from_tokens(
-                df, tokens, lengths, output_col, self._num_features
-            )
-            if output_col == input_col and input_col in df.columns:
-                df = df.drop(columns=[input_col])
+        text = context.string_column(df, self._text_column)
+        _, token_lengths = context.tokenized_text(
+            df, self._text_column, self._token_pattern
+        )
+        df["word_count"] = (
+            _str_count(text, self._word_pattern).fillna(0).astype("int64")
+        )
+        newline_count = _str_count(text, r"\n").fillna(0).astype("int64")
+        non_empty = text.str.len().fillna(0) > 0
+        df["line_count"] = (newline_count + 1).where(non_empty, 0).astype("int64")
+        df["tokenizer_token_count"] = token_lengths.astype("int64")
         return df
 
-    def _gpu_modified_columns(self) -> List[str]:
-        modified = self.get_output_columns()
-        modified.extend(
-            input_col
-            for input_col, output_col in zip(self._columns, self._output_columns)
-            if input_col == output_col
-        )
-        return modified
-
     def get_input_columns(self) -> List[str]:
-        return list(self._columns)
+        return [self._text_column]
 
     def get_output_columns(self) -> List[str]:
-        return [
-            f"{output_col}_{idx}"
-            for output_col in self._output_columns
-            for idx in range(self._num_features)
-        ]
+        return ["word_count", "line_count", "tokenizer_token_count"]
 
     def _get_serializable_fields(self) -> Dict[str, Any]:
         return {
-            **self._base_serializable_fields(),
-            "columns": self._columns,
-            "num_features": self._num_features,
+            **super()._get_serializable_fields(),
+            "text_column": self._text_column,
+            "word_pattern": self._word_pattern,
             "token_pattern": self._token_pattern,
-            "output_columns": self._output_columns,
         }
 
     def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
-        self._set_base_serializable_fields(fields)
-        self._columns = fields["columns"]
-        self._num_features = fields["num_features"]
+        super()._set_serializable_fields(fields, version)
+        self._text_column = fields["text_column"]
+        self._word_pattern = fields.get("word_pattern", _DEFAULT_WORD_PATTERN)
         self._token_pattern = fields.get("token_pattern", _DEFAULT_TOKEN_PATTERN)
-        self._output_columns = fields["output_columns"]
 
     def __repr__(self) -> str:
-        return (
-            f"{self.__class__.__name__}(columns={self._columns!r}, "
-            f"num_features={self._num_features!r}, "
-            f"output_columns={self._output_columns!r})"
-        )
-
-
-@PublicAPI(stability="alpha")
-@SerializablePreprocessor(
-    version=1, identifier="io.ray.preprocessors.gpu_column_dropper"
-)
-class GPUColumnDropper(GPUPreprocessor):
-    """Drop columns inside a fused GPU preprocessing stage."""
-
-    _is_fittable = False
-
-    def __init__(
-        self,
-        columns: List[str],
-        *,
-        batch_size: int = _DEFAULT_GPU_BATCH_SIZE,
-        num_gpus_per_worker: float = 1,
-        concurrency: Optional[int] = None,
-    ):
-        super().__init__(
-            batch_size=batch_size,
-            num_gpus_per_worker=num_gpus_per_worker,
-            concurrency=concurrency,
-        )
-        self._columns = columns
-
-    def _transform_cudf(
-        self, df: cudf.DataFrame, context: Optional[_GPUTransformContext] = None
-    ) -> cudf.DataFrame:
-        """Drop configured columns that are present in the batch."""
-        existing = [column for column in self._columns if column in df.columns]
-        if not existing:
-            return df
-        return df.drop(columns=existing)
-
-    def get_input_columns(self) -> List[str]:
-        return list(self._columns)
-
-    def get_output_columns(self) -> List[str]:
-        return []
-
-    def _gpu_modified_columns(self) -> List[str]:
-        return list(self._columns)
-
-    def _get_serializable_fields(self) -> Dict[str, Any]:
-        return {**self._base_serializable_fields(), "columns": self._columns}
-
-    def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
-        self._set_base_serializable_fields(fields)
-        self._columns = fields["columns"]
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(columns={self._columns!r})"
+        return f"{self.__class__.__name__}(text_column={self._text_column!r})"

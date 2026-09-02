@@ -13,15 +13,15 @@ from ray.data.preprocessors.gpu.ops import (
 )
 
 __all__ = [
-    "GPUPreprocessor",
     "GPUChain",
-    "GPUTextStatsPreprocessor",
-    "GPUStandardScaler",
+    "GPUPreprocessor",
+    "GPUColumnCaster",
+    "GPUColumnDropper",
+    "GPUHashingVectorizer",
+    "GPUOneHotEncoder",
+    "GPUOrdinalEncoder",
     "GPUPowerTransformer",
     "GPUSimpleImputer",
-    "GPUOrdinalEncoder",
-    "GPUColumnCaster",
-    "GPUOneHotEncoder",
-    "GPUHashingVectorizer",
-    "GPUColumnDropper",
+    "GPUStandardScaler",
+    "GPUTextStatsPreprocessor",
 ]
