@@ -69,6 +69,9 @@ def _cast_cudf_column_dtype(
     except (TypeError, ValueError, NotImplementedError):
         return
 
+    if df[column].dtype == cast_dtype:
+        return
+
     try:
         df[column] = df[column].astype(cast_dtype)
     except (TypeError, ValueError, NotImplementedError):
@@ -326,7 +329,10 @@ class GPUCount(GPUAggregateFn):
         result = (
             df.groupby(list(key_columns), dropna=False)[acc_col].sum().reset_index()
         )
-        result = result.rename(columns={result.columns[-1]: output_name})
+        # Renaming with the cuDF default (``inplace=False``) deep-copies the
+        # aggregation result. This can exhaust GPU memory at the end of a large
+        # aggregate even though the groupby itself completed successfully.
+        result.rename(columns={result.columns[-1]: output_name}, inplace=True)
         return result[list(key_columns) + [output_name]]
 
     def _empty_global_partial_values(self, accumulator_prefix: str) -> Dict[str, Any]:
@@ -405,7 +411,8 @@ class GPUSum(GPUAggregateFn):
         null_mask = result[count_col] == 0
         if not self.ignore_nulls:
             null_mask = result[size_col] != result[count_col]
-        result.loc[null_mask, acc_col] = None
+        if bool(null_mask.any()):
+            result.loc[null_mask, acc_col] = None
         return result[list(key_columns) + [acc_col]]
 
     def final_aggregate(
@@ -445,7 +452,8 @@ class GPUSum(GPUAggregateFn):
         null_mask = result[count_col] == 0
         if not self.ignore_nulls:
             null_mask = result[size_col] != result[count_col]
-        result.loc[null_mask, output_name] = None
+        if bool(null_mask.any()):
+            result.loc[null_mask, output_name] = None
         return result[list(key_columns) + [output_name]]
 
     def _empty_global_partial_values(self, accumulator_prefix: str) -> Dict[str, Any]:
@@ -567,7 +575,8 @@ class GPUMin(GPUAggregateFn):
         null_mask = result[count_col] == 0
         if not self.ignore_nulls:
             null_mask = result[size_col] != result[count_col]
-        result.loc[null_mask, acc_col] = None
+        if bool(null_mask.any()):
+            result.loc[null_mask, acc_col] = None
         return result[list(key_columns) + [acc_col]]
 
     def final_aggregate(
@@ -582,6 +591,12 @@ class GPUMin(GPUAggregateFn):
         size_col = f"{acc_col}_partial_size"
         count_col = f"{acc_col}_partial_count"
         grouped = df.groupby(list(key_columns), dropna=False)
+
+        if self.ignore_nulls:
+            result = grouped[acc_col].min().reset_index()
+            result.rename(columns={result.columns[-1]: output_name}, inplace=True)
+            _cast_cudf_column_dtype(result, output_name, output_dtype)
+            return result[list(key_columns) + [output_name]]
 
         sizes = grouped.size().reset_index()
         sizes = sizes.rename(columns={sizes.columns[-1]: size_col})
@@ -607,7 +622,8 @@ class GPUMin(GPUAggregateFn):
         null_mask = result[count_col] == 0
         if not self.ignore_nulls:
             null_mask = result[size_col] != result[count_col]
-        result.loc[null_mask, output_name] = None
+        if bool(null_mask.any()):
+            result.loc[null_mask, output_name] = None
         return result[list(key_columns) + [output_name]]
 
     def _empty_global_partial_values(self, accumulator_prefix: str) -> Dict[str, Any]:
@@ -731,7 +747,8 @@ class GPUMax(GPUAggregateFn):
         null_mask = result[count_col] == 0
         if not self.ignore_nulls:
             null_mask = result[size_col] != result[count_col]
-        result.loc[null_mask, acc_col] = None
+        if bool(null_mask.any()):
+            result.loc[null_mask, acc_col] = None
         return result[list(key_columns) + [acc_col]]
 
     def final_aggregate(
@@ -771,7 +788,8 @@ class GPUMax(GPUAggregateFn):
         null_mask = result[count_col] == 0
         if not self.ignore_nulls:
             null_mask = result[size_col] != result[count_col]
-        result.loc[null_mask, output_name] = None
+        if bool(null_mask.any()):
+            result.loc[null_mask, output_name] = None
         return result[list(key_columns) + [output_name]]
 
     def _empty_global_partial_values(self, accumulator_prefix: str) -> Dict[str, Any]:
@@ -895,7 +913,8 @@ class GPUMean(GPUAggregateFn):
         null_mask = result[count_col] == 0
         if not self.ignore_nulls:
             null_mask = result[size_col] != result[count_col]
-        result.loc[null_mask, sum_col] = None
+        if bool(null_mask.any()):
+            result.loc[null_mask, sum_col] = None
 
         result[null_count_col] = result[size_col] - result[count_col]
         _cast_cudf_column_dtype(result, null_count_col, count_dtype)
@@ -933,7 +952,8 @@ class GPUMean(GPUAggregateFn):
         null_mask = result[final_count_col] == 0
         if not self.ignore_nulls:
             null_mask = null_mask | (result[final_null_count_col] > 0)
-        result.loc[null_mask, output_name] = None
+        if bool(null_mask.any()):
+            result.loc[null_mask, output_name] = None
 
         return result[list(key_columns) + [output_name]]
 
@@ -1578,12 +1598,20 @@ class GPUHashAggregateActor:
                 cdf = pylibcudf_to_cudf_dataframe(
                     partition, column_names=self._shuffle_columns
                 ).copy(deep=True)
+            # ``cdf`` owns its data, so release the extracted partition before
+            # the final aggregation allocates its GPU working memory.
+            del partition
 
             output_df = self._aggregation_plan.final_aggregate(
                 cdf,
                 input_schema=self._runtime_input_schema,
             )
             block = output_df.to_arrow(preserve_index=False)
+            # The Arrow conversion synchronously copies the result to CPU memory.
+            # Release the GPU frames before requesting the next partition from
+            # the shuffle iterator.
+            del output_df
+            del cdf
             block = self._aggregation_plan.normalize_output_arrow(
                 block, input_schema=self._runtime_input_schema
             )
