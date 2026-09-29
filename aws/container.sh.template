@@ -1,0 +1,70 @@
+#!/bin/bash
+# this script runs inside the docker container
+STAGE=${1:-both}
+
+mkdir -p /tmp/output
+cd aws
+
+if [[ ${COMPUTE_TYPE} == "cpu" ]]; then
+    if [[ ${DOLLAR}STAGE == "fit" ]]; then
+        ( time -p python3 ${RAY_DATA_APP} \
+        --fit-only \
+        --materialize-fit-data \
+        --num-gpus 0 \
+        --read-concurrency 16 \
+        --fit-downsample 1.0 \
+        --input ${AWS_S3_BUCKET} \
+        --output /tmp/output 2>&1 | tee /tmp/output/run.out ) 2>time.out
+    elif [[ ${DOLLAR}STAGE == "transform" ]]; then
+        ( time -p python3 ${RAY_DATA_APP} \
+        --transform-only \
+        --transform-downsample 0.2 \
+        --preprocessor-dir /home/ray/aws/preprocessor \
+        --num-gpus 0 \
+        --read-concurrency 16 \
+        --input ${AWS_S3_BUCKET} \
+        --output /tmp/output 2>&1 | tee /tmp/output/run.out ) 2>time.out
+    else
+        ( time -p python3 ${RAY_DATA_APP} \
+        --no-materialize-fit-data \
+        --num-gpus 0 \
+        --read-concurrency 16 \
+        --fit-downsample 1.0 \
+        --input ${AWS_S3_BUCKET} \
+        --output /tmp/output 2>&1 | tee /tmp/output/run.out ) 2>time.out
+    fi
+else
+    if [[ ${DOLLAR}STAGE == "fit" ]]; then
+        ( time -p python3 ${RAY_DATA_APP} \
+        --fit-only \
+        --no-materialize-fit-data \
+        --num-gpus ${NUM_GPUS} \
+        --read-concurrency 2 \
+        --fit-downsample 1.0 \
+        --gpu-fit-batch-rows 100000 \
+        --input ${AWS_S3_BUCKET} \
+        --output /tmp/output 2>&1 | tee /tmp/output/run.out ) 2>time.out
+    elif [[ ${DOLLAR}STAGE == "transform" ]]; then
+        ( time -p python3 ${RAY_DATA_APP} \
+        --transform-only \
+        --transform-downsample 0.2 \
+        --preprocessor-dir /home/ray/aws/preprocessor \
+        --num-gpus ${NUM_GPUS} \
+        --read-concurrency 2 \
+        --gpu-transform-batch-rows 100000 \
+        --input ${AWS_S3_BUCKET} \
+        --output /tmp/output 2>&1 | tee /tmp/output/run.out ) 2>time.out
+    else
+        ( time -p python3 ${RAY_DATA_APP} \
+        --no-materialize-fit-data \
+        --num-gpus ${NUM_GPUS} \
+        --read-concurrency 2 \
+        --fit-downsample 1.0 \
+        --gpu-fit-batch-rows 100000 \
+        --gpu-transform-batch-rows 100000 \
+        --input ${AWS_S3_BUCKET} \
+        --output /tmp/output 2>&1 | tee /tmp/output/run.out ) 2>time.out
+    fi
+fi
+
+cat time.out >> /tmp/output/run.out
